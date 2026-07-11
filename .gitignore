@@ -1,0 +1,9 @@
+# Go
+processor/processor
+*.test
+
+# OS
+.DS_Store
+
+# Local scratch
+/tmp/

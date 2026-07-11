@@ -1,0 +1,212 @@
+# rewardflights.lucy.sh — architecture spec
+
+Status: FINAL v1 (synthesized from design panel + measured snappiness study, 2026-07-12)
+
+## System overview
+
+```
+github.com/intUnderflow/rewardflights          (source: scraper output, ODbL)
+        │  polled every 30 min by GitHub Actions in THIS repo
+        ▼
+processor/ (Go, stdlib-only)
+        │  deterministic transform; commit only on change
+        ▼
+github.com/intUnderflow/rewardflights.lucy.sh-data   (derived, ODbL share-alike)
+        │  fetched client-side from raw.githubusercontent.com
+        │  (verified: ACAO:*, gzip, max-age=300; ETag NOT CORS-readable)
+        ▼
+site/ (static, no build step) → Cloudflare Pages → rewardflights.lucy.sh
+```
+
+Architecture headline (empirically measured): today's entire calendar dataset
+gzips to ~39KB with nibble-per-day encoding, so the v1 client loads ONE bundle
+and every interaction — autocomplete, calendar, cabin filter, explore — is
+in-memory, zero-network. Per-origin shards are emitted from day one so scaling
+to 10x is a client flag, not a format migration.
+
+## Derived data format (rewardflights.lucy.sh-data)
+
+### Canonical serialization (all files)
+
+- Go `json.MarshalIndent`-style: sorted object keys, 1-space indent, LF,
+  single trailing newline, UTF-8. STOCK encoder output — no hand-rolled
+  serializer (judge-flagged as the top determinism risk). Values that change
+  land on their own line → meaningful git diffs (one route's day-change = a
+  one-line diff); gzip eats the indentation.
+- Byte-identical output for identical inputs: NO wall clock anywhere.
+- Golden-file tests pin exact bytes; CI runs a determinism canary (processor
+  runs twice; second run must report written=0 deleted=0).
+
+### Provenance / freshness (every fetchable file)
+
+- `"v"`: SOURCE repo commit SHA the generation was built from.
+- `"t"`: SOURCE commit's committer timestamp (unix seconds). Semantically
+  "data as of"; keeps regeneration byte-pure.
+- `"schema"`: integer, currently 1. Bumped ONLY on breaking change; clients
+  ignore unknown keys/fields (additive evolution is free). Unknown cabin bits
+  render as "Other"; unknown place codes render as the raw code.
+- Embedded in-band because CORS blocks reading ETag from raw.githubusercontent.
+
+### Day encoding (measured: 39KB gz full dataset; 11% off binary floor)
+
+Availability for route+airline = **nibble-per-day uppercase-hex string**:
+
+- Global `epoch` (YYYY-MM-DD) = Jan 1 of the year of the earliest available
+  date. Calendar-anchored → day-to-day regenerations only diff where data
+  changed; one epoch shift per year rollover.
+- Char i = day `epoch + i`. Bitmask: M(Economy)=1, W(PremiumEconomy)=2,
+  C(Business)=4, F(First)=8; `0` = none. All strings uniform length =
+  `days` (epoch → last available date inclusive).
+- Bits are per-airline-defined via legends (below). Future airline with >4
+  award buckets: its legend defines bits ≥16 and its strings use 2 hex chars
+  per day via an additive per-airline `width` field (default 1). Existing
+  airlines' strings never rewrite when another airline's legend grows.
+- Defensive filter: dates earlier than the source commit date are dropped
+  with a single aggregated WARN (protects against source pruning failures).
+
+### Files
+
+```
+manifest.json                        ~200 B stable entrypoint / version poll
+availability.json                    whole-dataset bundle (v1 client's ONE fetch)
+origins/<ORIGIN>.json                per-origin shards (same shape, filtered)
+flights/<ORIG>/<DEST>/<YYYY-MM>.json per-flight detail, all airlines merged
+                                     (origin-nested: GitHub UI truncates
+                                     1000-entry dir listings at 10x scale)
+changes/recent.json                  rolling opened/closed feed (see below)
+places.json                          standalone copy of the places table
+README.md, FORMAT.md, LICENSE, DbCL-1.0.txt
+```
+
+`manifest.json`:
+```json
+{"bundle":"availability.json","changes":"changes/recent.json",
+ "counts":{"airlines":1,"places":173,"routeDates":72116,"routes":345},
+ "epoch":"2026-01-01","license":{…},"mode":"bundle","schema":1,
+ "t":1770000000,"v":"<source sha>"}
+```
+
+`availability.json`:
+```json
+{"airlines":{"BA":{"cabins":{"1":"Economy","2":"Premium Economy",
+                             "4":"Business","8":"First"},
+                   "name":"British Airways","slug":"british-airways"}},
+ "days":517,"epoch":"2026-01-01",
+ "license":{"attribution":"Contains data from github.com/intUnderflow/rewardflights, © its contributors, Open Database License (ODbL) v1.0",
+            "spdx":"ODbL-1.0","url":"https://opendatacommons.org/licenses/odbl/1-0/"},
+ "places":{"LON":{"country":"United Kingdom","name":"London",
+                  "search":["Heathrow","LHR","Gatwick","LGW","City","LCY","Stansted","STN","Luton","LTN"]},…},
+ "routes":{"LON-TYO":{"a":{"BA":"000…680C…"},"fm":["2026-10"]}},
+ "schema":1,"t":1770000000,"v":"…"}
+```
+- Route entry: lowercase keys = metadata, uppercase = (never used; airline ids
+  live under `"a"`). `"a"` maps airline id → nibble string. `"fm"` lists
+  route-months that have flight-detail files — clients never probe/404
+  (raw.githubusercontent caches 404s for 5 min). `"fm"` omitted when empty.
+- Airline ids come from an APPEND-ONLY registry in processor assets
+  (slug → {id, name, cabins}); once assigned an id is frozen forever;
+  a later colliding airline gets its slug as id. (Judge-flagged: retroactive
+  id renames would break every path/key.)
+- `places` embedded (cold load = ONE fetch) — only codes present in current
+  data; curated table lives in processor assets; unmapped code → emit
+  `{"name":"<CODE>"}` + greppable WARN (route churn must not need redeploys).
+  Multi-airport metros carry `search` aliases (airport names + IATA codes)
+  for autocomplete.
+- `origins/LON.json`: identical shape, `routes` filtered to origin LON,
+  `places` filtered to codes referenced by those routes.
+
+`flights/<ORIG>/<DEST>/<YYYY-MM>.json` (when source grows `flights` arrays):
+```json
+{"days":{"15":{"BA":[{"arr":"08:55","car":["BA"],"dep":"13:00",
+   "fn":["BA0007"],"peak":"off-peak","rfs":true,
+   "seats":{"C":1,"W":6},"via":[]}]}},
+ "route":"LON-TYO","schema":1,"t":…,"v":"…"}
+```
+- Day keys zero-padded 2-digit (lexical = chronological). All airlines merged
+  per route-month (one fetch per date-click even on multi-airline routes).
+- Calendar-layer files never grow when detail ships. Target ≤15KB gz.
+
+`changes/recent.json` — the ONLY state-dependent output (documented as such):
+```json
+{"entries":[{"c":"C","d":"2026-10-15","k":"opened","r":"LON-TYO",
+             "al":"BA","t":1770000000}],"schema":1,"t":…,"v":"…"}
+```
+- Processor diffs previous availability.json (already in -out) against new:
+  route+airline+date granularity, kinds opened/closed/changed (cabin set).
+  Roll-off exclusions: dates that merely passed are NOT "closed".
+- Append newest-first, trim to 1000 entries. Deterministic given
+  (source, previous derived state); canary-safe (re-run diffs nothing).
+- Powers the "recently opened" home module + future alerts.
+
+### Size budgets (processor-enforced hard failure)
+- availability.json ≤ 300KB gz (beyond → future flip to `mode:"shard"`)
+- every other file ≤ 50KB gz
+
+### Safety rails
+- 50%-shrink guardrail: if new total routeDates < 50% of previous manifest's,
+  hard-fail before any write/delete (`-force` overrides). Protects against a
+  truncated source checkout mass-deleting the derived tree.
+- Managed-path ownership: processor owns manifest.json, availability.json,
+  places.json, FORMAT.md, origins/**, flights/**, changes/**; write-if-
+  different, delete stale, NEVER touches README/LICENSE/DbCL/.git.
+- Malformed source entries: WARN + skip, never abort the run; hard fail only
+  on structural problems (unreadable roots, zero data, budget breach,
+  guardrail).
+
+## Processor CLI
+
+`processor -src <rewardflights checkout> -out <data repo checkout>
+ [-source-sha SHA] [-source-time UNIX] [-force]`
+
+Missing sha/time → read from `git -C src log -1`. Machine-parseable summary:
+`SUMMARY routes=… routeDates=… origins=… places=… warnings=… written=… deleted=… unchanged=… bundleGzBytes=…`
+
+## Website (./site, no build step)
+
+- SPA: index.html + one JS + one CSS (critical CSS inlined), History-API
+  routing (`/`, `/route/LON-TYO`, `/from/LON`) with Cloudflare Pages SPA
+  fallback via `_redirects` (`/* /index.html 200`).
+- Cold path: preconnect + `preload as=fetch` availability.json (branch-head
+  URL); skeleton calendar from pure date math (fixed geometry, zero CLS).
+- Repeat path: localStorage snapshot (`avail:v1` key incl. schema) renders
+  REAL data first frame; network refresh in parallel; embedded `v` compare;
+  subtle "updated" pulse + changed-cell highlight. Snapshot read/write fully
+  try/catch'd (private mode, quota, corruption → cold path).
+- Freshness: manifest.json (~200B) polled every 5 min while visible + on
+  visibilitychange. New `v` → refetch bundle with `?v=<new>` (query-string
+  cache-bust — raw.githubusercontent caches per-full-URL). Always render
+  "availability as of <t> — verify with the airline before booking".
+  Optional liveness enhancement: GitHub commits API (CORS-enabled) for source
+  repo last-commit time; hide gracefully on rate limit. (Judge-flagged: a
+  dead scraper must not masquerade as a quiet market.)
+- Client contract: bundle is authoritative over manifest counts; unknown
+  airline id → render raw id; unknown cabin bit → "Other"; unknown place →
+  raw code; `fm`-listed month that 404s → "detail pending", retry, never an
+  error state.
+- All data access through ONE promise-map-deduped fetch layer; speculative
+  fetches `priority:'low'`, capped 4–6, disabled on saveData/2g; failed
+  speculation evicted from the map (never poisons user path).
+- In-memory features: autocomplete (names + search aliases), route calendar
+  w/ cabin filters, direction swap, explore ("where from LON in F in
+  October"), "recently opened" module from changes feed.
+- Failure: 8s timeout, ×2 retry w/ jittered backoff, amber stale banner when
+  serving snapshot only; never white-screen.
+- ODbL attribution in footer, rendered from the bundle's `license` block.
+
+## Automation (.github/workflows/process-data.yml)
+
+- `schedule */30` + `workflow_dispatch`; concurrency-gated.
+- Skip when data repo manifest `v` == source HEAD SHA.
+- Run processor → determinism canary (second run must print written=0
+  deleted=0) → commit `data: source <short-sha>` → push (PAT secret
+  `DATA_REPO_TOKEN`, contents:write on the data repo).
+
+## Licensing
+Source ODbL → derived repo ODbL share-alike + DbCL for contents; attribution
+in README, FORMAT.md, license block in data, and site footer.
+
+## Deliberately deferred (format already accommodates)
+- `mode:"shard"` client path + SHA-pinned shard URLs (bundle > 300KB gz)
+- Month×cabin summary bundle for shard-era autocomplete/explore
+- Service Worker (localStorage SWR delivers ~90% of the value now)
+- Fallback data origin (second Pages project serving the data repo)

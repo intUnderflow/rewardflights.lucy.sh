@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reward Flights — open award seat availability</title>
+<meta name="description" content="Free, open calendar of British Airways reward-flight (Avios) seat availability on every route. Find award seats before they're gone.">
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
+<link rel="dns-prefetch" href="https://raw.githubusercontent.com">
+<link rel="preload" as="fetch" href="https://raw.githubusercontent.com/intUnderflow/rewardflights.lucy.sh-data/main/availability.json" crossorigin="anonymous" id="bundle-preload">
+<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612-400.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612mono-400.woff2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/archivo-black.woff2" crossorigin>
+<link rel="stylesheet" href="/style.css">
+<meta name="theme-color" content="#FAFBFD" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0D1826" media="(prefers-color-scheme: dark)">
+</head>
+<body>
+<a class="skip-link" href="#main">Skip to content</a>
+
+<header class="topbar">
+  <a class="wordmark" href="/" data-nav>
+    <svg class="mark" width="18" height="18" viewBox="0 0 18 18" aria-hidden="true">
+      <rect x="2" y="13" width="11" height="2.6" rx="1.3" class="mk-m"/>
+      <rect x="2" y="9"  width="14" height="2.6" rx="1.3" class="mk-w"/>
+      <rect x="2" y="5"  width="8"  height="2.6" rx="1.3" class="mk-c"/>
+      <rect x="2" y="1"  width="5"  height="2.6" rx="1.3" class="mk-f"/>
+    </svg>
+    <span>Reward<b>Flights</b></span>
+  </a>
+  <div class="topbar-right">
+    <span class="freshness" id="freshness" title="When the availability data was last updated">…</span>
+  </div>
+</header>
+
+<div class="banner" id="banner" hidden></div>
+
+<main id="main" tabindex="-1">
+  <!-- Filled by app.js. Static skeleton for first paint: -->
+  <section class="hero">
+    <h1 class="hero-title">Find award seats<br>before they're gone.</h1>
+    <p class="hero-sub">A live calendar of British Airways reward-flight availability on every route — built on free, open data.</p>
+    <div class="search-card skeleton-search" aria-hidden="true">
+      <div class="sk-input"></div>
+      <div class="sk-input"></div>
+    </div>
+  </section>
+</main>
+
+<footer class="footer">
+  <p id="attribution">
+    Contains data from <a href="https://github.com/intUnderflow/rewardflights" rel="license">intUnderflow/rewardflights</a>,
+    © its contributors, <a href="https://opendatacommons.org/licenses/odbl/1-0/" rel="license">Open Database License (ODbL) v1.0</a>.
+  </p>
+  <p class="disclaimer">Availability is a point-in-time snapshot with no guarantee of accuracy or bookability.
+    Not affiliated with or endorsed by any airline. Always verify with the airline before booking.</p>
+  <p class="footer-links">
+    <a href="https://github.com/intUnderflow/rewardflights.lucy.sh">Site source</a> ·
+    <a href="https://github.com/intUnderflow/rewardflights.lucy.sh-data">Processed data</a> ·
+    <a href="https://github.com/intUnderflow/rewardflights">Raw data</a>
+  </p>
+</footer>
+
+<div class="day-panel" id="day-panel" hidden></div>
+<div class="scrim" id="scrim" hidden></div>
+
+<script src="/app.js" defer></script>
+</body>
+</html>

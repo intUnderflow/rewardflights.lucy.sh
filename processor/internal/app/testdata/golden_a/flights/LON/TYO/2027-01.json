@@ -1,0 +1,48 @@
+{
+ "days": {
+  "02": {
+   "BA": [
+    {
+     "arr": "08:55",
+     "car": [
+      "BA"
+     ],
+     "dep": "13:00",
+     "fn": [
+      "BA0007"
+     ],
+     "peak": "off-peak",
+     "rfs": false,
+     "seats": {
+      "F": 2
+     },
+     "via": []
+    },
+    {
+     "arr": "07:40",
+     "car": [
+      "BA",
+      "AY"
+     ],
+     "dep": "09:15",
+     "fn": [
+      "BA0870",
+      "BA0005"
+     ],
+     "peak": null,
+     "rfs": true,
+     "seats": {
+      "F": 1
+     },
+     "via": [
+      "HEL"
+     ]
+    }
+   ]
+  }
+ },
+ "route": "LON-TYO",
+ "schema": 1,
+ "t": 1770000000,
+ "v": "0123456789abcdef0123456789abcdef01234567"
+}

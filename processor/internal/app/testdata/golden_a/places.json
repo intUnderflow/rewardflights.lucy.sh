@@ -1,0 +1,47 @@
+{
+ "places": {
+  "LON": {
+   "country": "United Kingdom",
+   "name": "London",
+   "search": [
+    "Heathrow",
+    "LHR",
+    "Gatwick",
+    "LGW",
+    "London City",
+    "LCY",
+    "Stansted",
+    "STN",
+    "Luton",
+    "LTN"
+   ]
+  },
+  "NYC": {
+   "country": "United States",
+   "name": "New York",
+   "search": [
+    "JFK",
+    "Newark",
+    "EWR",
+    "LaGuardia",
+    "LGA"
+   ]
+  },
+  "TYO": {
+   "country": "Japan",
+   "name": "Tokyo",
+   "search": [
+    "Haneda",
+    "HND",
+    "Narita",
+    "NRT"
+   ]
+  },
+  "XQP": {
+   "name": "XQP"
+  }
+ },
+ "schema": 1,
+ "t": 1770000000,
+ "v": "0123456789abcdef0123456789abcdef01234567"
+}

@@ -1,0 +1,12 @@
+{
+  "british-airways": {
+    "id": "BA",
+    "name": "British Airways",
+    "cabins": {
+      "1": "Economy",
+      "2": "Premium Economy",
+      "4": "Business",
+      "8": "First"
+    }
+  }
+}
