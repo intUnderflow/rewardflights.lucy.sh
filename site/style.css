@@ -317,7 +317,47 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .bell-cab[aria-checked="true"]::after { content: "✓"; color: var(--gold); font-weight: 700; }
 .bell-cab[aria-checked="false"] { opacity: .62; }
 .bell-cab[aria-checked="false"] .swatch { background: var(--ink-3) !important; }
+.bell-pop { width: 330px; max-height: min(76vh, 640px); overflow-y: auto; }
+.bell-sec { margin-bottom: 14px; }
+.bell-sec h3 {
+  font-family: var(--font-data); font-size: 10px; letter-spacing: .12em;
+  text-transform: uppercase; color: var(--ink-3); margin: 0 0 7px;
+}
+.bell-modes { display: flex; gap: 5px; flex-wrap: wrap; }
+.bell-mode {
+  flex: 1; min-width: 84px; border: 1px solid var(--line-2); background: var(--panel);
+  border-radius: 8px; padding: 7px 8px; cursor: pointer; font-size: 12.5px; font-weight: 700;
+  color: var(--ink-2);
+}
+.bell-mode.on { border-color: var(--gold); color: var(--gold); background: var(--panel-2); }
+.bell-when-body { margin-top: 10px; }
+.bell-flex { display: flex; gap: 6px; }
+.bell-flex .np { flex: 1; justify-content: center; }
+.bell-hint { margin: 8px 0 0; font-size: 12px; color: var(--ink-3); line-height: 1.45; }
+.bell-derived { color: var(--ink-2); font-family: var(--font-data); font-size: 11.5px; }
+.bell-dates label {
+  display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 9px;
+}
+.bell-dates label span { display: flex; gap: 6px; margin-top: 4px; }
+.bell-dates input[type="date"] {
+  flex: 1; min-width: 0; padding: 7px 8px; border: 1px solid var(--line-2); border-radius: 7px;
+  background: var(--surface); color: var(--ink); font: 400 12.5px var(--font-data);
+}
+.bell-count {
+  margin: 4px 0 10px; font-size: 12.5px; font-weight: 700; line-height: 1.4;
+}
+.bell-count.ok { color: var(--cab-w); }
+.bell-count.none { color: var(--ink-2); font-weight: 400; }
+.bell-count.warn { color: var(--amber-ink); }
 .bell-save { width: 100%; justify-content: center; }
+.bell-save:disabled { opacity: .45; cursor: not-allowed; }
+@media (max-width: 640px) {
+  /* Full-screen sheet: a 330px popover with date inputs is unusable on a phone. */
+  .bell-pop {
+    position: fixed; inset: 0; width: 100vw; max-height: none; height: 100dvh;
+    border-radius: 0; border: 0; padding: 20px; z-index: 90; overflow-y: auto;
+  }
+}
 .bell-offbtn {
   width: 100%; margin-top: 8px; padding: 8px 12px; border-radius: 8px;
   border: 1px solid var(--line-2); background: none; color: var(--ink-2);
@@ -378,23 +418,36 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 }
 .alerts-off-all:hover { border-color: var(--amber-ink); color: var(--amber-ink); }
 .alert-row {
-  display: grid; grid-template-columns: 1fr auto auto auto; gap: 12px; align-items: center;
+  display: grid; grid-template-columns: 1fr auto auto auto; gap: 4px 12px; align-items: center;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  padding: 11px 14px;
+  padding: 12px 14px;
 }
+.alert-row.dead { border-style: dashed; opacity: .8; }
 .alert-route { text-decoration: none; display: grid; gap: 3px; min-width: 0; }
 .alert-cabs { display: flex; gap: 4px; }
 .alert-cabs .swatch { width: 10px; height: 10px; border-radius: 3px; }
 .alert-kind { font-family: var(--font-data); font-size: 11px; color: var(--ink-3); white-space: nowrap; }
+.alert-actions { display: flex; gap: 8px; align-items: center; }
+.alert-edit { font-size: 12px; color: var(--gold); text-decoration: none; white-space: nowrap; }
+.alert-edit:hover { text-decoration: underline; }
 .alert-off {
   border: 1px solid var(--line-2); background: none; color: var(--ink-2);
   border-radius: 8px; padding: 5px 11px; cursor: pointer; font-size: 12px; white-space: nowrap;
 }
 .alert-off:hover { border-color: var(--amber-ink); color: var(--amber-ink); }
+/* The constraint + status lines span the full row, under the route. */
+.alert-when {
+  grid-column: 1 / -1; font-family: var(--font-data); font-size: 11.5px; color: var(--ink-2);
+}
+.alert-state { grid-column: 1 / -1; font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
+.as-ok { color: var(--cab-w); }
+.as-idle { color: var(--ink-3); }
+.as-warn { color: var(--amber-ink); }
+.as-last { color: var(--ink-3); font-family: var(--font-data); font-size: 11px; }
 @media (max-width: 560px) {
   .alert-row { grid-template-columns: 1fr auto; row-gap: 8px; }
   .alert-kind { grid-column: 1; }
-  .alert-off { grid-column: 2; }
+  .alert-actions { grid-column: 2; }
 }
 .bell-note { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-2); line-height: 1.45; }
 .bell-note b { color: var(--ink); }

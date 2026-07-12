@@ -102,9 +102,6 @@ function baBookingURL(origin, dest, outIso, bit, returnIso) {
 const PUSH_API = "https://alerts-rewardflights.lucy.sh";
 const VAPID_PUBLIC_KEY = "BMHjtxbmirrQAoG2QNGDFNRZ-n5ijHTz99bVUkVLEAJDWsv3Ks6DSoKK88WKhCDk3rS_CmIDPWifQupVjL15TtQ";
 
-/* A topic is one thing a person actually wants: "Business round trips on
-   LON⇄TYO". kind: "rt" (round trip) | "ow" (one way). */
-const topicFor = (routeKey, kind, bit) => `rf_${routeKey}_${kind}_${CABIN_CODE[bit]}`;
 
 const pushSupported = () =>
   "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
@@ -194,19 +191,23 @@ const subPayload = (sub) => ({
   auth: b64url(sub.getKey("auth")),
 });
 
-/* The store holds the full topic set per endpoint, so changing one route's
-   alerts means sending the whole set back. */
-async function fetchTopics(sub) {
-  const res = await fetch(`${PUSH_API}/topics?endpoint=${encodeURIComponent(sub.endpoint)}`);
+/* A watch is one thing a person wants: a route, a direction, some cabins, and
+   — the point of all this — when they can actually travel.
+     {route, kind:"rt"|"ow", cabins:["C","F"],
+      out?:{from,to}, ret?:{from,to}, nights?:{min,max}}
+   Omitting `out` means "any time"; omitting `ret`/`nights` on a round trip
+   means "wherever the nights window lands me". */
+
+async function fetchWatches(sub) {
+  const res = await fetch(`${PUSH_API}/watches?endpoint=${encodeURIComponent(sub.endpoint)}`);
   if (!res.ok) throw new Error(`alert service unavailable (${res.status})`);
-  return new Set((await res.json()).topics || []);
+  return (await res.json()).watches || [];
 }
 
-async function saveTopics(sub, topics) {
-  const list = [...topics];
-  if (!list.length) {
-    // No topics left: drop the subscription entirely rather than keeping a
-    // dangling endpoint on file.
+async function saveWatches(sub, watches) {
+  if (!watches.length) {
+    // Nothing left to watch: drop the subscription rather than keep a dangling
+    // endpoint on file.
     await fetch(`${PUSH_API}/unsubscribe`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ endpoint: sub.endpoint }),
@@ -216,47 +217,128 @@ async function saveTopics(sub, topics) {
   }
   const res = await fetch(`${PUSH_API}/subscribe`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...subPayload(sub), topics: list }),
+    body: JSON.stringify({ ...subPayload(sub), watches }),
   });
-  if (!res.ok) throw new Error(`couldn't save alerts (${res.status})`);
-}
-
-/* Topic → {route, kind, bit}. Inverse of topicFor. */
-function parseTopic(t) {
-  const m = /^rf_([A-Z]{3}-[A-Z]{3})_(ow|rt)_([MWCF])$/.exec(t || "");
-  if (!m) return null;
-  const bit = { M: 1, W: 2, C: 4, F: 8 }[m[3]];
-  return { route: m[1], kind: m[2], bit };
-}
-
-/* Everything this device is watching, grouped into one row per route+kind. */
-function groupTopics(topics) {
-  const g = new Map();
-  for (const t of topics) {
-    const p = parseTopic(t);
-    if (!p) continue;
-    const k = `${p.route}|${p.kind}`;
-    if (!g.has(k)) g.set(k, { route: p.route, kind: p.kind, bits: [] });
-    g.get(k).bits.push(p.bit);
+  if (!res.ok) {
+    const detail = await res.json().catch(() => ({}));
+    throw new Error(detail.error || `couldn't save alerts (${res.status})`);
   }
-  return [...g.values()]
-    .map((x) => ({ ...x, bits: x.bits.sort((a, b) => a - b) }))
-    .sort((a, b) => a.route.localeCompare(b.route) || a.kind.localeCompare(b.kind));
 }
 
-/* Push subscriptions expire (the browser or push service can retire an
-   endpoint). When that happens the server drops it, so retrying is pointless —
-   the device needs a brand-new endpoint carrying the same topics. */
-async function renewSubscription(topics) {
-  const reg = await ensureSW();
-  const old = await reg.pushManager.getSubscription();
-  if (old) await old.unsubscribe().catch(() => {});
-  const sub = await getSubscription({ create: true });
-  await saveTopics(sub, topics);
-  return sub;
+/* ---------------- watches: helpers + the live match count ---------------- */
+
+const CABIN_BIT = { M: 1, W: 2, C: 4, F: 8 };
+const watchMask = (w) => (w.cabins || []).reduce((m, c) => m | (CABIN_BIT[c] || 0), 0);
+const reverseRoute = (r) => r.split("-").reverse().join("-");
+const NIGHTS_ANY = [1, 30];
+
+/* Day index (into the bundle) for an ISO date, unclamped. */
+function isoToIdx(iso) {
+  const [y, m, d] = (iso || "").split("-").map(Number);
+  if (!y) return null;
+  return Math.round((Date.UTC(y, m - 1, d) - store.epochMs) / DAY_MS);
+}
+const idxToIso = (i) => isoOf(dayDate(i));
+
+/* THE credibility feature. A date-constrained watch can be legitimately silent
+   for weeks, and the user will assume it's broken. The whole dataset is already
+   in memory, so we can answer "what matches RIGHT NOW?" instantly, with no
+   network — while they're still choosing the dates.
+   Returns {pairs, perCabin: Map<bit,count>, first: {out,ret}|null}. */
+function matchesNow(w) {
+  const empty = { pairs: 0, perCabin: new Map(), first: null };
+  if (!store.bundle || !store.bundle.routes[w.route]) return empty;
+  const mask = watchMask(w);
+  if (!mask) return empty;
+
+  const t0 = Math.max(0, todayIndex());
+  const last = store.bundle.days - 1;
+  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+  const oFrom = w.out?.from ? clamp(isoToIdx(w.out.from), t0, last) : t0;
+  const oTo = w.out?.to ? clamp(isoToIdx(w.out.to), t0, last) : last;
+
+  const out = routeBits(w.route);
+  const perCabin = new Map();
+  let pairs = 0, first = null;
+
+  if (w.kind === "ow") {
+    for (let d = oFrom; d <= oTo; d++) {
+      const v = out[d] & mask;
+      if (!v) continue;
+      pairs++;
+      if (!first) first = { out: idxToIso(d), ret: null };
+      for (const [bit] of cabinLegend()) if (v & bit) perCabin.set(bit, (perCabin.get(bit) || 0) + 1);
+    }
+    return { pairs, perCabin, first };
+  }
+
+  const rev = reverseRoute(w.route);
+  if (!store.bundle.routes[rev]) return empty;      // a round trip needs a way home
+  const ret = routeBits(rev);
+  const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
+  // No return range given → it's implied by the outbound window + nights.
+  const rFrom = w.ret?.from ? clamp(isoToIdx(w.ret.from), t0, last) : t0;
+  const rTo = w.ret?.to ? clamp(isoToIdx(w.ret.to), t0, last) : last;
+
+  for (let d = oFrom; d <= oTo; d++) {
+    const o = out[d] & mask;
+    if (!o) continue;
+    const lo = Math.max(d + minN, rFrom);
+    const hi = Math.min(d + maxN, rTo, last);
+    for (let r = lo; r <= hi; r++) {
+      const both = o & ret[r];                       // same cabin on BOTH legs
+      if (!both) continue;
+      pairs++;
+      if (!first) first = { out: idxToIso(d), ret: idxToIso(r) };
+      for (const [bit] of cabinLegend()) if (both & bit) perCabin.set(bit, (perCabin.get(bit) || 0) + 1);
+    }
+  }
+  return { pairs, perCabin, first };
 }
 
-/* The current subscription and its topics, or null if this device isn't
+/* Why a watch can never fire — so we can say so instead of leaving it silent. */
+function watchProblem(w) {
+  const t0 = Math.max(0, todayIndex());
+  if (w.kind === "rt" && !store.bundle?.routes?.[reverseRoute(w.route)]) {
+    return "There's no return route in the data, so a round trip can't be found.";
+  }
+  if (w.out?.to && isoToIdx(w.out.to) < t0) return "These dates have passed.";
+  if (w.kind === "rt" && w.out && w.ret) {
+    const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
+    if (isoToIdx(w.ret.to) < isoToIdx(w.out.from) + minN) {
+      return `Your return window ends before your outbound date plus ${minN} night${minN > 1 ? "s" : ""}.`;
+    }
+    if (isoToIdx(w.ret.from) > isoToIdx(w.out.to) + maxN) {
+      return `Your return window starts after the longest trip you'd take (${maxN} nights).`;
+    }
+  }
+  return null;
+}
+
+/* "1–20 Oct" / "28 Sep–5 Oct" / "28 Dec–4 Jan 2027" */
+function fmtRange(fromIso, toIso) {
+  if (!fromIso) return "any date";
+  const a = dayDate(isoToIdx(fromIso)), b = dayDate(isoToIdx(toIso));
+  const thisYear = new Date().getUTCFullYear();
+  const mA = fmtMonthShort.format(a), mB = fmtMonthShort.format(b);
+  const yB = b.getUTCFullYear() !== thisYear ? ` ${b.getUTCFullYear()}` : "";
+  if (fromIso === toIso) return `${a.getUTCDate()} ${mA}${yB}`;
+  if (mA === mB && !yB) return `${a.getUTCDate()}–${b.getUTCDate()} ${mA}`;
+  return `${a.getUTCDate()} ${mA}–${b.getUTCDate()} ${mB}${yB}`;
+}
+
+/* One line describing what a watch is watching. */
+function watchSummary(w) {
+  const bits = [];
+  bits.push(w.out ? `Out ${fmtRange(w.out.from, w.out.to)}` : "Any date");
+  if (w.kind === "rt") {
+    if (w.ret) bits.push(`back ${fmtRange(w.ret.from, w.ret.to)}`);
+    if (w.nights) bits.push(`${w.nights.min}–${w.nights.max} nights`);
+  }
+  return bits.join(" · ");
+}
+
+/* The current subscription and its watches, or null if this device isn't
    watching anything. Never throws — alerts are an enhancement, and the page
    must render fine when the alert service is unreachable. */
 async function currentAlerts() {
@@ -264,7 +346,7 @@ async function currentAlerts() {
     if (!pushSupported() || Notification.permission !== "granted") return null;
     const sub = await getSubscription();
     if (!sub) return null;
-    return { sub, topics: await fetchTopics(sub) };
+    return { sub, watches: await fetchWatches(sub) };
   } catch { return null; }
 }
 
@@ -991,10 +1073,8 @@ function refreshHomeModules() {
    the push subscription) and simply absent when there's nothing to show. */
 async function buildAlertsPanel(mount) {
   const data = await currentAlerts();
-  if (!data || !data.topics.size) { mount.innerHTML = ""; return; }
+  if (!data || !data.watches.length) { mount.innerHTML = ""; return; }
 
-  const rerender = () => buildAlertsPanel(mount);
-  const groups = groupTopics(data.topics);
   mount.innerHTML = "";
   const sec = el(`<section class="module alerts-mod">
     <h2><span class="dot" aria-hidden="true"></span>Your alerts
@@ -1002,43 +1082,57 @@ async function buildAlertsPanel(mount) {
     <div class="card-list"></div>
   </section>`);
   const list = $(".card-list", sec);
-
-  for (const g of groups) {
-    const [o, d] = g.route.split("-");
-    const href = `${g.kind === "rt" ? "/trip" : "/route"}/${g.route}`;
-    const arrow = g.kind === "rt" ? "⇄" : "→";
-    const cabs = g.bits.map((bit) =>
-      `<span class="swatch ${bitClass(bit)}" title="${esc(cabinLabel(bit))}"></span>`).join("");
-    const row = el(`<div class="alert-row">
-      <a class="alert-route" href="${href}">
-        <span class="rc-route">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</span>
-        <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
-      </a>
-      <span class="alert-cabs" aria-label="${esc(g.bits.map(cabinLabel).join(", "))}">${cabs}</span>
-      <span class="alert-kind">${g.kind === "rt" ? "round trip" : "one way"}</span>
-      <button type="button" class="alert-off" aria-label="Turn off alerts for ${o} to ${d}">Turn off</button>
-    </div>`);
-    $(".alert-off", row).addEventListener("click", async (e) => {
-      const btn = e.currentTarget;
-      btn.disabled = true; btn.textContent = "…";
-      const keep = new Set([...data.topics].filter((t) => {
-        const p = parseTopic(t);
-        return !(p && p.route === g.route && p.kind === g.kind);
-      }));
-      try {
-        await saveTopics(data.sub, keep);
-        announce(`Alerts off for ${o} to ${d}.`);
-        refreshAlertCount();
-        rerender();
-      } catch (err) {
-        btn.disabled = false; btn.textContent = "Turn off";
-        announce(String(err.message || err));
-      }
-    });
-    list.append(row);
-  }
-
+  for (const w of data.watches) list.append(alertRow(w, data, () => buildAlertsPanel(mount)));
   mount.append(sec);
+}
+
+/* One row describing a watch: what, when, and whether anything matches today.
+   Shared by the home panel and the /alerts page. */
+function alertRow(w, data, rerender, { editable = false } = {}) {
+  const [o, d] = w.route.split("-");
+  const href = `${w.kind === "rt" ? "/trip" : "/route"}/${w.route}`;
+  const arrow = w.kind === "rt" ? "⇄" : "→";
+  const cabs = (w.cabins || []).map((c) => CABIN_BIT[c]).filter(Boolean);
+  const problem = watchProblem(w);
+  const m = problem ? null : matchesNow(w);
+
+  const row = el(`<div class="alert-row${problem ? " dead" : ""}">
+    <a class="alert-route" href="${href}">
+      <span class="rc-route">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</span>
+      <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
+    </a>
+    <span class="alert-cabs" aria-label="${esc(cabs.map(cabinLabel).join(", "))}">${
+      cabs.map((bit) => `<span class="swatch ${bitClass(bit)}" title="${esc(cabinLabel(bit))}"></span>`).join("")
+    }</span>
+    <span class="alert-kind">${w.kind === "rt" ? "round trip" : "one way"}</span>
+    <span class="alert-actions">
+      ${editable ? `<a class="alert-edit" href="${href}?alert=1">Edit</a>` : ""}
+      <button type="button" class="alert-off" aria-label="Turn off alerts for ${o} to ${d}">Turn off</button>
+    </span>
+    <span class="alert-when">${esc(watchSummary(w))}</span>
+    <span class="alert-state">${problem
+      ? `<span class="as-warn">⚠ ${esc(problem)}</span>`
+      : m.pairs
+        ? `<span class="as-ok">● Armed · ${m.pairs} ${w.kind === "rt" ? "round trip" : "date"}${m.pairs > 1 ? "s" : ""} match right now</span>`
+        : `<span class="as-idle">● Armed · nothing matches yet — we'll tell you</span>`}
+      ${w.lastFiredAt ? `<span class="as-last">Last alert ${esc(timeAgo(w.lastFiredAt))}</span>` : ""}
+    </span>
+  </div>`);
+
+  $(".alert-off", row).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "…";
+    try {
+      await saveWatches(data.sub, data.watches.filter((x) => x.id !== w.id));
+      announce(`Alerts off for ${o} to ${d}.`);
+      refreshAlertCount();
+      rerender();
+    } catch (err) {
+      btn.disabled = false; btn.textContent = "Turn off";
+      announce(String(err.message || err));
+    }
+  });
+  return row;
 }
 
 function cabinLabel(bit) {
@@ -1192,9 +1286,17 @@ function tripDayIndex(iso) {
 }
 
 /* Alert bell for a route. `kind` is "rt" on /trip/ (round trips — the prize)
-   or "ow" on /route/. Cabins are pre-ticked from the filter the user already
-   set, because that IS their stated preference. */
-function alertBell(routeKey, kind, defaultMask) {
+   or "ow" on /route/.
+
+   Two principles, both load-bearing:
+   1. INHERIT, DON'T ASK. By the time the bell is clicked the page already knows
+      the cabins (the filter), the trip length, and often a chosen outbound day.
+      Read all three; most people should never touch a date field.
+   2. SHOW THE ANSWER WHILE THEY CHOOSE. The whole dataset is in memory, so every
+      change re-answers "how many trips match right now?" instantly. That is what
+      stops a legitimately-silent alert from looking broken, and it catches a
+      too-narrow window before it is saved rather than after weeks of nothing. */
+function alertBell(routeKey, kind, defaultMask, ctx = {}) {
   const [o, d] = routeKey.split("-");
   const wrap = el(`<div class="bell-wrap"></div>`);
   const btn = el(`<button type="button" class="btn bell-btn" aria-expanded="false"
@@ -1205,9 +1307,9 @@ function alertBell(routeKey, kind, defaultMask) {
   const legend = cabinLegend();
   const arrow = kind === "rt" ? "⇄" : "→";
 
-  function setLabel(n) {
-    $(".bell-label", btn).textContent = n ? `Alerts on (${n})` : "Alert me";
-    btn.classList.toggle("on", !!n);
+  function setLabel(on) {
+    $(".bell-label", btn).textContent = on ? "Alerts on" : "Alert me";
+    btn.classList.toggle("on", !!on);
   }
 
   async function refreshLabel() {
@@ -1215,8 +1317,8 @@ function alertBell(routeKey, kind, defaultMask) {
     try {
       const sub = await getSubscription();
       if (!sub) return;
-      const topics = await fetchTopics(sub);
-      setLabel(legend.filter(([bit]) => topics.has(topicFor(routeKey, kind, bit))).length);
+      const watches = await fetchWatches(sub);
+      setLabel(watches.some((w) => w.route === routeKey && w.kind === kind));
     } catch { /* label is cosmetic; never break the page over it */ }
   }
   refreshLabel();
@@ -1235,8 +1337,6 @@ function alertBell(routeKey, kind, defaultMask) {
     document.addEventListener("keydown", onKey);
     document.addEventListener("click", onOutside, true);
 
-    // iOS only exposes push to an installed web app — say so plainly instead
-    // of offering a button that silently can't work.
     if (!pushSupported()) {
       pop.innerHTML = isIOS() && !isStandalone()
         ? `<p class="bell-note"><b>Add Reward Flights to your Home Screen</b> to get alerts on iPhone —
@@ -1249,100 +1349,250 @@ function alertBell(routeKey, kind, defaultMask) {
       return;
     }
 
-    pop.innerHTML = `<div class="sk-line" style="height:96px"></div>`;
-    let current = new Set();
+    pop.innerHTML = `<div class="sk-line" style="height:150px"></div>`;
+    let all = [], mine = null;
     try {
-      const sub = await getSubscription();           // no permission prompt yet
-      if (sub) current = await fetchTopics(sub);
-    } catch { /* offline / store down → fall through to a fresh panel */ }
+      const sub = await getSubscription();               // no permission prompt yet
+      if (sub) all = await fetchWatches(sub);
+      mine = all.find((w) => w.route === routeKey && w.kind === kind) || null;
+    } catch { /* store unreachable → offer a fresh panel anyway */ }
 
-    const mine = new Set(legend.filter(([bit]) => current.has(topicFor(routeKey, kind, bit)))
-      .map(([bit]) => bit));
-    // Nothing set yet → pre-tick the cabins they're already filtering for.
-    const start = mine.size ? mine : new Set(legend.filter(([bit]) => bit & defaultMask).map(([b]) => b));
+    renderPanel(mine, all);
+  }
+
+  function renderPanel(mine, all) {
+    // Seed from the existing watch if there is one; otherwise from what the
+    // user has already told this page (cabin filter + trip length + picked day).
+    const seedMask = mine ? watchMask(mine) : (defaultMask || 15);
+    const nights = mine?.nights
+      ? [mine.nights.min, mine.nights.max]
+      : (kind === "rt" ? (ctx.nights || NIGHTS_ANY) : null);
+    let mode = mine?.out ? "exact" : (ctx.pickedOut && !mine ? "around" : "any");
+    if (mine?.out && ctx.pickedOut && !mine.ret) mode = "exact";
+    let flex = 7;
+    let outFrom = mine?.out?.from || "", outTo = mine?.out?.to || "";
+    let retFrom = mine?.ret?.from || "", retTo = mine?.ret?.to || "";
 
     pop.innerHTML = "";
-    pop.append(el(`<p class="bell-title">${mine.size ? "Alerting you when a" : "Alert me when a"}
+    pop.append(el(`<p class="bell-title">${mine ? "Alerting you when a" : "Alert me when a"}
       ${kind === "rt" ? "round trip" : "one-way seat"} opens on ${o} ${arrow} ${d}</p>`));
-    const cabs = el(`<div class="bell-cabs" role="group" aria-label="Cabins to watch"></div>`);
+
+    /* --- cabins --- */
+    const cabs = el(`<div class="bell-sec"><h3>Cabins</h3>
+      <div class="bell-cabs" role="group" aria-label="Cabins to watch"></div></div>`);
     for (const [bit, label] of legend) {
-      const on = start.has(bit);
+      const on = !!(seedMask & bit);
       const row = el(`<button type="button" class="bell-cab" role="checkbox" aria-checked="${on}" data-bit="${bit}">
         <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
         <span class="bell-cab-label">${esc(label)}</span>
       </button>`);
       row.addEventListener("click", () => {
-        const now = row.getAttribute("aria-checked") !== "true";
-        row.setAttribute("aria-checked", String(now));
+        row.setAttribute("aria-checked", String(row.getAttribute("aria-checked") !== "true"));
+        recount();
       });
-      cabs.append(row);
+      $(".bell-cabs", cabs).append(row);
     }
     pop.append(cabs);
-    const save = el(`<button type="button" class="btn bell-save">${mine.size ? "Update alerts" : "Save alerts"}</button>`);
-    const status = el(`<p class="bell-note" role="status"></p>`);
-    pop.append(save);
-    // Already watching this route? Offer a one-click off switch — untick-all-
-    // then-save is not a thing anyone should have to discover.
-    if (mine.size) {
+
+    /* --- when can you travel? --- */
+    const when = el(`<div class="bell-sec"><h3>When can you travel?</h3>
+      <div class="bell-modes" role="radiogroup" aria-label="When can you travel">
+        <button type="button" class="bell-mode" role="radio" data-mode="any">Any time</button>
+        ${ctx.pickedOut ? `<button type="button" class="bell-mode" role="radio" data-mode="around">Around ${esc(fmtShort.format(dayDate(dayIndexOf(ctx.pickedOut))))}</button>` : ""}
+        <button type="button" class="bell-mode" role="radio" data-mode="exact">Exact dates</button>
+      </div>
+      <div class="bell-when-body"></div>
+    </div>`);
+    pop.append(when);
+    const whenBody = $(".bell-when-body", when);
+
+    const countLine = el(`<p class="bell-count" role="status"></p>`);
+    const save = el(`<button type="button" class="btn bell-save">${mine ? "Update alerts" : "Save alerts"}</button>`);
+    pop.append(countLine, save);
+
+    if (mine) {
       const off = el(`<button type="button" class="bell-offbtn">Turn off alerts for this route</button>`);
-      off.addEventListener("click", async () => {
-        off.disabled = true;
-        status.textContent = "Turning off…";
-        try {
-          const sub = await getSubscription({ create: true });
-          const topics = await fetchTopics(sub).catch(() => new Set());
-          for (const [bit] of legend) topics.delete(topicFor(routeKey, kind, bit));
-          await saveTopics(sub, topics);
-          setLabel(0);
-          refreshAlertCount();
-          status.textContent = "Alerts off for this route.";
-          announce(status.textContent);
-          setTimeout(close, 1200);
-        } catch (err) {
-          off.disabled = false;
-          status.textContent = String(err.message || err);
-        }
-      });
+      off.addEventListener("click", () => commit(null, off));
       pop.append(off);
     }
-    pop.append(status);
+    const note = el(`<p class="bell-note" role="status"></p>`);
+    pop.append(note);
 
-    save.addEventListener("click", async () => {
-      save.disabled = true;
-      status.textContent = "Saving…";
-      const want = [...cabs.querySelectorAll('[aria-checked="true"]')].map((r) => Number(r.dataset.bit));
-      try {
-        // Permission is only requested here — at the moment they ask for it.
-        const sub = await getSubscription({ create: true });
-        const topics = await fetchTopics(sub).catch(() => new Set());
-        for (const [bit] of legend) {
-          const t = topicFor(routeKey, kind, bit);
-          if (want.includes(bit)) topics.add(t); else topics.delete(t);
+    function setMode(m) {
+      mode = m;
+      for (const b of when.querySelectorAll(".bell-mode")) {
+        const on = b.dataset.mode === m;
+        b.setAttribute("aria-checked", String(on));
+        b.classList.toggle("on", on);
+      }
+      drawWhen();
+      recount();
+    }
+
+    function drawWhen() {
+      whenBody.innerHTML = "";
+      if (mode === "any") {
+        whenBody.append(el(`<p class="bell-hint">We'll alert you whenever space opens, on any date${
+          kind === "rt" && nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.</p>`));
+        return;
+      }
+      if (mode === "around") {
+        const chips = el(`<div class="bell-flex" role="group" aria-label="How flexible are your dates">
+          ${[3, 7, 14].map((n) => `<button type="button" class="np" data-flex="${n}"
+            aria-pressed="${n === flex}">±${n} days</button>`).join("")}
+        </div>`);
+        chips.querySelectorAll(".np").forEach((b) => b.addEventListener("click", () => {
+          flex = Number(b.dataset.flex);
+          chips.querySelectorAll(".np").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+          drawDerived();
+          recount();
+        }));
+        whenBody.append(chips, el(`<p class="bell-hint bell-derived"></p>`));
+        drawDerived();
+        return;
+      }
+      // exact
+      const t0 = Math.max(0, todayIndex());
+      const minIso = idxToIso(t0), maxIso = idxToIso(store.bundle.days - 1);
+      whenBody.append(el(`<div class="bell-dates">
+        <label>Leave between
+          <span><input type="date" class="bd-of" min="${minIso}" max="${maxIso}" value="${esc(outFrom || defaultOut()[0])}">
+          <input type="date" class="bd-ot" min="${minIso}" max="${maxIso}" value="${esc(outTo || defaultOut()[1])}"></span>
+        </label>
+        ${kind === "rt" ? `<label>Come back between
+          <span><input type="date" class="bd-rf" min="${minIso}" max="${maxIso}" value="${esc(retFrom || "")}">
+          <input type="date" class="bd-rt" min="${minIso}" max="${maxIso}" value="${esc(retTo || "")}"></span>
+        </label>
+        <p class="bell-hint">Leave the return blank and we'll work it out from your trip length${
+          nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.</p>` : ""}
+      </div>`));
+      for (const i of whenBody.querySelectorAll("input")) {
+        i.addEventListener("input", () => {
+          outFrom = $(".bd-of", whenBody).value; outTo = $(".bd-ot", whenBody).value;
+          if (kind === "rt") { retFrom = $(".bd-rf", whenBody)?.value || ""; retTo = $(".bd-rt", whenBody)?.value || ""; }
+          recount();
+        });
+      }
+    }
+
+    function defaultOut() {
+      const t0 = Math.max(0, todayIndex());
+      const anchor = ctx.pickedOut ? dayIndexOf(ctx.pickedOut) : t0;
+      return [idxToIso(Math.max(t0, anchor)), idxToIso(Math.min(store.bundle.days - 1, anchor + 30))];
+    }
+
+    function drawDerived() {
+      const w = build();
+      const p = $(".bell-derived", whenBody);
+      if (p && w?.out) {
+        p.textContent = `Out ${fmtRange(w.out.from, w.out.to)}` +
+          (w.kind === "rt" ? ` · back ${fmtRange(w.ret.from, w.ret.to)} · ${w.nights.min}–${w.nights.max} nights` : "");
+      }
+    }
+
+    /* The watch the panel currently describes (null if no cabins ticked). */
+    function build() {
+      const cabins = [...pop.querySelectorAll('.bell-cab[aria-checked="true"]')]
+        .map((r) => CABIN_CODE[Number(r.dataset.bit)]).filter(Boolean);
+      if (!cabins.length) return null;
+      const w = { route: routeKey, kind, cabins };
+      if (kind === "rt" && nights) w.nights = { min: nights[0], max: nights[1] };
+
+      if (mode === "around" && ctx.pickedOut) {
+        const t0 = Math.max(0, todayIndex()), last = store.bundle.days - 1;
+        const a = dayIndexOf(ctx.pickedOut);
+        w.out = { from: idxToIso(Math.max(t0, a - flex)), to: idxToIso(Math.min(last, a + flex)) };
+        if (kind === "rt") {
+          // The return window is implied — don't make them state it twice.
+          const rf = Math.min(last, isoToIdx(w.out.from) + w.nights.min);
+          const rt = Math.min(last, isoToIdx(w.out.to) + w.nights.max);
+          w.ret = { from: idxToIso(rf), to: idxToIso(rt) };
         }
-        await saveTopics(sub, topics);
-        setLabel(want.length);
+      } else if (mode === "exact") {
+        const [df, dt] = defaultOut();
+        w.out = { from: outFrom || df, to: outTo || dt };
+        if (kind === "rt" && (retFrom || retTo)) {
+          const last = store.bundle.days - 1;
+          w.ret = {
+            from: retFrom || idxToIso(Math.min(last, isoToIdx(w.out.from) + w.nights.min)),
+            to: retTo || idxToIso(Math.min(last, isoToIdx(w.out.to) + w.nights.max)),
+          };
+        }
+      }
+      return w;
+    }
+
+    /* Live feedback: what matches right now, plus why it can never match. */
+    function recount() {
+      const w = build();
+      if (!w) {
+        countLine.className = "bell-count warn";
+        countLine.textContent = "Pick at least one cabin.";
+        save.disabled = true;
+        return;
+      }
+      const problem = watchProblem(w);
+      if (problem) {
+        countLine.className = "bell-count warn";
+        countLine.textContent = problem;
+        save.disabled = true;
+        return;
+      }
+      save.disabled = false;
+      const { pairs } = matchesNow(w);
+      const what = kind === "rt" ? "round trip" : "date";
+      countLine.className = pairs ? "bell-count ok" : "bell-count none";
+      countLine.textContent = pairs
+        ? `${pairs} ${what}${pairs > 1 ? "s" : ""} match right now`
+        : `Nothing matches right now — we'll tell you the moment something opens.`;
+    }
+
+    async function commit(w, btnEl) {
+      btnEl.disabled = true;
+      const was = btnEl.textContent;
+      btnEl.textContent = w ? "Saving…" : "Turning off…";
+      note.textContent = "";
+      try {
+        const sub = await getSubscription({ create: true });
+        const list = (await fetchWatches(sub).catch(() => []))
+          .filter((x) => !(x.route === routeKey && x.kind === kind));
+        if (w) list.push(w);
+        await saveWatches(sub, list);
+        setLabel(!!w);
         refreshAlertCount();
-        status.textContent = want.length
-          ? `Watching ${want.length} cabin${want.length > 1 ? "s" : ""}. We'll notify you the moment space opens.`
+        note.textContent = w
+          ? "Armed. We'll tell you the moment new space opens in your dates."
           : "Alerts off for this route.";
-        announce(status.textContent);
-        setTimeout(close, 1400);
+        announce(note.textContent);
+        setTimeout(close, 1500);
       } catch (err) {
+        btnEl.disabled = false; btnEl.textContent = was;
         if (err instanceof PermissionError) {
-          // The browser refused to ask (or the user said no) — plain text can't
-          // explain that; show the where-to-click guidance instead.
-          status.innerHTML = permissionHelpHTML(err.state);
+          note.innerHTML = permissionHelpHTML(err.state);
           announce("Your browser hid the notification permission prompt.");
         } else {
-          status.textContent = String(err.message || err);
+          note.textContent = String(err.message || err);
         }
-        save.disabled = false;
       }
+    }
+
+    save.addEventListener("click", () => {
+      const w = build();
+      if (w) commit(w, save);
     });
+
+    when.querySelectorAll(".bell-mode").forEach((b) =>
+      b.addEventListener("click", () => setMode(b.dataset.mode)));
+    setMode(mode);
     $(".bell-cab", pop)?.focus();
   }
 
   btn.addEventListener("click", () => (pop.hidden ? open() : close()));
+  // /alerts "Edit" deep-links here with ?alert=1 — open the panel on arrival so
+  // editing a watch is one click, using the same component that created it.
+  if (new URLSearchParams(location.search).get("alert") === "1") {
+    setTimeout(() => { if (pop.hidden) open(); }, 0);
+  }
   return wrap;
 }
 
@@ -1686,8 +1936,13 @@ function renderTrip(o, d) {
 
   toolbar.append(buildNightsControl());
   rebuildChips(); // synchronously sets mask + first drawCalendars()
-  // The prize: "tell me when a Business round trip opens on this pair".
-  toolbar.append(alertBell(key, "rt", mask));
+  // The prize: "tell me when a Business round trip opens on this pair". The
+  // bell inherits the trip length and the day they've clicked, so most people
+  // never touch a date field.
+  toolbar.append(alertBell(key, "rt", mask, {
+    get nights() { return nights.slice(); },
+    get pickedOut() { return params.get("out") || null; },
+  }));
 
   function drawCalendars() {
     const animate = firstDraw;
@@ -2277,7 +2532,7 @@ function refreshAlertCount() {
   const link = $("#alerts-link");
   if (!link) return;
   currentAlerts().then((data) => {
-    const n = data ? groupTopics(data.topics).length : 0;
+    const n = data ? data.watches.length : 0;
     link.hidden = false;
     $(".al-count", link).textContent = n ? String(n) : "";
     link.classList.toggle("on", n > 0);
@@ -2322,13 +2577,14 @@ async function drawAlertsPage(body) {
   }
 
   const data = await currentAlerts();
-  const groups = data ? groupTopics(data.topics) : [];
+  const watches = data ? data.watches : [];
 
-  if (!groups.length) {
+  if (!watches.length) {
     body.append(el(`<div class="empty-state">
       <div class="big">You're not watching anything yet</div>
       <p>Open any route and hit <b>🔔 Alert me</b> to be told the moment award space opens —
-         pick the cabins you care about, and we'll only bother you when they're bookable.</p>
+         pick the cabins you care about and when you can actually travel, and we'll only
+         bother you when a trip you could really take becomes bookable.</p>
       <p><a class="btn" href="/">Find a route</a></p>
     </div>`));
     body.append(alertsFooterHTML());
@@ -2336,7 +2592,7 @@ async function drawAlertsPage(body) {
   }
 
   const head = el(`<div class="alerts-head">
-    <p class="alerts-count">Watching <b>${groups.length}</b> route${groups.length > 1 ? "s" : ""}</p>
+    <p class="alerts-count">Watching <b>${watches.length}</b> route${watches.length > 1 ? "s" : ""}</p>
     <div class="alerts-actions">
       <button type="button" class="btn" id="alerts-test">Send a test notification</button>
       <button type="button" class="alerts-off-all" id="alerts-all-off">Turn all off</button>
@@ -2345,50 +2601,18 @@ async function drawAlertsPage(body) {
   body.append(head);
 
   const list = el(`<div class="card-list alerts-list"></div>`);
-  for (const g of groups) {
-    const [o, d] = g.route.split("-");
-    const href = `${g.kind === "rt" ? "/trip" : "/route"}/${g.route}`;
-    const arrow = g.kind === "rt" ? "⇄" : "→";
-    const row = el(`<div class="alert-row">
-      <a class="alert-route" href="${href}">
-        <span class="rc-route">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</span>
-        <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
-      </a>
-      <span class="alert-cabs" aria-label="${esc(g.bits.map(cabinLabel).join(", "))}">${
-        g.bits.map((bit) => `<span class="swatch ${bitClass(bit)}" title="${esc(cabinLabel(bit))}"></span>`).join("")
-      }</span>
-      <span class="alert-kind">${g.kind === "rt" ? "round trip" : "one way"}</span>
-      <button type="button" class="alert-off" aria-label="Turn off alerts for ${o} to ${d}">Turn off</button>
-    </div>`);
-    $(".alert-off", row).addEventListener("click", async (e) => {
-      const btn = e.currentTarget;
-      btn.disabled = true; btn.textContent = "…";
-      const keep = new Set([...data.topics].filter((t) => {
-        const p = parseTopic(t);
-        return !(p && p.route === g.route && p.kind === g.kind);
-      }));
-      try {
-        await saveTopics(data.sub, keep);
-        announce(`Alerts off for ${o} to ${d}.`);
-        refreshAlertCount();
-        drawAlertsPage(body);
-      } catch (err) {
-        btn.disabled = false; btn.textContent = "Turn off";
-        status(body, String(err.message || err));
-      }
-    });
-    list.append(row);
-  }
+  const rerender = () => drawAlertsPage(body);
+  for (const w of watches) list.append(alertRow(w, data, rerender, { editable: true }));
   body.append(list, el(`<p class="alerts-status" role="status"></p>`), alertsFooterHTML());
 
   $("#alerts-all-off", head).addEventListener("click", async (e) => {
     const btn = e.currentTarget;
     btn.disabled = true; btn.textContent = "…";
     try {
-      await saveTopics(data.sub, new Set());
+      await saveWatches(data.sub, []);
       announce("All alerts turned off.");
       refreshAlertCount();
-      drawAlertsPage(body);
+      rerender();
     } catch (err) {
       btn.disabled = false; btn.textContent = "Turn all off";
       status(body, String(err.message || err));
@@ -2408,7 +2632,7 @@ async function drawAlertsPage(body) {
         // The push service retired this device's endpoint; the server has
         // already dropped it. Re-subscribe transparently and keep the alerts.
         status(body, "Renewing this device's notifications…");
-        await renewSubscription(data.topics);
+        await renewSubscription(data.watches);
         // Re-render FIRST (it rebuilds the status line from scratch), then
         // report — otherwise the message is wiped the moment it's set.
         await drawAlertsPage(body);
