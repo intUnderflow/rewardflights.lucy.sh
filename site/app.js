@@ -828,7 +828,7 @@ function renderRoute(o, d) {
     <div class="route-title-row">
       <h1 class="route-title" aria-label="${o} to ${d}">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</h1>
       <div class="head-actions">
-        <a class="btn" href="/route/${d}-${o}" title="See the return direction">⇄ Return</a>
+        <a class="btn" href="/route/${d}-${o}" title="View the reverse one-way calendar (${d} to ${o})">⇄ View ${d} → ${o}</a>
       </div>
     </div>
     <p class="route-cities">${esc(placeName(o))}${placeCountry(o) ? `, ${esc(placeCountry(o))}` : ""}
@@ -1047,13 +1047,14 @@ async function openDayPanel(routeKey, idx) {
   panelEl.setAttribute("aria-modal", "true");
   panelEl.setAttribute("aria-labelledby", "dp-title");
   panelEl.innerHTML = "";
-  // Return-leg candidates: dates on the reverse route (dest→origin) on or
-  // after this outbound date. Used to optionally deep-link a round trip.
+  // Return-leg candidates: dates on the reverse route (dest→origin) strictly
+  // AFTER this outbound date — a zero-night same-day turnaround is never what
+  // an award traveller means by "return".
   const revKey = `${d}-${o}`;
   const revBits = store.bundle.routes[revKey] ? routeBits(revKey) : null;
   const returns = [];
   if (revBits) {
-    for (let i = idx; i < revBits.length; i++) {
+    for (let i = idx + 1; i < revBits.length; i++) {
       if (revBits[i]) returns.push({ iso: isoOf(dayDate(i)), bits: revBits[i] });
     }
   }
@@ -1092,15 +1093,28 @@ async function openDayPanel(routeKey, idx) {
   panelEl.addEventListener("keydown", trapTab);
 
   // Wire the return picker: rewrite each cabin link between one-way and round
-  // trip as the user picks a return date.
+  // trip as the user picks a return date. CRITICAL: BA applies one CabinCode
+  // to BOTH legs, so a round-trip link is only offered for cabins open on the
+  // outbound AND the chosen return — otherwise we'd deep-link users into an
+  // empty BA result ("this site lied to me").
   const returnSelect = $("#dp-return-date", panelEl);
   if (returnSelect) {
     returnSelect.addEventListener("change", () => {
       const ret = returnSelect.value || null;
+      const retBits = ret ? (returns.find((r) => r.iso === ret)?.bits ?? 0) : 0;
       for (const link of panelEl.querySelectorAll(".dp-cab")) {
         const bit = Number(link.dataset.bit);
-        link.href = baBookingURL(o, d, iso, bit, ret);
-        $(".dp-cab-go", link).textContent = ret ? "Search return ↗" : "Search one way ↗";
+        const bothLegs = !ret || (bit & retBits);
+        link.classList.toggle("off", !bothLegs);
+        if (bothLegs) {
+          link.href = baBookingURL(o, d, iso, bit, ret);
+          link.removeAttribute("aria-disabled");
+          $(".dp-cab-go", link).textContent = ret ? "Search return ↗" : "Search one way ↗";
+        } else {
+          link.removeAttribute("href");
+          link.setAttribute("aria-disabled", "true");
+          $(".dp-cab-go", link).textContent = "Not open on the return date";
+        }
       }
     });
   }
