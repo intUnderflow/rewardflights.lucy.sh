@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"encoding/base64"
 	"errors"
 	"fmt"
@@ -12,7 +13,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertapi"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alerts"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
 )
 
@@ -25,7 +28,13 @@ type watchConfig struct {
 	Commit   bool          // commit -Out when it changes
 	Push     bool          // push -Out after commit (implies Commit + pre-sync)
 	TokenCmd string        // shell command printing a git token to stdout; empty -> plain git
-	Alerts   alerts.Config // seat-alert publishing; disabled unless Worker is set
+
+	Alerts        alerts.Config // seat alerts; enabled when VapidKeyPath is set
+	AlertsStore   string        // subscription store file
+	AlertsMaxSubs int           // subscription cap
+	AlertsListen  string        // subscription API listen address; empty -> no API
+	AlertsRate    int           // API requests/min per client IP
+	AlertsBurst   int           // API rate-limit burst
 }
 
 // runWatch is the constantly-running mode: it watches the local source
@@ -43,21 +52,55 @@ func runWatch(cfg watchConfig) error {
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
 
-	// Seat alerts (optional): baseline on the bundle that is current at
-	// process start, so nothing already-visible alerts after a restart.
+	// Seat alerts (optional): the watcher owns the subscription store and
+	// serves the subscription API itself. Baseline on the bundle that is
+	// current at process start, so nothing already-visible alerts on restart.
 	var alerter *alerts.Watcher
-	if cfg.Alerts.Worker != "" {
-		cfg.Alerts.Logf = logf
+	var store *alertstore.Store
+	apiCtx, stopAPI := context.WithCancel(context.Background())
+	defer stopAPI()
+
+	if cfg.Alerts.VapidKeyPath != "" {
 		var err error
+		store, err = alertstore.Open(alertstore.Options{
+			Path: cfg.AlertsStore, MaxSubs: cfg.AlertsMaxSubs, Logf: logf,
+		})
+		if err != nil {
+			return err
+		}
+		// The store holds subscriptions: never lose them to an abrupt exit.
+		defer func() {
+			if err := store.Close(); err != nil {
+				logf("watch: alerts: flushing subscription store: %v", err)
+			}
+		}()
+
+		cfg.Alerts.Store = store
+		cfg.Alerts.Logf = logf
 		alerter, err = alerts.NewWatcher(cfg.Alerts)
 		if err != nil {
 			return err
 		}
+		logf("watch: alerts enabled (store=%s subs=%d)", cfg.AlertsStore, store.Count())
+
 		if raw, err := os.ReadFile(filepath.Join(cfg.Out, "availability.json")); err == nil {
 			alerter.Baseline(raw)
-			logf("watch: alerts enabled, baseline loaded")
+			logf("watch: alerts baseline loaded")
 		} else {
-			logf("watch: alerts enabled, no baseline yet (%v)", err)
+			logf("watch: alerts: no baseline yet (%v)", err)
+		}
+
+		if cfg.AlertsListen != "" {
+			api := alertapi.New(alertapi.Config{
+				Addr: cfg.AlertsListen, Store: store,
+				RatePerMin: cfg.AlertsRate, Burst: cfg.AlertsBurst, Logf: logf,
+			})
+			go func() {
+				logf("watch: subscription API listening on %s", cfg.AlertsListen)
+				if err := api.ListenAndServe(apiCtx); err != nil {
+					logf("watch: subscription API stopped: %v", err)
+				}
+			}()
 		}
 	}
 
@@ -128,6 +171,7 @@ func runWatch(cfg watchConfig) error {
 		select {
 		case <-stop:
 			logf("watch: signal received, exiting")
+			stopAPI() // graceful HTTP shutdown; the deferred store.Close flushes
 			return nil
 		case <-tick.C:
 			process()

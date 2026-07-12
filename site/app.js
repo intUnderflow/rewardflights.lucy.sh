@@ -99,7 +99,7 @@ function baBookingURL(origin, dest, outIso, bit, returnIso) {
 
 /* ---------------- alerts (Web Push) ---------------- */
 
-const PUSH_API = "https://push.rewardflights.lucy.sh";
+const PUSH_API = "https://alerts-rewardflights.lucy.sh";
 const VAPID_PUBLIC_KEY = "BMHjtxbmirrQAoG2QNGDFNRZ-n5ijHTz99bVUkVLEAJDWsv3Ks6DSoKK88WKhCDk3rS_CmIDPWifQupVjL15TtQ";
 
 /* A topic is one thing a person actually wants: "Business round trips on

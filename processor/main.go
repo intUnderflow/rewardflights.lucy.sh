@@ -19,11 +19,13 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alerts"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
 )
 
@@ -38,11 +40,14 @@ func main() {
 	commit := flag.Bool("commit", false, "watch mode: git commit -out when the derived data changes")
 	push := flag.Bool("push", false, "watch mode: git push -out after committing (implies -commit)")
 	tokenCmd := flag.String("token-cmd", "", "watch mode: shell command printing a git token to stdout for the push (e.g. the GitHub App mint script); empty uses the ambient git credentials")
-	alertsWorker := flag.String("alerts-worker", "", "watch mode: subscription-store Worker base URL for seat alerts (empty disables alerting)")
-	alertsPullSecret := flag.String("alerts-pull-secret", "", "watch mode: bearer token for pulling subscriptions from the Worker")
-	alertsVapidKey := flag.String("alerts-vapid-key", "", "watch mode: file holding the VAPID P-256 private key (PEM or base64url scalar)")
+	alertsVapidKey := flag.String("alerts-vapid-key", "", "watch mode: file holding the VAPID P-256 private key (PEM or base64url scalar); enables seat alerts")
 	alertsVapidSubject := flag.String("alerts-vapid-subject", "", "watch mode: VAPID sub claim, e.g. mailto:alerts@rewardflights.lucy.sh")
-	alertsState := flag.String("alerts-state", "", "watch mode: path of the alerts state file (cooldown/batch persistence)")
+	alertsStore := flag.String("alerts-store", defaultAlertsPath("subs.json"), "watch mode: JSON file holding push subscriptions")
+	alertsState := flag.String("alerts-state", defaultAlertsPath("state.json"), "watch mode: path of the alerts state file (cooldown/batch persistence)")
+	alertsListen := flag.String("alerts-listen", "", "watch mode: listen address for the subscription API, e.g. 127.0.0.1:8787 (empty disables the API)")
+	alertsMaxSubs := flag.Int("alerts-max-subs", alertstore.DefaultMaxSubs, "watch mode: maximum stored subscriptions")
+	alertsRate := flag.Int("alerts-rate", 60, "watch mode: subscription API requests per minute per client IP")
+	alertsBurst := flag.Int("alerts-burst", 20, "watch mode: subscription API rate-limit burst")
 	alertsCooldown := flag.Duration("alerts-cooldown", 3*time.Hour, "watch mode: minimum off-time before a day re-alerts")
 	alertsBatch := flag.Duration("alerts-batch", time.Hour, "watch mode: minimum interval between publishes per topic")
 	alertsWindow := flag.Int("alerts-window", 30, "watch mode: round-trip return window in nights")
@@ -59,8 +64,6 @@ func main() {
 			Src: *src, Out: *out, Force: *force,
 			Interval: *interval, Commit: *commit, Push: *push, TokenCmd: *tokenCmd,
 			Alerts: alerts.Config{
-				Worker:       *alertsWorker,
-				PullSecret:   *alertsPullSecret,
 				VapidKeyPath: *alertsVapidKey,
 				VapidSubject: *alertsVapidSubject,
 				StatePath:    *alertsState,
@@ -68,6 +71,11 @@ func main() {
 				Batch:        *alertsBatch,
 				Window:       *alertsWindow,
 			},
+			AlertsStore:   *alertsStore,
+			AlertsMaxSubs: *alertsMaxSubs,
+			AlertsListen:  *alertsListen,
+			AlertsRate:    *alertsRate,
+			AlertsBurst:   *alertsBurst,
 		}); err != nil {
 			fatal(err)
 		}
@@ -98,6 +106,15 @@ func main() {
 		fatal(err)
 	}
 	fmt.Println(result.Summary())
+}
+
+// defaultAlertsPath places alert files under ~/rf/alerts by default.
+func defaultAlertsPath(name string) string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return filepath.Join("rf", "alerts", name)
+	}
+	return filepath.Join(home, "rf", "alerts", name)
 }
 
 // gitHead reads the HEAD commit SHA and committer timestamp of the source

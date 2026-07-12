@@ -1,8 +1,12 @@
 // Package alerts publishes Web Push notifications when new award
 // availability opens, mirroring the site's model: browsers subscribe to
-// topics rf_{ROUTE}_{ow|rt}_{M|W|C|F} via a Cloudflare Worker subscription
-// store, and the watcher encrypts one batched message per topic (RFC 8291,
-// VAPID) whenever dates enter that topic's "on" set.
+// topics rf_{ROUTE}_{ow|rt}_{M|W|C|F}, and the watcher encrypts one batched
+// message per topic (RFC 8291, VAPID) whenever dates enter that topic's
+// "on" set.
+//
+// Subscriptions live in a local store (internal/alertstore) owned by this
+// same process: the watcher is the sender, so if the host is down alerts do
+// not fire regardless of where subscriptions are kept.
 //
 // The watcher compares the previous cycle's availability bundle against the
 // new one. All detection timing (cooldown, batching, pruning) is driven by
@@ -19,13 +23,13 @@ import (
 	"io"
 	"maps"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"slices"
 	"strings"
 	"time"
 
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
 )
 
@@ -33,15 +37,14 @@ import (
 // documented defaults; Publish and Logf default to the real Web Push
 // publisher and stderr logging.
 type Config struct {
-	Worker       string        // subscription-store Worker base URL; empty disables alerting
-	PullSecret   string        // bearer token for GET/DELETE {Worker}/subs
-	VapidKeyPath string        // file holding the VAPID P-256 private key (PEM or base64url scalar)
-	VapidSubject string        // VAPID "sub" claim, e.g. mailto:alerts@rewardflights.lucy.sh
-	StatePath    string        // JSON state file; empty keeps state in memory only
-	Cooldown     time.Duration // min off-time before a day re-alerts (default 3h)
-	Batch        time.Duration // min interval between publishes per topic (default 1h)
-	Window       int           // round-trip return window in nights (default 30)
-	Publish      PublishFunc   // injected in tests; nil builds the Web Push publisher
+	Store        *alertstore.Store // local subscription store (required unless Publish is injected)
+	VapidKeyPath string            // file holding the VAPID P-256 private key (PEM or base64url scalar)
+	VapidSubject string            // VAPID "sub" claim, e.g. mailto:alerts@rewardflights.lucy.sh
+	StatePath    string            // JSON state file; empty keeps state in memory only
+	Cooldown     time.Duration     // min off-time before a day re-alerts (default 3h)
+	Batch        time.Duration     // min interval between publishes per topic (default 1h)
+	Window       int               // round-trip return window in nights (default 30)
+	Publish      PublishFunc       // injected in tests; nil builds the Web Push publisher
 	Logf         func(format string, args ...any)
 }
 
@@ -106,7 +109,7 @@ const lastOnRetentionDays = 7
 // NewWatcher builds a watcher, loading persisted state when StatePath names
 // a readable, well-formed state file (anything else starts fresh). Without
 // an injected Publish func it wires up the real Web Push publisher, which
-// requires Worker and a loadable VAPID key.
+// requires a subscription Store and a loadable VAPID key.
 func NewWatcher(cfg Config) (*Watcher, error) {
 	if cfg.Cooldown <= 0 {
 		cfg.Cooldown = 3 * time.Hour
@@ -121,14 +124,14 @@ func NewWatcher(cfg Config) (*Watcher, error) {
 		cfg.Logf = func(format string, args ...any) { fmt.Fprintf(os.Stderr, format+"\n", args...) }
 	}
 	if cfg.Publish == nil {
-		if cfg.Worker == "" {
-			return nil, fmt.Errorf("alerts: no Worker URL and no injected publisher")
+		if cfg.Store == nil {
+			return nil, fmt.Errorf("alerts: no subscription store and no injected publisher")
 		}
 		vapid, err := webpush.LoadVapid(cfg.VapidKeyPath, cfg.VapidSubject)
 		if err != nil {
 			return nil, fmt.Errorf("alerts: %w", err)
 		}
-		cfg.Publish = workerPublisher(cfg.Worker, cfg.PullSecret, vapid, cfg.Logf)
+		cfg.Publish = storePublisher(cfg.Store, vapid, cfg.Logf)
 	}
 	return &Watcher{cfg: cfg, state: loadState(cfg.StatePath)}, nil
 }
@@ -322,25 +325,25 @@ func buildPublication(topic string, dates []string) (Publication, error) {
 	return pub, nil
 }
 
-// workerPublisher returns the real Web Push publish func. Per publication it
-// pulls the topic's subscriptions from the Worker store, encrypts the payload
-// per RFC 8291 for each, and POSTs to each push endpoint with VAPID auth.
+// storePublisher returns the real Web Push publish func: it reads the
+// topic's subscribers straight from the local store, encrypts the payload per
+// RFC 8291 for each, and POSTs to each push endpoint with VAPID auth.
 //
-// Error contract: a returned error means "nothing was attempted" (the
-// subscription pull failed) and the batch is carried forward. Everything
-// after a successful pull counts as delivered — per-endpoint failures are
-// logged, dead subscriptions (404/410) are pruned from the store, and a rare
-// missed notification is preferred over a re-send storm.
-func workerPublisher(worker, pullSecret string, vapid *webpush.Vapid, logf func(string, ...any)) PublishFunc {
-	client := &http.Client{Timeout: 5 * time.Second}
-	base := strings.TrimRight(worker, "/")
+// Error contract: publishing never returns an error, because there is no
+// longer a fallible "fetch the subscribers" step — the store is in-process.
+// Per-endpoint failures are logged; dead subscriptions (404/410 from the push
+// service) are removed from the store; a rare missed notification is preferred
+// over a re-send storm, so the batch is always considered drained.
+// pushClient sends to the push services. It is a package var so tests can
+// point its transport at a local server while exercising real endpoint URLs.
+var pushClient = &http.Client{Timeout: 5 * time.Second}
+
+func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, logf func(string, ...any)) PublishFunc {
+	client := pushClient
 	return func(p Publication) error {
-		subs, err := fetchSubs(client, base, pullSecret, p.Topic)
-		if err != nil {
-			return err
-		}
+		subs := store.Get(p.Topic)
 		if len(subs) == 0 {
-			return nil // no subscribers: treat as delivered, don't re-batch forever
+			return nil // nobody subscribed to this topic
 		}
 		payload, err := json.Marshal(map[string]string{
 			"title": p.Title, "body": p.Body, "url": p.URL, "tag": p.Topic,
@@ -351,9 +354,9 @@ func workerPublisher(worker, pullSecret string, vapid *webpush.Vapid, logf func(
 		for _, sub := range subs {
 			body, err := webpush.Encrypt(sub, payload)
 			if err != nil {
-				// Undecodable keys can never succeed: prune like a dead endpoint.
+				// Undecodable keys can never succeed: drop like a dead endpoint.
 				logf("WARN alert-push-badsub %s: %v", sub.Endpoint, err)
-				pruneSub(client, base, pullSecret, sub.Endpoint, logf)
+				store.Remove(sub.Endpoint)
 				continue
 			}
 			status, err := sendPush(client, vapid, sub.Endpoint, body)
@@ -361,44 +364,15 @@ func workerPublisher(worker, pullSecret string, vapid *webpush.Vapid, logf func(
 			case err != nil:
 				logf("WARN alert-push-failed %s: %v", sub.Endpoint, err)
 			case status == http.StatusNotFound || status == http.StatusGone:
-				pruneSub(client, base, pullSecret, sub.Endpoint, logf)
+				// The browser is gone for good: the push service tells us so.
+				logf("alert-push-expired %s (status %d), removing", sub.Endpoint, status)
+				store.Remove(sub.Endpoint)
 			case status < 200 || status >= 300:
 				logf("WARN alert-push-failed %s: status %d", sub.Endpoint, status)
 			}
 		}
 		return nil
 	}
-}
-
-// fetchSubs pulls a topic's subscriptions from the Worker store. A 404 (or
-// an empty list) means no subscribers; any other failure is an error so the
-// caller keeps the batch pending.
-func fetchSubs(client *http.Client, base, secret, topic string) ([]webpush.Subscription, error) {
-	req, err := http.NewRequest(http.MethodGet, base+"/subs?topic="+url.QueryEscape(topic), nil)
-	if err != nil {
-		return nil, err
-	}
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode == http.StatusNotFound {
-		io.Copy(io.Discard, resp.Body)
-		return nil, nil
-	}
-	if resp.StatusCode != http.StatusOK {
-		io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("subscription pull: status %d", resp.StatusCode)
-	}
-	var subs []webpush.Subscription
-	if err := json.NewDecoder(resp.Body).Decode(&subs); err != nil {
-		return nil, fmt.Errorf("subscription pull: %w", err)
-	}
-	return subs, nil
 }
 
 // sendPush POSTs one encrypted message to a push endpoint.
@@ -422,32 +396,6 @@ func sendPush(client *http.Client, vapid *webpush.Vapid, endpoint string, body [
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return resp.StatusCode, nil
-}
-
-// pruneSub best-effort deletes a dead subscription from the Worker store.
-func pruneSub(client *http.Client, base, secret, endpoint string, logf func(string, ...any)) {
-	payload, err := json.Marshal(map[string]string{"endpoint": endpoint})
-	if err != nil {
-		return
-	}
-	req, err := http.NewRequest(http.MethodDelete, base+"/subs", bytes.NewReader(payload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-	resp, err := client.Do(req)
-	if err != nil {
-		logf("WARN alert-prune-failed %s: %v", endpoint, err)
-		return
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		logf("WARN alert-prune-failed %s: status %d", endpoint, resp.StatusCode)
-	}
 }
 
 // loadState reads the persisted state; anything missing or malformed starts
