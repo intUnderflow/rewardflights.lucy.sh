@@ -938,6 +938,14 @@ function setNightsPref(lo, hi) {
   try { sessionStorage.setItem("rf:nights", `${lo}-${hi}`); } catch {}
 }
 
+/* The current trip-length window as a query string for swap/cross links —
+   the window is direction-agnostic, so it survives an origin/dest swap
+   (picked dates do not: they belong to the old outbound direction). */
+function nightsQS() {
+  const w = parseNights(new URLSearchParams(location.search).get("nights")) || getNightsPref();
+  return w ? `?nights=${w[0]}-${w[1]}` : "";
+}
+
 /* Valid not-in-the-past day index for a URL-borne ISO date, or -1 (invalid
    params must degrade silently, never crash the page). */
 function tripDayIndex(iso) {
@@ -983,7 +991,8 @@ function renderRoute(o, d) {
   const head = el(`<div class="route-head">
     <p class="crumbs"><a href="/">Search</a> · <a href="/from/${o}">All from ${esc(placeName(o))}</a></p>
     <div class="route-title-row">
-      <h1 class="route-title" aria-label="${o} to ${d}">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</h1>
+      <h1 class="route-title" aria-label="${o} to ${d}">${o} <a class="arrow arrow-swap" href="/route/${d}-${o}"
+        title="Flip direction — view ${d} → ${o}" aria-label="Flip direction — view ${d} to ${o}">→</a> ${d}</h1>
       ${tripSegHTML(o, d, "route")}
       <div class="head-actions">
         <a class="btn" href="/route/${d}-${o}" title="View the reverse one-way calendar (${d} to ${o})">⇄ View ${d} → ${o}</a>
@@ -1178,7 +1187,8 @@ function renderTrip(o, d) {
   mainEl.append(el(`<div class="route-head">
     <p class="crumbs"><a href="/">Search</a> · <a href="/from/${o}">All from ${esc(placeName(o))}</a></p>
     <div class="route-title-row">
-      <h1 class="route-title" aria-label="${o} to ${d} round trip">${o} <span class="arrow" aria-hidden="true">⇄</span> ${d}</h1>
+      <h1 class="route-title" aria-label="${o} to ${d} round trip">${o} <a class="arrow arrow-swap" href="/trip/${d}-${o}${nightsQS()}"
+        title="Swap — plan ${d} ⇄ ${o} instead" aria-label="Swap origin and destination — plan ${d} to ${o} round trips">⇄</a> ${d}</h1>
       ${tripSegHTML(o, d, "trip")}
     </div>
     <p class="route-cities">${esc(placeName(o))}${placeCountry(o) ? `, ${esc(placeCountry(o))}` : ""}
