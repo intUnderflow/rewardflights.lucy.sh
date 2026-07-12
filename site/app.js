@@ -670,7 +670,13 @@ function attachAutocomplete(input, { getRestrict, sparkFor, onPick }) {
     if (list.hidden) return;
     if (e.key === "ArrowDown") { e.preventDefault(); setActive(Math.min(active + 1, items.length - 1)); }
     else if (e.key === "ArrowUp") { e.preventDefault(); setActive(Math.max(active - 1, 0)); }
-    else if (e.key === "Enter") { e.preventDefault(); if (items[active]) { close(); onPick(items[active]); } }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      // Capture before close(): close() resets `active` to -1, so reading
+      // items[active] after it would hand onPick undefined.
+      const pick = items[active];
+      if (pick) { close(); onPick(pick); }
+    }
     else if (e.key === "Escape") close();
   });
 }
