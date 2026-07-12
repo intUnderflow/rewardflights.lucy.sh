@@ -208,6 +208,36 @@ Missing sha/time → read from `git -C src log -1`. Machine-parseable summary:
 - Host-specific service config (launchd/systemd, token command) lives on the
   host, not in the repo.
 
+## Round trips (/trip/ — the default surface, added 2026-07-12)
+
+Round trip is the primary user goal; the directional data supports it entirely
+client-side. `/trip/ORIG-DEST` (segmented control navigates to/from the one-way
+`/route/` view):
+
+- Engine: `roundTripBits(outKey, retKey, mask, minNights, maxNights)` — per
+  outbound day D, OR of `ret[R] & (out[D] & mask)` over R in
+  [D+minNights, D+maxNights] (same-cabin-both-ways by construction; minNights
+  ≥ 1; missing reverse route → zeros). Cached per (route, mask, window).
+- Calendar: day lit iff a round trip is completable (stack = round-trippable
+  cabins); outbound-only days render dim but clickable with an honest
+  explanation; chips / year strip / month counts all recount from roundBits.
+- Trip length: presets Weekend 2–4 · 1 week 5–9 · 2 weeks 10–16 · Flexible
+  1–30 (default) + custom min/max; pref in sessionStorage, URL wins.
+- URL state: `?nights=MIN-MAX&out=YYYY-MM-DD&ret=YYYY-MM-DD`; pushState for
+  picks (Back = undo), replaceState for filter tweaks; invalid params degrade.
+- Pair-picker panel: radio-group of valid returns (nights + 4-lane stack),
+  sorted shares-a-selected-cabin first; sticky summary; ONE CTA per cabin in
+  `outBits & retBits & mask` (an empty-BA-result link is impossible by
+  construction); per-leg one-way fallbacks; filter-hidden round trips get an
+  honest "hidden by your cabin filter" note + "Show all cabins". Mobile:
+  full-screen 1 Out · 2 Back · 3 Book stepper.
+- Seat-stack is a fixed 4-lane gauge everywhere (absent cabin = faint track),
+  restoring position-encoding for CVD and mobile legibility. First has its own
+  hue (`--cab-f` copper-rose, CVD-validated); `--gold` is brand-only.
+- Home search is round-trip-first (segmented + nights presets); explore
+  (`/from/`) counts round-trippable days (1–30 window) with "outbound only"
+  badges.
+
 ## Licensing
 Code (processor + site) is CC BY-NC-SA 4.0. The derived data carries no license
 of its own; each file embeds a `source` provenance block naming the source repo,

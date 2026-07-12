@@ -32,7 +32,7 @@
   --cab-m: #3B7CC9;
   --cab-w: #17A398;
   --cab-c: #8B5CF6;
-  --cab-f: #A87908;
+  --cab-f: #C0564A; /* copper-rose: First's own hue — --gold stays brand-only */
   --cell-empty: #EDF1F6;
   --shadow: 0 1px 2px rgba(22,35,59,.06), 0 8px 24px rgba(22,35,59,.08);
   --radius: 10px;
@@ -58,7 +58,7 @@
     --cab-m: #3D7FD6;
     --cab-w: #12968C;
     --cab-c: #8B5CF6;
-    --cab-f: #B0800D;
+    --cab-f: #CE7460; /* copper-rose: First's own hue — --gold stays brand-only */
     --cell-empty: #1A2A44;
     --shadow: 0 1px 2px rgba(0,0,0,.3), 0 8px 24px rgba(0,0,0,.35);
   }
@@ -179,6 +179,14 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .home-secondary { margin-top: 18px; font-size: 14px; color: var(--ink-2); }
 .home-secondary a { font-weight: 700; }
 
+/* home trip-type row: [Round trip | One way] + nights presets, spanning the
+   search card above From/To. The seg options are buttons here (a state toggle,
+   not navigation), sharing the .seg-opt look. */
+.sc-top { grid-column: 1 / -1; display: flex; align-items: center; gap: 8px 16px; flex-wrap: wrap; }
+button.seg-opt { border: 0; background: none; cursor: pointer; }
+.home-nights { display: inline-flex; gap: 6px; flex-wrap: wrap; }
+.home-nights[hidden] { display: none; }
+
 /* skeletons */
 .skeleton-search .sk-input, .sk-line, .sk-cell {
   background: linear-gradient(90deg, var(--panel-2) 25%, var(--line) 50%, var(--panel-2) 75%);
@@ -256,7 +264,14 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .route-title .arrow { color: var(--gold); font-size: .62em; position: relative; top: -.08em; }
 .route-cities { color: var(--ink-2); font-size: 15px; margin: 8px 0 0; }
 .route-cities .via { color: var(--ink-3); }
+.rev-note { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); margin: 6px 0 0; }
 .head-actions { margin-left: auto; display: flex; gap: 8px; }
+
+/* segmented [Round trip | One way] — navigates between /trip/ and /route/ */
+.seg { display: inline-flex; gap: 2px; padding: 3px; border: 1px solid var(--line-2); border-radius: 999px; background: var(--panel); }
+.seg-opt { padding: 5px 13px; border-radius: 999px; font-size: 13px; font-weight: 700; text-decoration: none; color: var(--ink-2); }
+.seg-opt:hover { color: var(--ink); }
+.seg-opt.on { background: var(--ink); color: var(--surface); }
 .btn {
   border: 1px solid var(--line-2); background: var(--panel); color: var(--ink);
   border-radius: 8px; padding: 8px 14px; cursor: pointer; font-size: 13px; font-weight: 700;
@@ -271,6 +286,18 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 }
 .new-legend { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
 .new-legend .new-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gold); }
+
+/* trip-length control (presets + custom min/max nights) */
+.nights-ctl { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.nc-label { font-family: var(--font-data); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); margin-right: 2px; }
+.np { display: inline-flex; align-items: baseline; gap: 5px; border: 1px solid var(--line-2); border-radius: 999px; padding: 5px 11px; background: var(--panel); cursor: pointer; font-size: 12.5px; font-weight: 700; color: var(--ink-2); }
+.np:hover { border-color: var(--ink-3); }
+.np[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--surface); }
+/* No opacity fade here: 10.5px is small text, so the range label must hold
+   ≥4.5:1 on the chip (plain --ink-2 on --panel does; a .8 fade did not). */
+.np .np-r { font-family: var(--font-data); font-weight: 400; font-size: 10.5px; }
+.np-custom { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-3); font-family: var(--font-data); font-size: 11.5px; }
+.np-custom input { width: 52px; padding: 5px 7px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--surface); color: var(--ink); font: 400 13px var(--font-data); }
 
 /* year strip — 12 months at a glance */
 .year-strip { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; margin: 18px 0 34px; }
@@ -301,9 +328,16 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .dow span { text-align: center; font-family: var(--font-data); font-size: 9.5px; color: var(--ink-3); text-transform: uppercase; }
 .grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 4px; }
 
-/* THE SIGNATURE: seat-stack day cell.
-   Up to 4 thin bars, FIXED position order bottom→top = Economy→First,
-   so cabin identity survives without color (position encodes it). */
+/* THE SIGNATURE: the seat-stack gauge (one renderer: stackHTML in app.js).
+   Always 4 lanes in FIXED positions bottom→top = Economy→First. A present
+   cabin is a full colored bar; an absent cabin keeps its lane as a faint
+   1px track line, so cabin identity reads by position even without color.
+   4 bars × 5px + 3 gaps × 2px = the 26px cell budget, unchanged. */
+.stack { display: flex; flex-direction: column-reverse; gap: 2px; justify-content: flex-start; }
+.stack i { display: block; height: 5px; border-radius: 2.5px; }
+.stack i.lane-off { height: 1px; margin: 2px 0; border-radius: 0; background: var(--line); opacity: .6; }
+.stack-row { width: 36px; flex: none; }
+
 .day {
   aspect-ratio: 1 / 1.15; border-radius: 7px; background: var(--cell-empty);
   border: 0; padding: 3px 4px; cursor: default; position: relative;
@@ -313,12 +347,11 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
   font-family: var(--font-data); font-size: 10px; color: var(--ink-3);
   line-height: 1; text-align: right;
 }
-.day .stack { display: flex; flex-direction: column-reverse; gap: 2px; min-height: 26px; justify-content: flex-start; }
-.day .stack i { display: block; height: 5px; border-radius: 2.5px; }
+.day .stack { min-height: 26px; }
 .day.has { background: var(--panel); border: 1px solid var(--line); cursor: pointer; }
 .day.has:hover { border-color: var(--ink-2); }
 .day.has .num { color: var(--ink-2); font-weight: 700; }
-.day.dim .stack i { background: var(--line-2) !important; }
+.day.dim .stack i:not(.lane-off) { background: var(--line-2) !important; }
 .day.pad { visibility: hidden; }
 .day.past { opacity: .35; }
 .day.new::after {
@@ -340,6 +373,7 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .tip .t-date { font-family: var(--font-data); font-weight: 700; margin-bottom: 3px; }
 .tip .t-cab { display: flex; align-items: center; gap: 7px; }
 .tip .t-cab .swatch { width: 9px; height: 9px; border-radius: 2px; }
+.tip .t-note { opacity: .75; font-size: 11.5px; }
 
 /* day detail panel */
 .scrim { position: fixed; inset: 0; background: rgba(10,16,28,.45); z-index: 70; }
@@ -355,6 +389,8 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 }
 .dp-close { position: absolute; top: 16px; right: 16px; background: none; border: 0;
   font-size: 22px; cursor: pointer; color: var(--ink-2); line-height: 1; padding: 6px; }
+.dp-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin: 0 0 20px; padding-right: 34px; }
+.dp-head .dp-route { margin-bottom: 0; }
 .dp-date { font-family: var(--font-data); font-size: 13px; color: var(--ink-2); margin: 0; }
 .dp-route { font-family: var(--font-display); font-size: 24px; margin: 4px 0 20px; }
 .dp-lead { font-size: 13.5px; color: var(--ink-2); margin: 0 0 12px; }
@@ -398,6 +434,37 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .tag.peak { background: var(--amber-bg); color: var(--amber-ink); }
 .dp-note { font-size: 12.5px; color: var(--ink-3); }
 .dp-book { margin: 18px 0; }
+.dp-trip-link { font-size: 13px; color: var(--ink-2); margin: 0 0 20px; }
+.dp-trip-link a { font-weight: 700; }
+
+/* pair-picker panel (round trips) */
+.pp-sub { font-family: var(--font-data); font-size: 11.5px; color: var(--ink-3); margin: 4px 0 0; }
+.pp-steps { display: none; }
+.pp-out { display: flex; align-items: center; gap: 12px; border: 1px solid var(--line); border-radius: 8px; padding: 10px 13px; margin: 0 0 16px; }
+.pp-out-label, .pp-ret-label { font-family: var(--font-data); font-size: 10.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--ink-3); }
+.pp-out-date { font-weight: 700; font-size: 14px; flex: 1; }
+.pp-ret-label { display: block; margin: 0 0 8px; }
+.pp-rows { display: flex; flex-direction: column; gap: 7px; margin: 0 0 16px; }
+.pp-row { display: flex; align-items: center; gap: 10px; padding: 10px 12px; border: 1px solid var(--line-2); border-radius: 8px; background: none; cursor: pointer; text-align: left; }
+.pp-row:hover { border-color: var(--ink-2); }
+.pp-row[aria-checked="true"] { border-color: var(--ink); background: var(--panel-2); }
+.pp-radio { width: 14px; height: 14px; flex: none; border-radius: 50%; border: 2px solid var(--line-2); }
+.pp-row[aria-checked="true"] .pp-radio { border: 4px solid var(--gold); }
+.pp-row-date { font-weight: 700; font-size: 13.5px; }
+.pp-row-n { flex: 1; font-family: var(--font-data); font-size: 11.5px; color: var(--ink-3); }
+/* bottom -26px matches the panel's 26px padding (as margin 0 -26px already
+   does horizontally): the stuck summary sits flush with the panel's bottom
+   edge instead of 26px short, so no return-row slivers paint beneath it. */
+.pp-summary { position: sticky; bottom: -26px; margin: 0 -26px; padding: 13px 26px 16px; background: var(--panel); border-top: 1px solid var(--line); }
+.pp-sum-line { font-family: var(--font-data); font-size: 12px; margin: 0 0 10px; color: var(--ink-2); }
+.pp-ctas { display: flex; flex-direction: column; gap: 8px; }
+.pp-cta { display: flex; align-items: center; gap: 10px; padding: 11px 13px; border: 1px solid var(--line-2); border-radius: 8px; font-weight: 700; font-size: 14px; text-decoration: none; color: var(--ink); transition: border-color .15s ease, background .15s ease; }
+.pp-cta:hover { border-color: var(--ink-2); background: var(--panel-2); }
+.pp-cta .swatch { width: 13px; height: 13px; border-radius: 3px; }
+.pp-cta .pp-cta-go { margin-left: auto; font-family: var(--font-data); font-weight: 400; font-size: 12px; color: var(--gold); }
+.pp-none { margin: 0 0 8px; font-size: 13px; color: var(--ink-2); }
+.pp-oneways { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-2); }
+.pp-oneways a { font-weight: 700; }
 
 /* ---------- explore (/from/XXX) ---------- */
 .dest-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; margin-top: 26px; }
@@ -416,6 +483,12 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .dc-meta { display: flex; justify-content: space-between; font-size: 11.5px; color: var(--ink-2); }
 .dc-cabs { display: flex; gap: 4px; }
 .dc-cabs .swatch { width: 9px; height: 9px; border-radius: 2px; }
+/* outbound-only destination: card kept but grayed (the calendar's dim
+   semantics at card level) — outbound space exists, nothing round-trippable. */
+.dest-card.dc-ow { border-style: dashed; }
+.dest-card.dc-ow .dc-code, .dest-card.dc-ow .dc-name { color: var(--ink-2); }
+.dest-card.dc-ow .dc-cabs .swatch { background: var(--ink-3) !important; opacity: .6; }
+.dc-badge { font-family: var(--font-data); font-size: 10.5px; color: var(--ink-3); }
 
 .page-title { font-family: var(--font-display); font-weight: 400; font-size: clamp(24px, 4vw, 38px); margin: 0; }
 .page-sub { color: var(--ink-2); margin: 8px 0 0; }
@@ -439,4 +512,10 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 @media (max-width: 640px) {
   .day-panel { width: 100vw; border-left: 0; }
   .route-toolbar { position: static; }
+  /* pair panel goes full-screen with a 3-step header:
+     1 Out (tap to re-pick) · 2 Back (the list) · 3 Book (summary reveals) */
+  .pp-steps { display: flex; gap: 6px; margin: 0 0 16px; padding-right: 34px; }
+  .pp-step { flex: 1; border: 1px solid var(--line); border-radius: 999px; background: none; padding: 6px 4px; text-align: center; font-family: var(--font-data); font-size: 11px; letter-spacing: .04em; text-transform: uppercase; color: var(--ink-3); }
+  .pp-step.on { color: var(--ink); border-color: var(--ink-2); font-weight: 700; }
+  .pp-summary.pp-unrevealed { display: none; }
 }
