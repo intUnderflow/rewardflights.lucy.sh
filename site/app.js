@@ -244,6 +244,18 @@ function groupTopics(topics) {
     .sort((a, b) => a.route.localeCompare(b.route) || a.kind.localeCompare(b.kind));
 }
 
+/* Push subscriptions expire (the browser or push service can retire an
+   endpoint). When that happens the server drops it, so retrying is pointless —
+   the device needs a brand-new endpoint carrying the same topics. */
+async function renewSubscription(topics) {
+  const reg = await ensureSW();
+  const old = await reg.pushManager.getSubscription();
+  if (old) await old.unsubscribe().catch(() => {});
+  const sub = await getSubscription({ create: true });
+  await saveTopics(sub, topics);
+  return sub;
+}
+
 /* The current subscription and its topics, or null if this device isn't
    watching anything. Never throws — alerts are an enhancement, and the page
    must render fine when the alert service is unreachable. */
@@ -2392,8 +2404,18 @@ async function drawAlertsPage(body) {
         method: "POST", headers: { "content-type": "application/json" },
         body: JSON.stringify({ endpoint: data.sub.endpoint }),
       });
-      if (res.status === 410) throw new Error("This device's subscription expired — turn an alert off and on again to renew it.");
-      if (res.status === 429) throw new Error("Too many test notifications — try again later.");
+      if (res.status === 410) {
+        // The push service retired this device's endpoint; the server has
+        // already dropped it. Re-subscribe transparently and keep the alerts.
+        status(body, "Renewing this device's notifications…");
+        await renewSubscription(data.topics);
+        // Re-render FIRST (it rebuilds the status line from scratch), then
+        // report — otherwise the message is wiped the moment it's set.
+        await drawAlertsPage(body);
+        status(body, "Renewed this device — press the test button once more.");
+        return;
+      }
+      if (res.status === 429) throw new Error("That's enough tests for now — try again later.");
       if (!res.ok) throw new Error(`Couldn't send a test (${res.status}).`);
       status(body, "Sent — it should arrive in a second or two.");
     } catch (err) {
