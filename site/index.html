@@ -12,7 +12,11 @@
 <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612-400.woff2" crossorigin>
 <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612mono-400.woff2" crossorigin>
 <link rel="preload" as="font" type="font/woff2" href="/assets/fonts/archivo-black.woff2" crossorigin>
-<link rel="stylesheet" href="/style.css">
+<!-- ?v= busts the browser cache on deploy: index.html is served no-cache
+     (fresh every load), but the shell assets inherit a 4h browser-cache TTL,
+     so a NEW url is the reliable way to ship shell changes. BUMP THIS NUMBER
+     whenever app.js or style.css changes. -->
+<link rel="stylesheet" href="/style.css?v=2">
 <meta name="theme-color" content="#FAFBFD" media="(prefers-color-scheme: light)">
 <meta name="theme-color" content="#0D1826" media="(prefers-color-scheme: dark)">
 </head>
@@ -65,6 +69,6 @@
 <div class="day-panel" id="day-panel" hidden></div>
 <div class="scrim" id="scrim" hidden></div>
 
-<script src="/app.js" defer></script>
+<script src="/app.js?v=2" defer></script>
 </body>
 </html>

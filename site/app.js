@@ -1,4 +1,3 @@
-/* build 6 */
 /* Reward Flights — static SPA over open award-availability data.
    All data comes from the derived-data repo via raw.githubusercontent.com;
    the whole calendar dataset is one small bundle, so after boot every
