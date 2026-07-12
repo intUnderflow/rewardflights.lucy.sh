@@ -459,6 +459,8 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 }
 .alert-state { grid-column: 1 / -1; font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
 .as-ok { color: var(--cab-w); }
+.as-new { color: var(--gold); font-weight: 700; }
+.alert-row.has-new { border-color: var(--gold); }
 .as-idle { color: var(--ink-3); }
 .as-warn { color: var(--amber-ink); }
 .as-last { color: var(--ink-3); font-family: var(--font-data); font-size: 11px; }

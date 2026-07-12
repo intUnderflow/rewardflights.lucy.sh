@@ -245,8 +245,9 @@ const idxToIso = (i) => isoOf(dayDate(i));
    in memory, so we can answer "what matches RIGHT NOW?" instantly, with no
    network — while they're still choosing the dates.
    Returns {pairs, perCabin: Map<bit,count>, first: {out,ret}|null}. */
-function matchesNow(w) {
-  const empty = { pairs: 0, perCabin: new Map(), first: null };
+function matchesNow(w, { list = false } = {}) {
+  const empty = { pairs: 0, perCabin: new Map(), first: null, list: [] };
+  const keys = [];
   if (!store.bundle || !store.bundle.routes[w.route]) return empty;
   const mask = watchMask(w);
   if (!mask) return empty;
@@ -267,9 +268,10 @@ function matchesNow(w) {
       if (!v) continue;
       pairs++;
       if (!first) first = { out: idxToIso(d), ret: null };
+      if (list) for (const [bit] of cabinLegend()) if (v & bit) keys.push(`${idxToIso(d)}|${bit}`);
       for (const [bit] of cabinLegend()) if (v & bit) perCabin.set(bit, (perCabin.get(bit) || 0) + 1);
     }
-    return { pairs, perCabin, first };
+    return { pairs, perCabin, first, list: keys };
   }
 
   const rev = reverseRoute(w.route);
@@ -290,10 +292,44 @@ function matchesNow(w) {
       if (!both) continue;
       pairs++;
       if (!first) first = { out: idxToIso(d), ret: idxToIso(r) };
+      if (list) for (const [bit] of cabinLegend()) if (both & bit) keys.push(`${idxToIso(d)}|${idxToIso(r)}|${bit}`);
       for (const [bit] of cabinLegend()) if (both & bit) perCabin.set(bit, (perCabin.get(bit) || 0) + 1);
     }
   }
-  return { pairs, perCabin, first };
+  return { pairs, perCabin, first, list: keys };
+}
+
+/* A notification you never receive is worse than no notification: the push can
+   be accepted by the push service and still be dropped by the OS, silently, with
+   no signal to us or to you. So the site keeps its own record of what a watch
+   matched last time you looked, and tells you what's new — no server, no data
+   held, and it works even when notifications are broken end to end. */
+const SEEN_KEY = "rf:seen:v1";
+
+function loadSeen() {
+  try { return JSON.parse(localStorage.getItem(SEEN_KEY)) || {}; } catch { return {}; }
+}
+function saveSeen(seen) {
+  try { localStorage.setItem(SEEN_KEY, JSON.stringify(seen)); } catch {}
+}
+
+/* Trips matching a watch that weren't matching the last time this device looked.
+   Returns {pairs:[{out,ret}], count} — the same news a notification would carry. */
+function newSinceSeen(w, seen) {
+  const now = matchesNow(w, { list: true });
+  const before = new Set(seen[w.id]?.pairs || []);
+  const fresh = now.list.filter((p) => !before.has(p));
+  return { count: fresh.length, first: fresh.slice(0, 3), everSeen: !!seen[w.id] };
+}
+
+/* Record what a watch matches now, so the next visit can diff against it. */
+function markSeen(watches) {
+  const seen = loadSeen();
+  const keep = {};
+  for (const w of watches) {
+    keep[w.id] = { pairs: matchesNow(w, { list: true }).list, t: Math.floor(Date.now() / 1000) };
+  }
+  saveSeen(keep);   // watches that no longer exist drop out
 }
 
 /* Why a watch can never fire — so we can say so instead of leaving it silent. */
@@ -1082,21 +1118,25 @@ async function buildAlertsPanel(mount) {
     <div class="card-list"></div>
   </section>`);
   const list = $(".card-list", sec);
-  for (const w of data.watches) list.append(alertRow(w, data, () => buildAlertsPanel(mount)));
+  const seen = loadSeen();
+  for (const w of data.watches) list.append(alertRow(w, data, () => buildAlertsPanel(mount), { seen }));
   mount.append(sec);
 }
 
 /* One row describing a watch: what, when, and whether anything matches today.
    Shared by the home panel and the /alerts page. */
-function alertRow(w, data, rerender, { editable = false } = {}) {
+function alertRow(w, data, rerender, { editable = false, seen = null } = {}) {
   const [o, d] = w.route.split("-");
   const href = `${w.kind === "rt" ? "/trip" : "/route"}/${w.route}`;
   const arrow = w.kind === "rt" ? "⇄" : "→";
   const cabs = (w.cabins || []).map((c) => CABIN_BIT[c]).filter(Boolean);
   const problem = watchProblem(w);
   const m = problem ? null : matchesNow(w);
+  // What's appeared since this device last looked — the news a notification
+  // would have carried, shown here in case it never arrived.
+  const fresh = problem || !seen ? null : newSinceSeen(w, seen);
 
-  const row = el(`<div class="alert-row${problem ? " dead" : ""}">
+  const row = el(`<div class="alert-row${problem ? " dead" : ""}${fresh?.count && fresh.everSeen ? " has-new" : ""}">
     <a class="alert-route" href="${href}">
       <span class="rc-route">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</span>
       <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
@@ -1112,9 +1152,12 @@ function alertRow(w, data, rerender, { editable = false } = {}) {
     <span class="alert-when">${esc(watchSummary(w))}</span>
     <span class="alert-state">${problem
       ? `<span class="as-warn">⚠ ${esc(problem)}</span>`
-      : m.pairs
-        ? `<span class="as-ok">● Armed · ${m.pairs} ${w.kind === "rt" ? "round trip" : "date"}${m.pairs > 1 ? "s" : ""} match right now</span>`
-        : `<span class="as-idle">● Armed · nothing matches yet — we'll tell you</span>`}
+      : fresh && fresh.count && fresh.everSeen
+        ? `<span class="as-new">★ ${fresh.count} new since you last looked</span>
+           <span class="as-ok">${m.pairs} match now</span>`
+        : m.pairs
+          ? `<span class="as-ok">● Armed · ${m.pairs} ${w.kind === "rt" ? "round trip" : "date"}${m.pairs > 1 ? "s" : ""} match right now</span>`
+          : `<span class="as-idle">● Armed · nothing matches yet — we'll tell you</span>`}
       ${w.lastFiredAt ? `<span class="as-last">Last alert ${esc(timeAgo(w.lastFiredAt))}</span>` : ""}
     </span>
   </div>`);
@@ -2602,8 +2645,12 @@ async function drawAlertsPage(body) {
 
   const list = el(`<div class="card-list alerts-list"></div>`);
   const rerender = () => drawAlertsPage(body);
-  for (const w of watches) list.append(alertRow(w, data, rerender, { editable: true }));
+  const seen = loadSeen();
+  for (const w of watches) list.append(alertRow(w, data, rerender, { editable: true, seen }));
   body.append(list, el(`<p class="alerts-status" role="status"></p>`), troubleshootHTML(), alertsFooterHTML());
+  // Now that they've seen it, this becomes the new baseline. Deferred so the
+  // "new since you last looked" line is what they actually read on this visit.
+  markSeen(watches);
 
   $("#alerts-all-off", head).addEventListener("click", async (e) => {
     const btn = e.currentTarget;
