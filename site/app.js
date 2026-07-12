@@ -138,6 +138,18 @@ function urlB64ToUint8(b64) {
 const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
   .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 
+/* Thrown when the browser won't let us ask, or the user said no. `state` is
+   the Notification permission value; "default" means the prompt never really
+   appeared (Chrome's "quieter messaging" resolves the request immediately and
+   hides it behind an address-bar icon), which needs different advice from an
+   outright block. */
+class PermissionError extends Error {
+  constructor(state) {
+    super(state);
+    this.state = state;
+  }
+}
+
 /* The browser's push subscription, creating it (and asking permission) only
    when the user has actually asked for an alert. */
 async function getSubscription({ create = false } = {}) {
@@ -148,15 +160,32 @@ async function getSubscription({ create = false } = {}) {
     // already granted is pointless (and some engines never resolve it).
     const perm = Notification.permission === "granted"
       ? "granted" : await Notification.requestPermission();
-    if (perm !== "granted") throw new Error(perm === "denied"
-      ? "Notifications are blocked for this site in your browser settings."
-      : "Notification permission wasn't granted.");
+    if (perm !== "granted") throw new PermissionError(perm);
     sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,
       applicationServerKey: urlB64ToUint8(VAPID_PUBLIC_KEY),
     });
   }
   return sub;
+}
+
+/* What to tell someone whose browser won't show the prompt. We can't override
+   these settings from a page — all we can do is say exactly where the switch
+   is. Returns inner HTML, so it can drop straight into the status paragraph. */
+function permissionHelpHTML(state) {
+  const chromey = /Chrome|Chromium|Edg/.test(navigator.userAgent) && !/Firefox/.test(navigator.userAgent);
+  if (state === "denied") {
+    return `<b>Notifications are blocked for this site.</b> ${chromey
+      ? `Click the icon at the left of the address bar → <b>Notifications</b> → <b>Allow</b>, then reload and try again.`
+      : `Open your browser's site settings for this page, allow notifications, then try again.`}`;
+  }
+  // "default": the request resolved without the user ever seeing a dialog.
+  return `<b>Your browser hid the permission prompt.</b> ${chromey
+    ? `Chrome calls this <i>quieter messaging</i>. Click the blocked-bell icon at the
+       right of the address bar and choose <b>Allow</b>, then press Save alerts again —
+       or turn it off in Settings → Privacy and security → Site settings → Notifications.`
+    : `Allow notifications for this site from the address bar or site settings,
+       then press Save alerts again.`}`;
 }
 
 const subPayload = (sub) => ({
@@ -1104,8 +1133,7 @@ function alertBell(routeKey, kind, defaultMask) {
       return;
     }
     if (Notification.permission === "denied") {
-      pop.innerHTML = `<p class="bell-note">Notifications are blocked for this site.
-        Re-enable them in your browser's site settings, then try again.</p>`;
+      pop.innerHTML = `<p class="bell-note">${permissionHelpHTML("denied")}</p>`;
       return;
     }
 
@@ -1162,7 +1190,14 @@ function alertBell(routeKey, kind, defaultMask) {
         announce(status.textContent);
         setTimeout(close, 1400);
       } catch (err) {
-        status.textContent = String(err.message || err);
+        if (err instanceof PermissionError) {
+          // The browser refused to ask (or the user said no) — plain text can't
+          // explain that; show the where-to-click guidance instead.
+          status.innerHTML = permissionHelpHTML(err.state);
+          announce("Your browser hid the notification permission prompt.");
+        } else {
+          status.textContent = String(err.message || err);
+        }
         save.disabled = false;
       }
     });
