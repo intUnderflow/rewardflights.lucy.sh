@@ -7,10 +7,12 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alerts"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
 )
 
@@ -23,6 +25,7 @@ type watchConfig struct {
 	Commit   bool          // commit -Out when it changes
 	Push     bool          // push -Out after commit (implies Commit + pre-sync)
 	TokenCmd string        // shell command printing a git token to stdout; empty -> plain git
+	Alerts   alerts.Config // seat-alert publishing; disabled unless Worker is set
 }
 
 // runWatch is the constantly-running mode: it watches the local source
@@ -39,6 +42,24 @@ func runWatch(cfg watchConfig) error {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	// Seat alerts (optional): baseline on the bundle that is current at
+	// process start, so nothing already-visible alerts after a restart.
+	var alerter *alerts.Watcher
+	if cfg.Alerts.Worker != "" {
+		cfg.Alerts.Logf = logf
+		var err error
+		alerter, err = alerts.NewWatcher(cfg.Alerts)
+		if err != nil {
+			return err
+		}
+		if raw, err := os.ReadFile(filepath.Join(cfg.Out, "availability.json")); err == nil {
+			alerter.Baseline(raw)
+			logf("watch: alerts enabled, baseline loaded")
+		} else {
+			logf("watch: alerts enabled, no baseline yet (%v)", err)
+		}
+	}
 
 	var lastProcessed string
 	tick := time.NewTicker(cfg.Interval)
@@ -87,6 +108,16 @@ func runWatch(cfg watchConfig) error {
 				logf("watch: %s derived data for source %s", pushVerb(cfg.Push), short(sha))
 			} else {
 				logf("watch: no derived-data change for source %s", short(sha))
+			}
+		}
+
+		// Seat alerts run strictly after the data push and never fail the
+		// cycle: a lost notification is acceptable, a stalled push is not.
+		if alerter != nil {
+			if raw, err := os.ReadFile(filepath.Join(cfg.Out, "availability.json")); err == nil {
+				alerter.Cycle(raw)
+			} else {
+				logf("watch: alerts: cannot read new bundle: %v", err)
 			}
 		}
 		lastProcessed = sha

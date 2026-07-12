@@ -31,13 +31,30 @@ runs in memory with zero further network requests.
 
 See [`SPEC.md`](SPEC.md) for the full architecture and data-format spec.
 
+## Seat alerts
+
+Free, instant, and per-cabin — the thing competitors charge for. Subscribe on
+any route ("tell me when a **Business round trip** opens on LON⇄TYO") and the
+watcher pushes a notification within seconds of the seats appearing, because it
+already knows the moment availability changes.
+
+An alert fires on the *joint* condition, not just "the route changed": for a
+round trip both legs must open award space **in the same cabin** within your
+trip-length window. Repeat flapping on one route is damped (a cooldown per
+route+cabin+date, and per-topic batching), so a churny route can't spam you.
+
+Delivery is standards Web Push (RFC 8291 + VAPID) — no app to install, free on
+every platform including iPhone (where iOS requires adding the site to the Home
+Screen first). We store no accounts and no personal data: a subscription is an
+opaque push endpoint, nothing more.
+
 ## Repo layout
 
 | Path | What |
 |------|------|
-| `processor/` | Go program: source dataset → derived web format |
+| `processor/` | Go: source dataset → derived web format, plus the alert watcher/sender |
 | `site/` | The static website (no build step; deploy as-is) |
-| `.github/workflows/process-data.yml` | Scheduled pipeline that keeps the data repo fresh |
+| `push-worker/` | Cloudflare Worker holding push subscriptions ([README](push-worker/README.md)) |
 | `SPEC.md` | Architecture + data-format specification |
 
 ## Development

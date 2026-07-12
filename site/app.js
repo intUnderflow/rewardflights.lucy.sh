@@ -97,6 +97,101 @@ function baBookingURL(origin, dest, outIso, bit, returnIso) {
     params.map(([k, v]) => `${k}=${v}`).join("&");
 }
 
+/* ---------------- alerts (Web Push) ---------------- */
+
+const PUSH_API = "https://push.rewardflights.lucy.sh";
+const VAPID_PUBLIC_KEY = "BMHjtxbmirrQAoG2QNGDFNRZ-n5ijHTz99bVUkVLEAJDWsv3Ks6DSoKK88WKhCDk3rS_CmIDPWifQupVjL15TtQ";
+
+/* A topic is one thing a person actually wants: "Business round trips on
+   LON⇄TYO". kind: "rt" (round trip) | "ow" (one way). */
+const topicFor = (routeKey, kind, bit) => `rf_${routeKey}_${kind}_${CABIN_CODE[bit]}`;
+
+const pushSupported = () =>
+  "serviceWorker" in navigator && "PushManager" in window && "Notification" in window;
+
+/* iOS exposes PushManager only to a Home-Screen web app (16.4+), so a plain
+   Safari tab needs an install step first. Detect that case to explain it
+   rather than showing a button that can't work. */
+const isIOS = () => /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
+const isStandalone = () =>
+  window.matchMedia?.("(display-mode: standalone)").matches || navigator.standalone === true;
+
+/* Get a live registration to talk to pushManager through. Never cache one: the
+   worker calls skipWaiting()+claim(), so the active worker can be swapped while
+   the page is open, and pushManager calls made through a superseded
+   registration never settle. register() is idempotent and cheap once
+   registered; awaiting ready guarantees the worker is active before we
+   subscribe. */
+async function ensureSW() {
+  const reg = await navigator.serviceWorker.register("/sw.js");
+  await navigator.serviceWorker.ready;
+  return reg;
+}
+
+function urlB64ToUint8(b64) {
+  const pad = "=".repeat((4 - (b64.length % 4)) % 4);
+  const raw = atob((b64 + pad).replace(/-/g, "+").replace(/_/g, "/"));
+  return Uint8Array.from([...raw].map((c) => c.charCodeAt(0)));
+}
+
+const b64url = (buf) => btoa(String.fromCharCode(...new Uint8Array(buf)))
+  .replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+
+/* The browser's push subscription, creating it (and asking permission) only
+   when the user has actually asked for an alert. */
+async function getSubscription({ create = false } = {}) {
+  const reg = await ensureSW();
+  let sub = await reg.pushManager.getSubscription();
+  if (!sub && create) {
+    // Only prompt when we actually need to: re-asking when permission is
+    // already granted is pointless (and some engines never resolve it).
+    const perm = Notification.permission === "granted"
+      ? "granted" : await Notification.requestPermission();
+    if (perm !== "granted") throw new Error(perm === "denied"
+      ? "Notifications are blocked for this site in your browser settings."
+      : "Notification permission wasn't granted.");
+    sub = await reg.pushManager.subscribe({
+      userVisibleOnly: true,
+      applicationServerKey: urlB64ToUint8(VAPID_PUBLIC_KEY),
+    });
+  }
+  return sub;
+}
+
+const subPayload = (sub) => ({
+  endpoint: sub.endpoint,
+  p256dh: b64url(sub.getKey("p256dh")),
+  auth: b64url(sub.getKey("auth")),
+});
+
+/* The store holds the full topic set per endpoint, so changing one route's
+   alerts means sending the whole set back. */
+async function fetchTopics(sub) {
+  const res = await fetch(`${PUSH_API}/topics?endpoint=${encodeURIComponent(sub.endpoint)}`);
+  if (!res.ok) throw new Error(`alert service unavailable (${res.status})`);
+  return new Set((await res.json()).topics || []);
+}
+
+async function saveTopics(sub, topics) {
+  const list = [...topics];
+  if (!list.length) {
+    // No topics left: drop the subscription entirely rather than keeping a
+    // dangling endpoint on file.
+    await fetch(`${PUSH_API}/unsubscribe`, {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: sub.endpoint }),
+    });
+    await sub.unsubscribe().catch(() => {});
+    return;
+  }
+  const res = await fetch(`${PUSH_API}/subscribe`, {
+    method: "POST", headers: { "content-type": "application/json" },
+    body: JSON.stringify({ ...subPayload(sub), topics: list }),
+  });
+  if (!res.ok) throw new Error(`couldn't save alerts (${res.status})`);
+}
+
 /* ---------------- tiny utils ---------------- */
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -955,6 +1050,129 @@ function tripDayIndex(iso) {
   return isoOf(dayDate(idx)) === iso ? idx : -1; // rejects overflow dates (e.g. 2026-02-31)
 }
 
+/* Alert bell for a route. `kind` is "rt" on /trip/ (round trips — the prize)
+   or "ow" on /route/. Cabins are pre-ticked from the filter the user already
+   set, because that IS their stated preference. */
+function alertBell(routeKey, kind, defaultMask) {
+  const [o, d] = routeKey.split("-");
+  const wrap = el(`<div class="bell-wrap"></div>`);
+  const btn = el(`<button type="button" class="btn bell-btn" aria-expanded="false"
+    aria-haspopup="dialog">🔔 <span class="bell-label">Alert me</span></button>`);
+  const pop = el(`<div class="bell-pop" role="dialog" aria-label="Alerts for this route" hidden></div>`);
+  wrap.append(btn, pop);
+
+  const legend = cabinLegend();
+  const arrow = kind === "rt" ? "⇄" : "→";
+
+  function setLabel(n) {
+    $(".bell-label", btn).textContent = n ? `Alerts on (${n})` : "Alert me";
+    btn.classList.toggle("on", !!n);
+  }
+
+  async function refreshLabel() {
+    if (!pushSupported() || Notification.permission !== "granted") return;
+    try {
+      const sub = await getSubscription();
+      if (!sub) return;
+      const topics = await fetchTopics(sub);
+      setLabel(legend.filter(([bit]) => topics.has(topicFor(routeKey, kind, bit))).length);
+    } catch { /* label is cosmetic; never break the page over it */ }
+  }
+  refreshLabel();
+
+  function close() {
+    pop.hidden = true; btn.setAttribute("aria-expanded", "false");
+    document.removeEventListener("keydown", onKey);
+    document.removeEventListener("click", onOutside, true);
+  }
+  const onKey = (e) => { if (e.key === "Escape") { close(); btn.focus(); } };
+  const onOutside = (e) => { if (!wrap.contains(e.target)) close(); };
+
+  async function open() {
+    pop.hidden = false;
+    btn.setAttribute("aria-expanded", "true");
+    document.addEventListener("keydown", onKey);
+    document.addEventListener("click", onOutside, true);
+
+    // iOS only exposes push to an installed web app — say so plainly instead
+    // of offering a button that silently can't work.
+    if (!pushSupported()) {
+      pop.innerHTML = isIOS() && !isStandalone()
+        ? `<p class="bell-note"><b>Add Reward Flights to your Home Screen</b> to get alerts on iPhone —
+           tap Share, then “Add to Home Screen”, and open it from there.</p>`
+        : `<p class="bell-note">This browser doesn't support push notifications.</p>`;
+      return;
+    }
+    if (Notification.permission === "denied") {
+      pop.innerHTML = `<p class="bell-note">Notifications are blocked for this site.
+        Re-enable them in your browser's site settings, then try again.</p>`;
+      return;
+    }
+
+    pop.innerHTML = `<div class="sk-line" style="height:96px"></div>`;
+    let current = new Set();
+    try {
+      const sub = await getSubscription();           // no permission prompt yet
+      if (sub) current = await fetchTopics(sub);
+    } catch { /* offline / store down → fall through to a fresh panel */ }
+
+    const mine = new Set(legend.filter(([bit]) => current.has(topicFor(routeKey, kind, bit)))
+      .map(([bit]) => bit));
+    // Nothing set yet → pre-tick the cabins they're already filtering for.
+    const start = mine.size ? mine : new Set(legend.filter(([bit]) => bit & defaultMask).map(([b]) => b));
+
+    pop.innerHTML = "";
+    pop.append(el(`<p class="bell-title">Alert me when a
+      ${kind === "rt" ? "round trip" : "one-way seat"} opens on ${o} ${arrow} ${d}</p>`));
+    const cabs = el(`<div class="bell-cabs" role="group" aria-label="Cabins to watch"></div>`);
+    for (const [bit, label] of legend) {
+      const on = start.has(bit);
+      const row = el(`<button type="button" class="bell-cab" role="checkbox" aria-checked="${on}" data-bit="${bit}">
+        <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
+        <span class="bell-cab-label">${esc(label)}</span>
+      </button>`);
+      row.addEventListener("click", () => {
+        const now = row.getAttribute("aria-checked") !== "true";
+        row.setAttribute("aria-checked", String(now));
+      });
+      cabs.append(row);
+    }
+    pop.append(cabs);
+    const save = el(`<button type="button" class="btn bell-save">Save alerts</button>`);
+    const status = el(`<p class="bell-note" role="status"></p>`);
+    pop.append(save, status);
+
+    save.addEventListener("click", async () => {
+      save.disabled = true;
+      status.textContent = "Saving…";
+      const want = [...cabs.querySelectorAll('[aria-checked="true"]')].map((r) => Number(r.dataset.bit));
+      try {
+        // Permission is only requested here — at the moment they ask for it.
+        const sub = await getSubscription({ create: true });
+        const topics = await fetchTopics(sub).catch(() => new Set());
+        for (const [bit] of legend) {
+          const t = topicFor(routeKey, kind, bit);
+          if (want.includes(bit)) topics.add(t); else topics.delete(t);
+        }
+        await saveTopics(sub, topics);
+        setLabel(want.length);
+        status.textContent = want.length
+          ? `Watching ${want.length} cabin${want.length > 1 ? "s" : ""}. We'll notify you the moment space opens.`
+          : "Alerts off for this route.";
+        announce(status.textContent);
+        setTimeout(close, 1400);
+      } catch (err) {
+        status.textContent = String(err.message || err);
+        save.disabled = false;
+      }
+    });
+    $(".bell-cab", pop)?.focus();
+  }
+
+  btn.addEventListener("click", () => (pop.hidden ? open() : close()));
+  return wrap;
+}
+
 /* ---------------- pages: route ---------------- */
 
 /* Segmented [Round trip | One way]: NAVIGATES between /trip/X-Y and /route/X-Y
@@ -1027,6 +1245,7 @@ function renderRoute(o, d) {
   if (routeHasNew(key)) {
     toolbar.append(el(`<span class="new-legend"><span class="new-dot" aria-hidden="true"></span>opened in the last 48h</span>`));
   }
+  toolbar.append(alertBell(key, "ow", mask));
 
   function drawCalendars() {
     // The year-strip grow animation is an entrance moment — it plays once,
@@ -1294,6 +1513,8 @@ function renderTrip(o, d) {
 
   toolbar.append(buildNightsControl());
   rebuildChips(); // synchronously sets mask + first drawCalendars()
+  // The prize: "tell me when a Business round trip opens on this pair".
+  toolbar.append(alertBell(key, "rt", mask));
 
   function drawCalendars() {
     const animate = firstDraw;
