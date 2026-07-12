@@ -69,6 +69,26 @@ func TestCheckBudgets(t *testing.T) {
 	}
 }
 
+func TestBundleRawBudget(t *testing.T) {
+	// 5 MiB of zeros gzips to a few KiB — the gz budget passes, but the raw
+	// second net must catch it (a stretched nibble horizon looks like this).
+	huge := bytes.Repeat([]byte{'0'}, 5<<20)
+	err := CheckBudgets(map[string][]byte{BundlePath: huge})
+	if err == nil {
+		t.Fatal("compressible-but-huge bundle must fail the raw budget")
+	}
+	if !strings.Contains(err.Error(), "raw budget") || !strings.Contains(err.Error(), BundlePath) {
+		t.Errorf("error %q must cite the raw budget and the bundle", err)
+	}
+	// Non-bundle files have no raw budget (they are gz-bounded already).
+	if err := CheckBudgets(map[string][]byte{"origins/LON.json": bytes.Repeat([]byte{'0'}, 5<<20)}); err != nil {
+		t.Errorf("raw budget must apply to the bundle only: %v", err)
+	}
+	if err := CheckBudgets(map[string][]byte{BundlePath: bytes.Repeat([]byte{'0'}, 4<<20)}); err != nil {
+		t.Errorf("exactly 4 MiB must pass: %v", err)
+	}
+}
+
 func TestManaged(t *testing.T) {
 	for path, want := range map[string]bool{
 		"manifest.json": true, "availability.json": true, "places.json": true,
@@ -140,6 +160,68 @@ func TestSyncLifecycle(t *testing.T) {
 	got, err := os.ReadFile(filepath.Join(out, "README.md"))
 	if err != nil || !bytes.Equal(got, readme) {
 		t.Errorf("README.md must never be touched (got %q, %v)", got, err)
+	}
+}
+
+func TestSyncReplacesSymlinkedManagedPaths(t *testing.T) {
+	out, victim := t.TempDir(), t.TempDir()
+	secret := filepath.Join(victim, "secret.txt")
+	if err := os.WriteFile(secret, []byte("secret"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// A symlinked managed root file, a symlinked managed dir, and a
+	// symlinked subdirectory inside a real managed dir.
+	if err := os.Symlink(secret, filepath.Join(out, "availability.json")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(out, "origins")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(out, "flights"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(out, "flights", "LON")); err != nil {
+		t.Fatal(err)
+	}
+
+	desired := map[string][]byte{
+		"availability.json":            []byte("bundle\n"),
+		"origins/LON.json":             []byte("lon\n"),
+		"flights/LON/TYO/2026-07.json": []byte("f\n"),
+	}
+	if _, err := Sync(out, desired); err != nil {
+		t.Fatal(err)
+	}
+
+	for rel, want := range desired {
+		p := filepath.Join(out, filepath.FromSlash(rel))
+		// Every component below out must be a real file/dir, not a link.
+		for sub := p; len(sub) > len(out); sub = filepath.Dir(sub) {
+			info, err := os.Lstat(sub)
+			if err != nil {
+				t.Fatalf("missing %s: %v", sub, err)
+			}
+			if info.Mode()&os.ModeSymlink != 0 {
+				t.Errorf("%s is still a symlink", sub)
+			}
+		}
+		got, err := os.ReadFile(p)
+		if err != nil || !bytes.Equal(got, want) {
+			t.Errorf("%s content = %q, %v", rel, got, err)
+		}
+	}
+
+	// Nothing escaped into the symlink target.
+	if got, err := os.ReadFile(secret); err != nil || string(got) != "secret" {
+		t.Errorf("victim file modified: %q, %v", got, err)
+	}
+	entries, err := os.ReadDir(victim)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 1 || entries[0].Name() != "secret.txt" {
+		t.Errorf("victim dir polluted: %v", entries)
 	}
 }
 

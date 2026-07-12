@@ -34,13 +34,26 @@ jobs:
           token: ${{ secrets.DATA_REPO_TOKEN }}
           fetch-depth: 1
 
+      - name: Require a licensed data repo
+        run: |
+          # The processor never writes README/LICENSE/DbCL — those are seeded
+          # once by a human. Refuse to run against an unseeded repo so we never
+          # publish derived data without its ODbL license (share-alike).
+          for f in LICENSE README.md; do
+            if [ ! -f "data-out/$f" ]; then
+              echo "::error::data repo is missing $f — seed it once before enabling the pipeline (see repo README, 'First publish')."
+              exit 1
+            fi
+          done
+
       - name: Skip if source unchanged
         id: skip
         run: |
           src_sha="$(git -C rewardflights-src rev-parse HEAD)"
-          have_sha="$(grep -o '"v":"[0-9a-f]*"' data-out/manifest.json 2>/dev/null | cut -d'"' -f4 || true)"
+          # Parse the version out of the canonical (1-space-indented) manifest.
+          have_sha="$(jq -r '.v // empty' data-out/manifest.json 2>/dev/null || true)"
           echo "src_sha=$src_sha" >> "$GITHUB_OUTPUT"
-          if [ "$src_sha" = "$have_sha" ]; then
+          if [ -n "$have_sha" ] && [ "$src_sha" = "$have_sha" ]; then
             echo "Source $src_sha already processed; skipping."
             echo "changed=false" >> "$GITHUB_OUTPUT"
           else

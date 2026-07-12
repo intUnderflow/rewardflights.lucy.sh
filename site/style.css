@@ -22,7 +22,7 @@
   --panel-2: #F1F4F9;
   --ink: #16233B;
   --ink-2: #55647D;
-  --ink-3: #8B97AB;
+  --ink-3: #5E6B82; /* ≥4.5:1 on --surface for the small muted text tier */
   --line: #E3E8F0;
   --line-2: #D2DAE6;
   --focus: #16233B;
@@ -48,7 +48,7 @@
     --panel-2: #1B2C47;
     --ink: #E8EEF7;
     --ink-2: #9FAFC6;
-    --ink-3: #64748E;
+    --ink-3: #92A1BA; /* ≥4.5:1 on --surface/--panel for small muted text */
     --line: #24344E;
     --line-2: #2F4160;
     --focus: #E8EEF7;
@@ -83,6 +83,13 @@ button { font: inherit; color: inherit; }
   background: var(--panel); padding: 8px 14px; border-radius: 0 0 8px 0;
 }
 .skip-link:focus { left: 0; }
+
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+body.modal-open { overflow: hidden; }
+[inert] { user-select: none; }
 
 /* ---------- top bar ---------- */
 .topbar {
@@ -224,9 +231,12 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 }
 .chip .swatch { width: 12px; height: 12px; border-radius: 3px; }
 .chip .n { font-family: var(--font-data); font-weight: 400; font-size: 11.5px; color: var(--ink-3); }
-.chip[aria-pressed="false"] { opacity: .42; }
+/* Unpressed / no-availability chips: desaturate the SWATCH only and keep the
+   label at readable contrast — dimming the whole button would drop the text
+   below WCAG AA (the label must stay legible to operate the filter). */
+.chip[aria-pressed="false"] { background: var(--panel-2); color: var(--ink-2); }
 .chip[aria-pressed="false"] .swatch { background: var(--ink-3) !important; }
-.chip.none { opacity: .38; }
+.chip.none { border-style: dashed; }
 .chip.none .swatch { background: var(--ink-3) !important; }
 
 .month-compact { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; }
@@ -259,6 +269,8 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
   background: color-mix(in srgb, var(--surface) 88%, transparent);
   backdrop-filter: blur(8px); padding: 12px 0;
 }
+.new-legend { display: inline-flex; align-items: center; gap: 7px; font-size: 12.5px; color: var(--ink-2); }
+.new-legend .new-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--gold); }
 
 /* year strip — 12 months at a glance */
 .year-strip { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; margin: 18px 0 34px; }

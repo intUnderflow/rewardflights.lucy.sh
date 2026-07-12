@@ -9,12 +9,27 @@
 const DEFAULT_DATA_BASE =
   "https://raw.githubusercontent.com/intUnderflow/rewardflights.lucy.sh-data/main";
 
+/* A data-origin override is allowed ONLY for local development. Accepting an
+   arbitrary ?data= URL and persisting it would let a crafted link point a
+   victim at attacker-controlled availability data forever, so we restrict it
+   to loopback origins and never persist a remote one. */
+function isDevOrigin(u) {
+  try {
+    const url = new URL(u, location.href);
+    if (url.protocol !== "http:" && url.protocol !== "https:") return false;
+    return ["localhost", "127.0.0.1", "[::1]"].includes(url.hostname);
+  } catch { return false; }
+}
+
 const dataBase = (() => {
   try {
     const q = new URLSearchParams(location.search).get("data");
-    if (q === "default") localStorage.removeItem("rf:dataBase");
-    else if (q) localStorage.setItem("rf:dataBase", q);
-    return localStorage.getItem("rf:dataBase") || DEFAULT_DATA_BASE;
+    if (q === "default") { localStorage.removeItem("rf:dataBase"); return DEFAULT_DATA_BASE; }
+    if (q && isDevOrigin(q)) { localStorage.setItem("rf:dataBase", q); return q; }
+    const saved = localStorage.getItem("rf:dataBase");
+    if (saved && isDevOrigin(saved)) return saved;
+    localStorage.removeItem("rf:dataBase");
+    return DEFAULT_DATA_BASE;
   } catch { return DEFAULT_DATA_BASE; }
 })();
 
@@ -58,8 +73,12 @@ function timeAgo(unixSec) {
 function utcDate(y, m, d) { return new Date(Date.UTC(y, m, d)); }
 function isoOf(dt) { return dt.toISOString().slice(0, 10); }
 
-/* ---------------- fetch layer (single, deduped) ---------------- */
+/* ---------------- fetch layer (concurrent-request dedupe) ---------------- */
 
+/* Coalesces concurrent requests for the same URL; it is NOT a response cache.
+   The entry is dropped once the request settles (success or failure), so a
+   later fetch of the same URL re-hits the network — otherwise the changes feed
+   and flight detail would freeze at boot-time state for the tab's whole life. */
 const inflight = new Map();
 
 function getJSON(url, { timeout = 8000, retries = 2 } = {}) {
@@ -79,7 +98,7 @@ function getJSON(url, { timeout = 8000, retries = 2 } = {}) {
       throw err;
     } finally { clearTimeout(timer); }
   };
-  const p = attempt(retries).catch((err) => { inflight.delete(url); throw err; });
+  const p = attempt(retries).finally(() => { inflight.delete(url); });
   inflight.set(url, p);
   return p;
 }
@@ -97,12 +116,23 @@ const store = {
   monthCache: new Map(),
 };
 
+const ROUTE_RE = /^[A-Z]{3}-[A-Z]{3}$/;
+const CODE_RE = /^[A-Z]{3}$/;
+
 function adoptBundle(bundle, fromSnapshot) {
   if (bundle.schema !== 1) throw new Error(`Unsupported data schema ${bundle.schema}`);
+  // Route keys and place codes get interpolated into markup and URLs, so
+  // structurally validate them at the trust boundary and drop anything
+  // malformed — defense in depth even though the data origin is trusted.
+  bundle.routes = Object.fromEntries(
+    Object.entries(bundle.routes || {}).filter(([k]) => ROUTE_RE.test(k)));
+  bundle.places = Object.fromEntries(
+    Object.entries(bundle.places || {}).filter(([k]) => CODE_RE.test(k)));
   store.bundle = bundle;
   store.fromSnapshot = fromSnapshot;
   const [ey, em, ed] = bundle.epoch.split("-").map(Number);
   store.epochMs = Date.UTC(ey, em - 1, ed);
+  _months12 = null; // epoch (and thus month day-offsets) can change between bundles
   store.placeList = Object.entries(bundle.places).map(([code, p]) => ({
     code, name: p.name || code, country: p.country || "", search: p.search || [],
   }));
@@ -127,7 +157,12 @@ function routeBits(routeKey) {
   if (!route) return null;
   const days = store.bundle.days;
   const merged = new Uint8Array(days);
-  for (const str of Object.values(route.a)) {
+  for (const [airlineId, str] of Object.entries(route.a)) {
+    // Per the format contract a future airline may encode >1 hex char per day
+    // (width>1). We only decode single-nibble strings today; skip anything
+    // wider so we degrade to "not shown" rather than misaligning days.
+    const width = store.bundle.airlines?.[airlineId]?.width ?? 1;
+    if (width !== 1) continue;
     const n = Math.min(str.length, days);
     for (let i = 0; i < n; i++) {
       const v = parseInt(str[i], 16);
@@ -142,9 +177,12 @@ function dayIndexOf(iso) {
   const [y, m, d] = iso.split("-").map(Number);
   return Math.round((Date.UTC(y, m - 1, d) - store.epochMs) / DAY_MS);
 }
+/* Day indices are calendar dates (epoch + i, read as a UTC day). "Today" must
+   be the user's LOCAL calendar date mapped onto that same index, or users west
+   of UTC lose their current day every evening. */
 function todayIndex() {
   const now = new Date();
-  return Math.floor((Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate()) - store.epochMs) / DAY_MS);
+  return Math.round((Date.UTC(now.getFullYear(), now.getMonth(), now.getDate()) - store.epochMs) / DAY_MS);
 }
 
 /* Cabin legend, merged across airlines: bit → label (first legend wins). */
@@ -182,13 +220,19 @@ function monthCounts(kind, key) {
   return counts;
 }
 
-let _months12 = null;
+/* The 12 months from the current LOCAL month, as day-offset windows into the
+   current bundle's epoch. Cached, but the cache is keyed on (epoch, year-month)
+   so it rebuilds after an epoch change (adoptBundle nulls it) or when a long-
+   lived tab crosses a month/year boundary — otherwise every calendar would
+   silently shift by a month or a year. */
+let _months12 = null, _months12Key = "";
 function next12Months() {
-  if (_months12) return _months12;
   const now = new Date();
+  const key = `${store.epochMs}|${now.getFullYear()}-${now.getMonth()}`;
+  if (_months12 && _months12Key === key) return _months12;
   const out = [];
   for (let k = 0; k < 12; k++) {
-    const y = now.getUTCFullYear(), m = now.getUTCMonth() + k;
+    const y = now.getFullYear(), m = now.getMonth() + k;
     const first = utcDate(y, m, 1), next = utcDate(y, m + 1, 1);
     out.push({
       y: first.getUTCFullYear(), m: first.getUTCMonth(),
@@ -198,6 +242,7 @@ function next12Months() {
     });
   }
   _months12 = out;
+  _months12Key = key;
   return out;
 }
 
@@ -244,8 +289,10 @@ async function boot() {
     adoptBundle(fresh, false);
     try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(fresh)); } catch {}
     hideBanner();
-    if (!painted || changedV) route();
-    if (painted && changedV) pulseFreshness();
+    // Re-render on first paint always; on a version change, only if it won't
+    // wipe a search the user has already started typing.
+    if (!painted || (changedV && !isTypingInSearch())) route();
+    if (painted && changedV) { pulseFreshness(); announce(`Availability updated to ${freshLabel()}.`); }
   } catch (err) {
     if (!painted) {
       renderFatal(err);
@@ -259,11 +306,13 @@ async function boot() {
 }
 
 async function loadChanges() {
-  const path = "changes/recent.json";
+  // Pin to the current bundle version so a new generation bypasses the
+  // 5-minute CDN cache and the feed stays consistent with the calendar.
+  const v = store.bundle?.v ? `?v=${encodeURIComponent(store.bundle.v)}` : "";
   try {
-    store.changes = await getJSON(`${dataBase}/${path}`);
-    if (current.page === "home") route(); // enrich home once the feed lands
-  } catch { store.changes = null; }
+    store.changes = await getJSON(`${dataBase}/changes/recent.json${v}`);
+    if (current.page === "home") refreshHomeModules(); // enrich without stomping input
+  } catch { /* keep whatever we had; feed is enrichment only */ }
 }
 
 /* ---------------- freshness ---------------- */
@@ -308,24 +357,57 @@ async function checkForUpdate() {
     const manifest = await getJSON(`${dataBase}/manifest.json?ts=${Math.floor(Date.now() / 60000)}`, { retries: 0 });
     if (manifest.v && manifest.v !== store.bundle.v) {
       // New generation: bypass the 5-minute CDN cache via a versioned URL.
-      const fresh = await getJSON(`${dataBase}/availability.json?v=${manifest.v}`);
-      adoptBundle(fresh, false);
-      try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(fresh)); } catch {}
-      loadChanges();
-      route();
-      pulseFreshness();
+      const fresh = await getJSON(`${dataBase}/availability.json?v=${encodeURIComponent(manifest.v)}`);
+      // Guard against a stale CDN replica: only adopt when the bundle we got
+      // back actually IS a new version. Otherwise we'd re-adopt the same data
+      // and fire a false "updated" pulse + destructive re-render every poll.
+      if (fresh.v && fresh.v !== store.bundle.v) {
+        const wasRoute = current.page === "route";
+        const scrollY = window.scrollY;
+        adoptBundle(fresh, false);
+        try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(fresh)); } catch {}
+        loadChanges();
+        // Don't yank a half-typed search out from under the user.
+        if (!isTypingInSearch()) {
+          route();
+          if (wasRoute) window.scrollTo({ top: scrollY });
+          pulseFreshness();
+          announce(`Availability updated to ${freshLabel()}.`);
+        }
+      }
     }
     hideBanner();
   } catch { /* silent — next poll retries */ }
 }
 
-function showBanner(text, withRetry) {
-  bannerEl.innerHTML = esc(text) + (withRetry ? ` <button type="button" id="banner-retry">Retry</button>` : "");
-  bannerEl.hidden = false;
-  const btn = $("#banner-retry");
-  if (btn) btn.addEventListener("click", () => { bannerEl.hidden = true; boot(); });
+function isTypingInSearch() {
+  const a = document.activeElement;
+  return !!(a && a.tagName === "INPUT" && a.closest(".search-card"));
 }
-function hideBanner() { bannerEl.hidden = true; }
+
+function showBanner(text, withRetry) {
+  bannerEl.textContent = text;
+  if (withRetry) {
+    const btn = el(`<button type="button">Retry</button>`);
+    btn.addEventListener("click", () => { bannerEl.hidden = true; boot(); });
+    bannerEl.append(btn);
+  }
+  bannerEl.hidden = false;
+}
+function hideBanner() { bannerEl.hidden = true; bannerEl.textContent = ""; }
+
+/* Polite screen-reader announcer for out-of-band changes (data refresh, page
+   navigation) that aren't tied to a focus move. */
+let liveRegion = null;
+function announce(msg) {
+  if (!liveRegion) {
+    liveRegion = el(`<div class="sr-only" role="status" aria-live="polite" aria-atomic="true"></div>`);
+    document.body.append(liveRegion);
+  }
+  liveRegion.textContent = "";
+  // A microtask gap makes AT re-announce even identical consecutive messages.
+  setTimeout(() => { liveRegion.textContent = msg; }, 60);
+}
 
 function renderFatal(err) {
   mainEl.innerHTML = "";
@@ -343,7 +425,7 @@ const current = { page: null, params: null };
 
 function navigate(path) {
   history.pushState(null, "", path);
-  route();
+  route({ focus: true });
 }
 
 document.addEventListener("click", (e) => {
@@ -352,19 +434,28 @@ document.addEventListener("click", (e) => {
   e.preventDefault();
   navigate(a.pathname + a.search);
 });
-window.addEventListener("popstate", route);
+window.addEventListener("popstate", () => route({ focus: true }));
 
-function route() {
+function route({ focus = false } = {}) {
   renderFreshness();
   closeDayPanel();
   const path = location.pathname;
   let m;
-  if (path === "/" || path === "") return renderHome();
-  if ((m = path.match(/^\/route\/([A-Z]{3})-([A-Z]{3})\/?$/i)))
-    return renderRoute(m[1].toUpperCase(), m[2].toUpperCase());
-  if ((m = path.match(/^\/from\/([A-Z]{3})\/?$/i)))
-    return renderFrom(m[1].toUpperCase());
-  return renderNotFound();
+  if (path === "/" || path === "") renderHome();
+  else if ((m = path.match(/^\/route\/([A-Z]{3})-([A-Z]{3})\/?$/i)))
+    renderRoute(m[1].toUpperCase(), m[2].toUpperCase());
+  else if ((m = path.match(/^\/from\/([A-Z]{3})\/?$/i)))
+    renderFrom(m[1].toUpperCase());
+  else renderNotFound();
+
+  // On a real navigation, move focus into the new page so keyboard and screen-
+  // reader users are repositioned and the change is announced (title alone is
+  // not). Skipped on data-refresh re-renders, which pass no focus flag.
+  if (focus && store.bundle) {
+    const h1 = $("h1", mainEl);
+    if (h1) h1.tabIndex = -1;
+    (h1 || mainEl).focus?.({ preventScroll: false });
+  }
 }
 
 function setTitle(t) { document.title = t ? `${t} — Reward Flights` : "Reward Flights — open award seat availability"; }
@@ -402,18 +493,24 @@ function matchPlaces(query, restrictTo) {
    moment: by the time you pick, you've already seen the shape of the year. */
 function attachAutocomplete(input, { getRestrict, sparkFor, onPick }) {
   const wrap = input.closest(".field");
-  const list = el(`<div class="suggest" role="listbox" hidden></div>`);
-  wrap.append(list);
+  const listId = `${input.id}-listbox`;
+  const list = el(`<div class="suggest" role="listbox" id="${listId}" hidden></div>`);
+  const liveMsg = el(`<div class="sr-only" role="status" aria-live="polite"></div>`);
+  wrap.append(list, liveMsg);
   let items = [], active = -1;
 
   input.setAttribute("role", "combobox");
   input.setAttribute("aria-autocomplete", "list");
   input.setAttribute("aria-expanded", "false");
+  input.setAttribute("aria-controls", listId);
   input.autocomplete = "off";
   input.spellcheck = false;
 
   function close() {
-    list.hidden = true; input.setAttribute("aria-expanded", "false"); active = -1;
+    list.hidden = true;
+    input.setAttribute("aria-expanded", "false");
+    input.removeAttribute("aria-activedescendant"); // don't leave a dangling ref
+    active = -1;
   }
   function open() {
     list.hidden = false; input.setAttribute("aria-expanded", "true");
@@ -426,6 +523,8 @@ function attachAutocomplete(input, { getRestrict, sparkFor, onPick }) {
     if (!items.length) {
       if (input.value.trim()) {
         list.append(el(`<div class="sg-empty">No places match “${esc(input.value.trim())}”${restrict ? " from the chosen origin" : ""}.</div>`));
+        liveMsg.textContent = `No places match ${input.value.trim()}`;
+        input.removeAttribute("aria-activedescendant");
         open();
       } else close();
       return;
@@ -439,22 +538,33 @@ function attachAutocomplete(input, { getRestrict, sparkFor, onPick }) {
             `<i style="height:${Math.max(2, Math.round((c / max) * 26))}px"></i>`).join("")}</span>
            <span class="sg-days">${total}d</span>`
         : "";
-      const row = el(`<button type="button" class="sg-row" role="option" id="${input.id}-opt-${i}">
-        <span class="sg-code">${esc(p.code)}</span>
-        <span class="sg-name"><span class="nm">${esc(p.name)}</span><br><span class="co">${esc(p.country)}</span></span>
-        <span style="display:flex;align-items:center">${spark}</span>
-      </button>`);
-      row.addEventListener("mousedown", (e) => e.preventDefault()); // keep focus
+      // Options are non-focusable (tabindex -1): focus stays on the input and
+      // selection is managed via aria-activedescendant, per the combobox pattern.
+      const label = counts
+        ? `${p.name}, ${p.country}. ${total} days with seats in the next year.`
+        : `${p.name}, ${p.country}`;
+      const row = el(`<div class="sg-row" role="option" tabindex="-1" id="${input.id}-opt-${i}"
+          aria-label="${esc(label)}">
+        <span class="sg-code" aria-hidden="true">${esc(p.code)}</span>
+        <span class="sg-name" aria-hidden="true"><span class="nm">${esc(p.name)}</span><br><span class="co">${esc(p.country)}</span></span>
+        <span aria-hidden="true" style="display:flex;align-items:center">${spark}</span>
+      </div>`);
+      row.addEventListener("mousedown", (e) => e.preventDefault()); // keep focus on input
       row.addEventListener("click", () => { close(); onPick(p); });
       list.append(row);
     });
+    liveMsg.textContent = `${items.length} place${items.length > 1 ? "s" : ""} found`;
     setActive(0);
     open();
   }
 
   function setActive(i) {
     active = i;
-    [...list.children].forEach((c, j) => c.classList.toggle("active", j === i));
+    [...list.children].forEach((c, j) => {
+      const on = j === i;
+      c.classList.toggle("active", on);
+      if (c.getAttribute("role") === "option") c.setAttribute("aria-selected", on ? "true" : "false");
+    });
     const opt = list.children[i];
     if (opt) {
       input.setAttribute("aria-activedescendant", opt.id || "");
@@ -466,6 +576,9 @@ function attachAutocomplete(input, { getRestrict, sparkFor, onPick }) {
   input.addEventListener("focus", () => { if (input.value.trim()) render(); });
   input.addEventListener("blur", () => setTimeout(close, 120));
   input.addEventListener("keydown", (e) => {
+    // Tab must leave the field and close the list synchronously (options are
+    // not in the tab order, so focus proceeds to the next control cleanly).
+    if (e.key === "Tab") { close(); return; }
     if (list.hidden) return;
     if (e.key === "ArrowDown") { e.preventDefault(); setActive(Math.min(active + 1, items.length - 1)); }
     else if (e.key === "ArrowUp") { e.preventDefault(); setActive(Math.max(active - 1, 0)); }
@@ -544,18 +657,33 @@ function renderHome() {
   });
   updateHint();
 
-  // Modules: recently opened + deepest availability.
+  // Modules mount to their own region so the changes feed can refresh them
+  // later without rebuilding (and clearing) the search card above.
+  const mount = el(`<div id="home-modules"></div>`);
+  mainEl.append(mount);
+  buildHomeModules(mount);
+}
+
+/* Re-render only the home modules region (recently-opened + deepest + stats),
+   leaving the search inputs and their focus/typed text untouched. */
+function refreshHomeModules() {
+  const mount = $("#home-modules");
+  if (mount) buildHomeModules(mount);
+}
+
+function buildHomeModules(mount) {
+  mount.innerHTML = "";
   const modules = el(`<div class="modules"></div>`);
   const opened = recentlyOpened();
   if (opened.length) {
-    const mod = el(`<section class="module"><h2><span class="dot"></span>Recently opened</h2><div class="card-list"></div></section>`);
+    const mod = el(`<section class="module"><h2><span class="dot" aria-hidden="true"></span>Recently opened</h2><div class="card-list"></div></section>`);
     const listEl = $(".card-list", mod);
     for (const g of opened) {
       const [o, d] = g.route.split("-");
       listEl.append(el(`<a class="route-card" href="/route/${g.route}">
-        <span class="rc-route">${o} <span class="arrow">→</span> ${d}</span>
+        <span class="rc-route">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</span>
         <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
-        <span class="rc-meta"><span class="chg-opened">+${g.count} date${g.count > 1 ? "s" : ""}</span><br><span class="when">${timeAgo(g.t)}</span></span>
+        <span class="rc-meta"><span class="chg-opened">+${g.count} date${g.count > 1 ? "s" : ""}</span><br><span class="when">${esc(timeAgo(g.t))}</span></span>
       </a>`));
     }
     modules.append(mod);
@@ -567,19 +695,19 @@ function renderHome() {
     for (const { key, total } of top) {
       const [o, d] = key.split("-");
       listEl.append(el(`<a class="route-card" href="/route/${key}">
-        <span class="rc-route">${o} <span class="arrow">→</span> ${d}</span>
+        <span class="rc-route">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</span>
         <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
         <span class="rc-meta"><b>${total}</b> days<br><span class="when">next 12 months</span></span>
       </a>`));
     }
     modules.append(mod);
   }
-  if (modules.children.length) mainEl.append(modules);
+  if (modules.children.length) mount.append(modules);
 
   const routeCount = Object.keys(store.bundle.routes).length;
   let dateCount = 0;
   for (const key of Object.keys(store.bundle.routes)) dateCount += routeTotals(key).total;
-  mainEl.append(el(`<div class="stats-strip">
+  mount.append(el(`<div class="stats-strip">
     <span><b>${routeCount}</b> routes tracked</span>
     <span><b>${dateCount.toLocaleString("en-GB")}</b> dates with seats</span>
     <span><b>${Object.keys(store.bundle.places).length}</b> cities</span>
@@ -656,7 +784,7 @@ function renderRoute(o, d) {
   const head = el(`<div class="route-head">
     <p class="crumbs"><a href="/">Search</a> · <a href="/from/${o}">All from ${esc(placeName(o))}</a></p>
     <div class="route-title-row">
-      <h1 class="route-title">${o} <span class="arrow">→</span> ${d}</h1>
+      <h1 class="route-title" aria-label="${o} to ${d}">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</h1>
       <div class="head-actions">
         <a class="btn" href="/route/${d}-${o}" title="See the return direction">⇄ Return</a>
       </div>
@@ -686,6 +814,9 @@ function renderRoute(o, d) {
 
   let mask = 0, firstDraw = true;
   toolbar.append(cabinChips(totals.perCabin, (m) => { mask = m; drawCalendars(); }));
+  if (routeHasNew(key)) {
+    toolbar.append(el(`<span class="new-legend"><span class="new-dot" aria-hidden="true"></span>opened in the last 48h</span>`));
+  }
 
   function drawCalendars() {
     // The year-strip grow animation is an entrance moment — it plays once,
@@ -696,13 +827,12 @@ function renderRoute(o, d) {
     const months = next12Months();
     const t0 = todayIndex();
 
-    // Year strip
-    const strip = el(`<div class="year-strip" role="tablist" aria-label="Months"></div>`);
-    const maxCount = Math.max(1, ...months.map((mo) => countIn(mo)));
+    // Year strip (in-page scroll shortcuts, not tabs → role=group)
+    const strip = el(`<div class="year-strip" role="group" aria-label="Jump to month"></div>`);
     months.forEach((mo, mi) => {
       const c = countIn(mo);
       const now = new Date();
-      const isCur = mo.y === now.getUTCFullYear() && mo.m === now.getUTCMonth();
+      const isCur = mo.y === now.getFullYear() && mo.m === now.getMonth();
       const btn = el(`<button type="button" class="ys-month${isCur ? " current" : ""}" aria-label="${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with seats">
         <span class="ys-label">${mo.label}</span>
         <span class="ys-bars" aria-hidden="true"></span>
@@ -792,8 +922,9 @@ function monthCal(routeKey, bits, mo, mask, t0) {
       .filter(([bit]) => v & bit)
       .map(([bit]) => `<i class="${(bit & mask) ? bitClass(bit) : ""} ${bit & mask ? "" : "off"}"></i>`)
       .join("");
-    const cell = el(`<button type="button" class="day has${shown ? "" : " dim"}${isNew(routeKey, iso) ? " new" : ""}"
-        aria-label="${fmtDate.format(dayDate(idx))}: ${cabNames(v)} available">
+    const fresh = isNew(routeKey, iso);
+    const cell = el(`<button type="button" class="day has${shown ? "" : " dim"}${fresh ? " new" : ""}"
+        aria-label="${esc(fmtDate.format(dayDate(idx)))}: ${esc(cabNames(v))} available${fresh ? ", newly opened" : ""}">
       <span class="num">${dnum}</span>
       <span class="stack" aria-hidden="true">${stack}</span>
     </button>`);
@@ -817,6 +948,12 @@ function isNew(routeKey, iso) {
   const cutoff = Date.now() / 1000 - NEW_BADGE_MS / 1000;
   return store.changes.entries.some((e) =>
     e.k === "opened" && e.r === routeKey && e.d === iso && e.t >= cutoff);
+}
+
+function routeHasNew(routeKey) {
+  if (!store.changes?.entries) return false;
+  const cutoff = Date.now() / 1000 - NEW_BADGE_MS / 1000;
+  return store.changes.entries.some((e) => e.k === "opened" && e.r === routeKey && e.t >= cutoff);
 }
 
 function renderRouteSkeleton(o, d) {
@@ -864,21 +1001,27 @@ async function openDayPanel(routeKey, idx) {
   panelReturnFocus = document.activeElement;
 
   const legend = cabinLegend().filter(([bit]) => bits[idx] & bit);
+  panelEl.setAttribute("role", "dialog");
+  panelEl.setAttribute("aria-modal", "true");
+  panelEl.setAttribute("aria-labelledby", "dp-title");
   panelEl.innerHTML = "";
   panelEl.append(el(`<div>
     <button class="dp-close" type="button" aria-label="Close">×</button>
-    <p class="dp-date">${fmtDate.format(dayDate(idx))}</p>
-    <p class="dp-route">${o} <span style="color:var(--gold)">→</span> ${d}</p>
+    <p class="dp-date">${esc(fmtDate.format(dayDate(idx)))}</p>
+    <p class="dp-route" id="dp-title">${o} <span style="color:var(--gold)" aria-hidden="true">→</span> ${d}</p>
     <div class="dp-cabs">${legend.map(([bit, label]) => `
-      <div class="dp-cab"><span class="swatch ${bitClass(bit)}"></span>${esc(label)}
+      <div class="dp-cab"><span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>${esc(label)}
         <span class="code">award seats</span></div>`).join("")}
     </div>
     <div class="dp-flights" id="dp-flights"></div>
-    <p class="dp-book"><a class="btn" href="https://www.britishairways.com/en-gb/executive-club/spending-avios" target="_blank" rel="noopener">Book with Avios on ba.com ↗</a></p>
+    <p class="dp-book"><a class="btn" href="https://www.britishairways.com/en-gb/executive-club/spending-avios" target="_blank" rel="noopener noreferrer">Book with Avios on ba.com ↗</a></p>
     <p class="dp-note">Seen in data as of ${esc(freshLabel())}. Availability moves fast — verify before planning.</p>
   </div>`));
   panelEl.hidden = false; scrimEl.hidden = false;
+  document.body.classList.add("modal-open");
+  setInert(true);
   $(".dp-close", panelEl).addEventListener("click", closeDayPanel);
+  panelEl.addEventListener("keydown", trapTab);
   $(".dp-close", panelEl).focus();
 
   // Flight-level detail, only where the data says it exists (no 404 probing —
@@ -923,8 +1066,32 @@ async function openDayPanel(routeKey, idx) {
 function closeDayPanel() {
   if (panelEl.hidden) return;
   panelEl.hidden = true; scrimEl.hidden = true;
+  panelEl.removeEventListener("keydown", trapTab);
+  document.body.classList.remove("modal-open");
+  setInert(false);
   panelReturnFocus?.focus?.();
 }
+
+/* Make the page behind the modal inert (unfocusable + hidden from AT). */
+function setInert(on) {
+  for (const sel of [".topbar", "#banner", "#main", ".footer"]) {
+    const node = $(sel);
+    if (node) node.inert = on;
+  }
+}
+
+/* Cycle Tab within the open panel so focus can't wander onto the scrim-covered
+   page behind it. */
+function trapTab(e) {
+  if (e.key !== "Tab") return;
+  const focusable = panelEl.querySelectorAll(
+    'a[href], button:not([disabled]), input, [tabindex]:not([tabindex="-1"])');
+  if (!focusable.length) return;
+  const first = focusable[0], last = focusable[focusable.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+}
+
 scrimEl.addEventListener("click", closeDayPanel);
 document.addEventListener("keydown", (e) => { if (e.key === "Escape") { closeDayPanel(); hideTip(); } });
 

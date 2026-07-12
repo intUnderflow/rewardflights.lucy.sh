@@ -35,6 +35,14 @@ type AirlineInfo struct {
 	Cabins map[string]string `json:"cabins"` // bitmask value (decimal string) -> label
 }
 
+// futureCapDays bounds how far past the source commit date an availability
+// date may lie. A single corrupt far-future file (e.g. 2999-12-31) would
+// otherwise stretch every nibble string to that horizon, ballooning memory
+// and output size. Dates beyond cutoff+futureCapDays are dropped with an
+// aggregated warning, mirroring the past-date filter. BA's booking window is
+// ~355 days, so 450 leaves generous headroom.
+const futureCapDays = 450
+
 // licenseBlock is embedded in manifest.json and every availability file.
 var licenseBlock = map[string]any{
 	"attribution": "Contains data from github.com/intUnderflow/rewardflights, © its contributors, Open Database License (ODbL) v1.0",
@@ -93,7 +101,7 @@ func Build(in Inputs) (*Output, error) {
 	flightDays := map[string]map[string]map[string][]map[string]any{}
 	airlinesJSON := map[string]any{}
 	minDate, maxDate := "", ""
-	routeDates, droppedPast := 0, 0
+	routeDates, droppedPast, droppedFuture := 0, 0, 0
 
 	for _, slug := range slices.Sorted(maps.Keys(in.Dataset.Airlines)) {
 		reg, ok := in.Airlines[slug]
@@ -114,11 +122,9 @@ func Build(in Inputs) (*Output, error) {
 					droppedPast++
 					continue
 				}
-				if minDate == "" || date < minDate {
-					minDate = date
-				}
-				if date > maxDate {
-					maxDate = date
+				if day > cutoffDay+futureCapDays {
+					droppedFuture++
+					continue
 				}
 				bits := 0
 				for _, cabin := range entry.Cabins {
@@ -128,6 +134,19 @@ func Build(in Inputs) (*Output, error) {
 						continue
 					}
 					bits |= b
+				}
+				if bits == 0 {
+					// A source file exists iff its date has availability; an
+					// empty (or entirely unrecognized) cabin list would skew
+					// routeDates and the shrink guardrail. Skip the date.
+					in.Log.Warn("empty-cabins", entry.Path)
+					continue
+				}
+				if minDate == "" || date < minDate {
+					minDate = date
+				}
+				if date > maxDate {
+					maxDate = date
 				}
 				byAirline, ok := routeBits[route]
 				if !ok {
@@ -161,6 +180,9 @@ func Build(in Inputs) (*Output, error) {
 	}
 	if droppedPast > 0 {
 		in.Log.Warn("dropped-past-dates", strconv.Itoa(droppedPast))
+	}
+	if droppedFuture > 0 {
+		in.Log.Warn("dropped-future-dates", strconv.Itoa(droppedFuture))
 	}
 	if routeDates == 0 {
 		return nil, errors.New("no availability data found in source tree (after past-date filtering)")

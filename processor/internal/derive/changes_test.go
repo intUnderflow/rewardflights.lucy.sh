@@ -77,6 +77,54 @@ func TestChangesRollOffNotClosed(t *testing.T) {
 	}
 }
 
+func TestChangesHorizonGrowthNotOpened(t *testing.T) {
+	// Old bundle encodes through 2026-01-02 (string length 2). The new run's
+	// horizon advanced to 01-04 with availability at the new edge — exactly
+	// what every scraper booking-window advance looks like. None of it is
+	// "recently opened".
+	old := oldBundleJSON(t, "2026-01-01", map[string]map[string]string{
+		"AAA-BBB": {"BA": "11"},
+		"CCC-DDD": {"BA": "01"},
+	})
+	newBits := map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {
+			day(t, "2026-01-01"): 1, day(t, "2026-01-02"): 1, // unchanged
+			day(t, "2026-01-03"): 1, day(t, "2026-01-04"): 15, // horizon growth
+		}},
+		"CCC-DDD": {"BA": {
+			day(t, "2026-01-02"): 1, // unchanged
+			day(t, "2026-01-03"): 8, // horizon growth
+		}},
+	}
+	entries := buildChanges(old, nil, newBits, day(t, "2026-01-01"), 46)
+	if len(entries) != 0 {
+		t.Fatalf("horizon extension must emit no entries, got %v", entries)
+	}
+}
+
+func TestChangesMidHorizonOpenStillEmitted(t *testing.T) {
+	// Horizon reaches 01-03; a gap at 01-02 filling in IS a genuine open,
+	// while 01-04 (beyond the old horizon) is not.
+	old := oldBundleJSON(t, "2026-01-01", map[string]map[string]string{
+		"AAA-BBB": {"BA": "101"},
+	})
+	newBits := map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {
+			day(t, "2026-01-01"): 1,
+			day(t, "2026-01-02"): 4, // opened mid-horizon
+			day(t, "2026-01-03"): 1,
+			day(t, "2026-01-04"): 1, // horizon growth, suppressed
+		}},
+	}
+	entries := buildChanges(old, nil, newBits, day(t, "2026-01-01"), 47)
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1: %v", len(entries), entries)
+	}
+	if got, want := entryString(t, entries[0]), "opened AAA-BBB BA 2026-01-02 C t=47"; got != want {
+		t.Errorf("entry = %q, want %q", got, want)
+	}
+}
+
 func TestChangesTrimAndPriorOrder(t *testing.T) {
 	prior := make([]map[string]any, 999)
 	for i := range prior {

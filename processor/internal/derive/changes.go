@@ -50,8 +50,15 @@ func buildChanges(oldBundle, oldChanges []byte, newBits map[string]map[string]ma
 
 // diffBundles decodes the previous bundle and diffs it against the new
 // route/airline/day bit state, returning the new batch of change entries.
+//
+// Days outside the OLD bundle's encoded window are excluded on both edges:
+// days before cutoffDay merely rolled into the past (not "closed"), and days
+// beyond the old bundle's last encoded day are horizon growth — the scraper's
+// booking window advancing — not "recently opened". Without the latter guard
+// every daily horizon advance would flood ~one noise entry per route into
+// the capped feed, evicting genuine changes within days.
 func diffBundles(oldBundle []byte, newBits map[string]map[string]map[int]int, cutoffDay int, sourceTime int64) []map[string]any {
-	oldState, ok := decodeBundle(oldBundle)
+	oldState, oldHorizon, ok := decodeBundle(oldBundle)
 	if !ok {
 		return nil
 	}
@@ -83,6 +90,9 @@ func diffBundles(oldBundle []byte, newBits map[string]map[string]map[int]int, cu
 		for day := range days {
 			if day < cutoffDay {
 				continue // rolled into the past, not a change
+			}
+			if day > oldHorizon {
+				continue // beyond the old encoded horizon: growth, not a change
 			}
 			oldB, newB := oldDays[day], newDays[day]
 			if oldB == newB {
@@ -117,11 +127,13 @@ func diffBundles(oldBundle []byte, newBits map[string]map[string]map[int]int, cu
 }
 
 // decodeBundle extracts route -> airline id -> day number -> bits from a
-// previous availability.json. Any parse problem means "no previous state"
-// (ok=false); nibble digits outside 1..F are ignored.
-func decodeBundle(raw []byte) (map[string]map[string]map[int]int, bool) {
+// previous availability.json, along with the bundle's last encoded day
+// (horizon = old epoch day + longest nibble string - 1, in the OLD epoch).
+// Any parse problem means "no previous state" (ok=false); nibble digits
+// outside 1..F are ignored.
+func decodeBundle(raw []byte) (state map[string]map[string]map[int]int, horizonDay int, ok bool) {
 	if raw == nil {
-		return nil, false
+		return nil, 0, false
 	}
 	var bundle struct {
 		Epoch  string `json:"epoch"`
@@ -130,16 +142,20 @@ func decodeBundle(raw []byte) (map[string]map[string]map[int]int, bool) {
 		} `json:"routes"`
 	}
 	if err := json.Unmarshal(raw, &bundle); err != nil {
-		return nil, false
+		return nil, 0, false
 	}
 	epochDay, err := parseDay(bundle.Epoch)
 	if err != nil {
-		return nil, false
+		return nil, 0, false
 	}
-	state := map[string]map[string]map[int]int{}
+	maxLen := 0
+	state = map[string]map[string]map[int]int{}
 	for _, route := range slices.Sorted(maps.Keys(bundle.Routes)) {
 		byAirline := map[string]map[int]int{}
 		for id, s := range bundle.Routes[route].A {
+			if len(s) > maxLen {
+				maxLen = len(s)
+			}
 			byDay := map[int]int{}
 			for i := 0; i < len(s); i++ {
 				if bits := hexBits(s[i]); bits > 0 {
@@ -150,5 +166,5 @@ func decodeBundle(raw []byte) (map[string]map[string]map[int]int, bool) {
 		}
 		state[route] = byAirline
 	}
-	return state, true
+	return state, epochDay + maxLen - 1, true
 }

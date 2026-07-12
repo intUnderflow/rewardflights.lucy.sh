@@ -19,11 +19,15 @@ var (
 	managedDirs      = []string{"changes", "flights", "origins"}
 )
 
-// Size budgets (gzip -9, hard failure when exceeded).
+// Size budgets (hard failure when exceeded). The gzip budgets bound what
+// clients download; the raw budget on the bundle is a second net against
+// pathological-but-compressible output (e.g. a nibble horizon stretched by a
+// bad far-future date gzips to almost nothing yet parses to hundreds of MB).
 const (
-	BundlePath    = "availability.json"
-	BundleLimitGz = 300 << 10 // 300 KiB
-	FileLimitGz   = 50 << 10  // 50 KiB, every non-bundle file
+	BundlePath     = "availability.json"
+	BundleLimitGz  = 300 << 10 // 300 KiB gzipped
+	FileLimitGz    = 50 << 10  // 50 KiB gzipped, every non-bundle file
+	BundleLimitRaw = 4 << 20   // 4 MiB uncompressed, bundle only
 )
 
 // GzipSize returns the size of data after gzip at best compression.
@@ -47,6 +51,10 @@ func GzipSize(data []byte) (int, error) {
 func CheckBudgets(files map[string][]byte) error {
 	var violations []string
 	for _, path := range slices.Sorted(maps.Keys(files)) {
+		if raw := len(files[path]); path == BundlePath && raw > BundleLimitRaw {
+			violations = append(violations,
+				fmt.Sprintf("%s is %d bytes raw, %d over its %d-byte raw budget", path, raw, raw-BundleLimitRaw, BundleLimitRaw))
+		}
 		gz, err := GzipSize(files[path])
 		if err != nil {
 			return fmt.Errorf("gzipping %s: %w", path, err)
@@ -85,6 +93,12 @@ func Sync(outDir string, desired map[string][]byte) (SyncStats, error) {
 		if !Managed(path) {
 			return stats, fmt.Errorf("internal: refusing to write non-managed path %q", path)
 		}
+	}
+
+	// Never write through a symlink: a link planted at a managed path would
+	// redirect writes (and dodge stale deletion) outside the managed tree.
+	if err := sanitizeManaged(outDir); err != nil {
+		return stats, err
 	}
 
 	existing, err := listManaged(outDir)
@@ -140,6 +154,78 @@ func Managed(path string) bool {
 		}
 	}
 	return false
+}
+
+// sanitizeManaged removes anything at a managed path that is not what the
+// emitter expects to find there — symlinks anywhere (root files, managed
+// dirs, or any component inside them), a directory squatting on a root file
+// path, or a plain file squatting on a managed dir path. These paths are
+// processor-owned, so removal is safe; failure to remove is a hard error
+// because writing would otherwise follow the link outside the managed tree.
+func sanitizeManaged(outDir string) error {
+	for _, name := range managedRootFiles {
+		p := filepath.Join(outDir, name)
+		info, err := os.Lstat(p)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("inspecting %s: %w", name, err)
+		}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			if err := os.Remove(p); err != nil {
+				return fmt.Errorf("removing symlink at managed path %s: %w", name, err)
+			}
+		case info.IsDir():
+			if err := os.RemoveAll(p); err != nil {
+				return fmt.Errorf("removing directory at managed file path %s: %w", name, err)
+			}
+		}
+	}
+	for _, dir := range managedDirs {
+		if err := sanitizeTree(filepath.Join(outDir, dir)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// sanitizeTree ensures root, if present, is a real directory containing no
+// symlinks at any depth (symlinked entries are removed, real subdirectories
+// are recursed into).
+func sanitizeTree(root string) error {
+	info, err := os.Lstat(root)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("inspecting %s: %w", root, err)
+	}
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		if err := os.Remove(root); err != nil {
+			return fmt.Errorf("removing non-directory at managed dir path %s: %w", root, err)
+		}
+		return nil
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		return err
+	}
+	for _, e := range entries {
+		p := filepath.Join(root, e.Name())
+		switch {
+		case e.Type()&os.ModeSymlink != 0:
+			if err := os.Remove(p); err != nil {
+				return fmt.Errorf("removing symlink at managed path %s: %w", p, err)
+			}
+		case e.IsDir():
+			if err := sanitizeTree(p); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
 }
 
 // listManaged returns every managed file currently present in outDir, as

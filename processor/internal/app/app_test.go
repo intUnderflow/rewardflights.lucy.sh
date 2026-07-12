@@ -72,9 +72,11 @@ func TestGoldenEndToEnd(t *testing.T) {
 		"WARN bad-json airlines/british-airways/data/NYC-LON/2026-12-30.json",
 		"WARN bad-date-file airlines/british-airways/data/NYC-LON/2026-13-40.json",
 		"WARN bad-route-dir airlines/british-airways/data/badname",
+		"WARN empty-cabins airlines/british-airways/data/LON-TYO/2026-12-29.json",
 		"WARN unknown-cabin Q airlines/british-airways/data/LON-TYO/2027-01-02.json",
 		"WARN unknown-cabin Z airlines/british-airways/data/NYC-LON/2026-12-31.json",
 		"WARN dropped-past-dates 1",
+		"WARN dropped-future-dates 1",
 		"WARN unmapped-place-code XQP",
 	}
 	gotWarn := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
@@ -88,7 +90,7 @@ func TestGoldenEndToEnd(t *testing.T) {
 	}
 
 	want := Result{
-		Routes: 4, RouteDates: 5, Origins: 3, Places: 4, Warnings: 7,
+		Routes: 4, RouteDates: 5, Origins: 3, Places: 4, Warnings: 9,
 		Written: 9, Deleted: 0, Unchanged: 0, BundleGz: res.BundleGz,
 	}
 	if *res != want {
@@ -320,6 +322,52 @@ func TestBudgetViolationNamesFile(t *testing.T) {
 	}
 	if files := treeFiles(t, out); len(files) != 0 {
 		t.Errorf("budget failure must not write anything, found %v", keys(files))
+	}
+}
+
+func TestFarFutureFileDoesNotBloatOutput(t *testing.T) {
+	// Reproduces the reported defect end-to-end: one syntactically valid
+	// far-future file next to normal data must be dropped with a warning
+	// instead of stretching days to ~36000 and the bundle to many MB.
+	src := t.TempDir()
+	dir := filepath.Join(src, "airlines", "british-airways", "data", "ABZ-LON")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for name, body := range map[string]string{
+		"2026-12-30.json": `{"cabinsAvailable":["M","C"]}`,
+		"2126-07-12.json": `{"cabinsAvailable":["M"]}`,
+	} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	out := t.TempDir()
+	res, stderr, err := runFixture(t, src, out, shaA, timeA, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := "WARN dropped-future-dates 1\n"; stderr != want {
+		t.Errorf("stderr = %q, want %q", stderr, want)
+	}
+	if res.RouteDates != 1 {
+		t.Errorf("routeDates = %d, want 1", res.RouteDates)
+	}
+	var bundle struct {
+		Days int `json:"days"`
+	}
+	raw, err := os.ReadFile(filepath.Join(out, "availability.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := json.Unmarshal(raw, &bundle); err != nil {
+		t.Fatal(err)
+	}
+	if bundle.Days != 364 { // 2026-01-01 .. 2026-12-30
+		t.Errorf("days = %d, want 364", bundle.Days)
+	}
+	if len(raw) > 10<<10 {
+		t.Errorf("bundle is %d bytes; the far-future date bloated it", len(raw))
 	}
 }
 
