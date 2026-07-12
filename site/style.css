@@ -17,6 +17,10 @@
   font-weight: 400; font-style: normal; font-display: swap; }
 
 :root {
+  /* Tell the browser which theme its NATIVE controls belong to. Without this,
+     the date inputs' calendar icon and picker popup render in light mode — a
+     black glyph, invisible on the dark panel. */
+  color-scheme: light;
   --surface: #FAFBFD;
   --panel: #FFFFFF;
   --panel-2: #F1F4F9;
@@ -43,6 +47,7 @@
 
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;   /* native date pickers, icons and scrollbars follow */
     --surface: #0D1826;
     --panel: #142238;
     --panel-2: #1B2C47;
