@@ -265,7 +265,10 @@ function matchesNow(w, { list = false } = {}) {
   const t0 = Math.max(0, todayIndex());
   const last = store.bundle.days - 1;
   const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
-  const oFrom = w.out?.from ? clamp(isoToIdx(w.out.from), t0, last) : t0;
+  // A lead-time watch floors the outbound at today + leadDays (rolling), which
+  // must give the same answer the server does.
+  const floor = w.leadDays ? clamp(t0 + w.leadDays, t0, last) : t0;
+  const oFrom = w.out?.from ? clamp(isoToIdx(w.out.from), t0, last) : floor;
   const oTo = w.out?.to ? clamp(isoToIdx(w.out.to), t0, last) : last;
 
   const out = routeBits(w.route);
@@ -374,9 +377,16 @@ function fmtRange(fromIso, toIso) {
 }
 
 /* One line describing what a watch is watching. */
+/* "at least 7 days' notice" → a friendly phrase. */
+function leadPhrase(n) {
+  if (n % 7 === 0 && n >= 7) { const w = n / 7; return `${w} week${w > 1 ? "s" : ""}' notice`; }
+  return `${n} day${n > 1 ? "s" : ""}' notice`;
+}
+
 function watchSummary(w) {
   const bits = [];
-  bits.push(w.out ? `Out ${fmtRange(w.out.from, w.out.to)}` : "Any date");
+  bits.push(w.leadDays ? `Any time, ${leadPhrase(w.leadDays)}`
+    : w.out ? `Out ${fmtRange(w.out.from, w.out.to)}` : "Any date");
   if (w.kind === "rt") {
     if (w.ret) bits.push(`back ${fmtRange(w.ret.from, w.ret.to)}`);
     if (w.nights) bits.push(`${w.nights.min}–${w.nights.max} nights`);
@@ -1423,6 +1433,7 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     let mode = mine?.out ? "exact" : (ctx.pickedOut && !mine ? "around" : "any");
     if (mine?.out && ctx.pickedOut && !mine.ret) mode = "exact";
     let flex = 7;
+    let lead = mine?.leadDays || 0;   // "any time, but N days' notice" (rolling)
     let outFrom = mine?.out?.from || "", outTo = mine?.out?.to || "";
     let retFrom = mine?.ret?.from || "", retTo = mine?.ret?.to || "";
 
@@ -1485,8 +1496,26 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     function drawWhen() {
       whenBody.innerHTML = "";
       if (mode === "any") {
-        whenBody.append(el(`<p class="bell-hint">We'll alert you whenever space opens, on any date${
-          kind === "rt" && nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.</p>`));
+        // A realistic middle ground between "any time" and pinned dates: any
+        // time, but with enough lead time to actually arrange the trip. It's a
+        // rolling floor — "at least N days from whenever an alert fires".
+        const opts = [[0, "No minimum"], [3, "3 days"], [7, "1 week"], [14, "2 weeks"], [30, "1 month"]];
+        const notice = el(`<div class="bell-notice">
+          <p class="bell-hint">How much notice do you need to arrange a trip?</p>
+          <div class="bell-flex" role="group" aria-label="Minimum notice">
+            ${opts.map(([n, lbl]) => `<button type="button" class="np" data-lead="${n}"
+              aria-pressed="${n === lead}">${esc(lbl)}</button>`).join("")}
+          </div>
+          <p class="bell-hint bell-lead-note"></p>
+        </div>`);
+        notice.querySelectorAll(".np").forEach((b) => b.addEventListener("click", () => {
+          lead = Number(b.dataset.lead);
+          notice.querySelectorAll(".np").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+          drawLeadNote();
+          recount();
+        }));
+        whenBody.append(notice);
+        drawLeadNote();
         return;
       }
       if (mode === "around") {
@@ -1534,6 +1563,16 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       return [idxToIso(Math.max(t0, anchor)), idxToIso(Math.min(store.bundle.days - 1, anchor + 30))];
     }
 
+    function drawLeadNote() {
+      const p = $(".bell-lead-note", whenBody);
+      if (!p) return;
+      p.textContent = lead
+        ? `We'll only alert you about trips leaving ${leadPhrase(lead).replace("' notice", "")} or more from now${
+            kind === "rt" && nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.`
+        : `We'll alert you whenever space opens, on any date${
+            kind === "rt" && nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.`;
+    }
+
     function drawDerived() {
       const w = build();
       const p = $(".bell-derived", whenBody);
@@ -1551,7 +1590,9 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       const w = { route: routeKey, kind, cabins };
       if (kind === "rt" && nights) w.nights = { min: nights[0], max: nights[1] };
 
-      if (mode === "around" && ctx.pickedOut) {
+      if (mode === "any") {
+        if (lead > 0) w.leadDays = lead;   // else fully unbounded ("any time")
+      } else if (mode === "around" && ctx.pickedOut) {
         const t0 = Math.max(0, todayIndex()), last = store.bundle.days - 1;
         const a = dayIndexOf(ctx.pickedOut);
         w.out = { from: idxToIso(Math.max(t0, a - flex)), to: idxToIso(Math.min(last, a + flex)) };

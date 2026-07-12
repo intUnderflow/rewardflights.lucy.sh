@@ -18,6 +18,7 @@ const (
 	MaxTopicsPerSub  = 60  // legacy topic path, retained for stale clients
 	MaxRangeDays     = 180 // span of a bounded date range
 	MaxFutureDays    = 800 // absurdity guard on range starts
+	MaxLeadDays      = 365 // "I need up to a year's notice" — cap on lead time
 	MinNights        = 1
 	MaxNights        = 60
 	DefaultNightsMin = 1  // matches NIGHTS_DEFAULT in app.js
@@ -58,15 +59,22 @@ type Nights struct {
 
 // Watch is one thing a person wants to be told about.
 type Watch struct {
-	ID          string   `json:"id"`
-	Route       string   `json:"route"`
-	Kind        string   `json:"kind"`   // "rt" | "ow"
-	Cabins      []string `json:"cabins"` // non-empty subset of M W C F, sorted M<W<C<F
-	Out         *Range   `json:"out,omitempty"`
-	Ret         *Range   `json:"ret,omitempty"` // rt only
-	Nights      *Nights  `json:"nights,omitempty"`
-	CreatedAt   int64    `json:"createdAt,omitempty"`
-	LastFiredAt int64    `json:"lastFiredAt,omitempty"`
+	ID     string   `json:"id"`
+	Route  string   `json:"route"`
+	Kind   string   `json:"kind"`   // "rt" | "ow"
+	Cabins []string `json:"cabins"` // non-empty subset of M W C F, sorted M<W<C<F
+	Out    *Range   `json:"out,omitempty"`
+	Ret    *Range   `json:"ret,omitempty"` // rt only
+	Nights *Nights  `json:"nights,omitempty"`
+	// LeadDays: "I can travel any time, but not sooner than N days from now" —
+	// a ROLLING floor on the outbound date. Stored as a relative offset, never
+	// an absolute date, so it re-anchors to "today" on every detection cycle
+	// instead of going stale (which is why it's safe where a fixed rolling
+	// window would not be). 0 = no lead requirement. Mutually exclusive with an
+	// explicit outbound range.
+	LeadDays    int   `json:"leadDays,omitempty"`
+	CreatedAt   int64 `json:"createdAt,omitempty"`
+	LastFiredAt int64 `json:"lastFiredAt,omitempty"`
 }
 
 // Watch statuses, computed at read time (never stored).
@@ -116,6 +124,14 @@ func Normalize(w Watch) (Watch, error) {
 		if w.Nights.Min < MinNights || w.Nights.Max > MaxNights || w.Nights.Min > w.Nights.Max {
 			return Watch{}, fmt.Errorf("nights must satisfy %d <= min <= max <= %d", MinNights, MaxNights)
 		}
+	}
+	if w.LeadDays < 0 || w.LeadDays > MaxLeadDays {
+		return Watch{}, fmt.Errorf("lead time must be between 0 and %d days", MaxLeadDays)
+	}
+	if w.LeadDays > 0 && w.Out != nil {
+		// "Any time with N days' notice" and "specific outbound dates" are two
+		// ways of saying when you can travel; combining them is contradictory.
+		return Watch{}, errors.New("lead time cannot be combined with specific outbound dates")
 	}
 
 	for name, r := range map[string]*Range{"out": w.Out, "ret": w.Ret} {
@@ -192,6 +208,10 @@ func watchID(w Watch) string {
 	b.WriteByte('|')
 	if w.Nights != nil {
 		fmt.Fprintf(&b, "%d-%d", w.Nights.Min, w.Nights.Max)
+	}
+	b.WriteByte('|')
+	if w.LeadDays > 0 {
+		fmt.Fprintf(&b, "L%d", w.LeadDays)
 	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:8]
@@ -318,9 +338,17 @@ func (r DayRange) Empty() bool { return r.From > r.To }
 
 // OutDays returns the watch's outbound range clamped to [today, endDay-1].
 // An unbounded side takes the clamp bound, which is exactly the legacy
-// "any time" semantics.
+// "any time" semantics. A LeadDays requirement raises the floor to
+// today+LeadDays — resolved here against the current "today", so the window
+// rolls forward each cycle rather than freezing at save time.
 func (w Watch) OutDays(today, endDay int) DayRange {
-	return clampRange(w.Out, today, endDay-1)
+	r := clampRange(w.Out, today, endDay-1)
+	if w.LeadDays > 0 {
+		if floor := today + w.LeadDays; floor > r.From {
+			r.From = floor
+		}
+	}
+	return r
 }
 
 // RetDays returns the watch's return range clamped to [today, endDay-1]. An
