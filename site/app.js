@@ -204,6 +204,16 @@ async function fetchWatches(sub) {
   return (await res.json()).watches || [];
 }
 
+/* The full device view: watches plus delivery telemetry. `device.reachable` is
+   false when we've sent this device pushes it never acknowledged — the silent-
+   suppression case that has no browser-visible signal. */
+async function fetchDevice(sub) {
+  const res = await fetch(`${PUSH_API}/watches?endpoint=${encodeURIComponent(sub.endpoint)}`);
+  if (!res.ok) throw new Error(`alert service unavailable (${res.status})`);
+  const j = await res.json();
+  return { watches: j.watches || [], device: j.device || null };
+}
+
 async function saveWatches(sub, watches) {
   if (!watches.length) {
     // Nothing left to watch: drop the subscription rather than keep a dangling
@@ -382,7 +392,7 @@ async function currentAlerts() {
     if (!pushSupported() || Notification.permission !== "granted") return null;
     const sub = await getSubscription();
     if (!sub) return null;
-    return { sub, watches: await fetchWatches(sub) };
+    return { sub, ...(await fetchDevice(sub)) };
   } catch { return null; }
 }
 
@@ -2632,6 +2642,20 @@ async function drawAlertsPage(body) {
     </div>`));
     body.append(alertsFooterHTML());
     return;
+  }
+
+  // The device may be silently unreachable — we've pushed alerts it never
+  // acknowledged. Say so, because nothing else will.
+  if (data.device && data.device.reachable === false && data.device.pushCount > 0) {
+    body.append(el(`<div class="reach-warn">
+      <b>This device may not be receiving your alerts.</b>
+      We've sent ${data.device.pushCount} notification${data.device.pushCount > 1 ? "s" : ""} that it
+      never confirmed — usually your operating system is blocking this browser's notifications.
+      Hit <b>Send a test notification</b> below; if it doesn't appear, check
+      ${/Macintosh|Mac OS X/.test(navigator.userAgent)
+        ? "System Settings → Notifications for this browser"
+        : "your device's notification settings for this browser"}.
+    </div>`));
   }
 
   const head = el(`<div class="alerts-head">

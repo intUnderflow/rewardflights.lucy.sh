@@ -5,6 +5,8 @@
    serving stale availability). */
 "use strict";
 
+const PUSH_API = "https://alerts-rewardflights.lucy.sh";
+
 self.addEventListener("install", () => self.skipWaiting());
 self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
 
@@ -24,8 +26,30 @@ self.addEventListener("push", (event) => {
     badge: "/assets/icon-192.png",
     timestamp: Date.now(),
   };
-  event.waitUntil(self.registration.showNotification(title, options));
+  // Tell the server this device actually received the push. The push service
+  // returns 201 whether or not the OS ends up showing anything, so this ack —
+  // sent from the device, when the push handler truly runs — is the only signal
+  // that separates "reached the device" from "silently dropped in transit / dead
+  // subscription". (It still can't prove the banner was displayed; only a click
+  // proves that.) Best-effort: never let it block the notification.
+  event.waitUntil(Promise.all([
+    self.registration.showNotification(title, options),
+    ackDelivery(),
+  ]));
 });
+
+async function ackDelivery() {
+  try {
+    const sub = await self.registration.pushManager.getSubscription();
+    if (!sub) return;
+    await fetch(`${PUSH_API}/ack`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ endpoint: sub.endpoint }),
+      keepalive: true,
+    });
+  } catch { /* diagnostic only — a failed ack must never affect the alert */ }
+}
 
 self.addEventListener("notificationclick", (event) => {
   event.notification.close();

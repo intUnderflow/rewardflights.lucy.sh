@@ -398,6 +398,13 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .alerts-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 .alerts-list { margin-bottom: 12px; }
 .alerts-status { min-height: 1.2em; margin: 0 0 8px; font-size: 13px; color: var(--gold); }
+.reach-warn {
+  margin: 18px 0 6px; padding: 12px 15px; border-radius: var(--radius);
+  border: 1px solid var(--amber-ink); background: var(--amber-bg); color: var(--amber-ink);
+  font-size: 13px; line-height: 1.5;
+}
+.reach-warn b { color: inherit; font-weight: 700; }
+
 .alerts-help {
   margin-top: 22px; padding: 14px 16px; border: 1px solid var(--amber-ink);
   border-radius: var(--radius); background: var(--amber-bg); color: var(--amber-ink);
