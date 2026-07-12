@@ -48,6 +48,7 @@ func main() {
 	alertsMaxSubs := flag.Int("alerts-max-subs", alertstore.DefaultMaxSubs, "watch mode: maximum stored subscriptions")
 	alertsRate := flag.Int("alerts-rate", 60, "watch mode: subscription API requests per minute per client IP")
 	alertsBurst := flag.Int("alerts-burst", 20, "watch mode: subscription API rate-limit burst")
+	alertsTestPerHour := flag.Int("alerts-test-per-hour", 5, "watch mode: POST /test notifications per hour per subscription")
 	alertsCooldown := flag.Duration("alerts-cooldown", 3*time.Hour, "watch mode: minimum off-time before a day re-alerts")
 	alertsBatch := flag.Duration("alerts-batch", time.Hour, "watch mode: minimum interval between publishes per topic")
 	alertsWindow := flag.Int("alerts-window", 30, "watch mode: round-trip return window in nights")
@@ -71,11 +72,12 @@ func main() {
 				Batch:        *alertsBatch,
 				Window:       *alertsWindow,
 			},
-			AlertsStore:   *alertsStore,
-			AlertsMaxSubs: *alertsMaxSubs,
-			AlertsListen:  *alertsListen,
-			AlertsRate:    *alertsRate,
-			AlertsBurst:   *alertsBurst,
+			AlertsStore:       *alertsStore,
+			AlertsMaxSubs:     *alertsMaxSubs,
+			AlertsListen:      *alertsListen,
+			AlertsRate:        *alertsRate,
+			AlertsBurst:       *alertsBurst,
+			AlertsTestPerHour: *alertsTestPerHour,
 		}); err != nil {
 			fatal(err)
 		}

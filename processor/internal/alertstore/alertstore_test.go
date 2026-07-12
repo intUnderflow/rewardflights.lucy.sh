@@ -378,3 +378,38 @@ func TestConcurrentAccess(t *testing.T) {
 		}
 	}
 }
+
+func TestLookup(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	if _, err := s.Upsert(sub(endpointA, "rf_LON-TYO_rt_C")); err != nil {
+		t.Fatal(err)
+	}
+	// A known subscription yields the push keys the sender needs.
+	got, ok := s.Lookup(endpointA)
+	if !ok {
+		t.Fatal("known endpoint must be found")
+	}
+	if got.Endpoint != endpointA || got.P256dh != "cGsx" || got.Auth != "YXV0aA" {
+		t.Errorf("lookup = %+v", got)
+	}
+	if _, ok := s.Lookup(endpointB); ok {
+		t.Error("unknown endpoint must not be found")
+	}
+
+	// The bool distinguishes "known but topic-less" from "unknown" — Topics
+	// alone cannot, since both come back empty. POST /test depends on this.
+	if _, err := s.Upsert(sub(endpointB)); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := s.Lookup(endpointB); !ok {
+		t.Error("a subscription with no topics is still a known subscription")
+	}
+	if got := s.Topics(endpointB); len(got) != 0 {
+		t.Errorf("topics = %v, want empty", got)
+	}
+
+	s.Remove(endpointA)
+	if _, ok := s.Lookup(endpointA); ok {
+		t.Error("removed endpoint must not be found")
+	}
+}

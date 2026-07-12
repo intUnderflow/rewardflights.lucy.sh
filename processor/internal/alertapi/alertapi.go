@@ -11,8 +11,11 @@ package alertapi
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"strconv"
@@ -21,16 +24,19 @@ import (
 	"time"
 
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
 )
 
 // Config parameterizes the API server.
 type Config struct {
-	Addr       string            // listen address, e.g. 127.0.0.1:8787
-	Store      *alertstore.Store // subscription store (required)
-	RatePerMin int               // requests per minute per client (default 60)
-	Burst      int               // token-bucket burst (default 20)
-	Logf       func(string, ...any)
-	Now        func() time.Time // injected in tests; defaults to time.Now
+	Addr        string            // listen address, e.g. 127.0.0.1:8787
+	Store       *alertstore.Store // subscription store (required)
+	Sender      *webpush.Sender   // push sender for POST /test; nil disables that route
+	RatePerMin  int               // requests per minute per client (default 60)
+	Burst       int               // token-bucket burst (default 20)
+	TestPerHour int               // POST /test sends per hour per subscription (default 5)
+	Logf        func(string, ...any)
+	Now         func() time.Time // injected in tests; defaults to time.Now
 }
 
 // maxBody bounds request bodies: a subscription with 60 topics is ~3KB.
@@ -42,9 +48,10 @@ const prodOrigin = "https://rewardflights.lucy.sh"
 
 // Server is the running API.
 type Server struct {
-	cfg     Config
-	http    *http.Server
-	limiter *limiter
+	cfg      Config
+	http     *http.Server
+	limiter  *limiter
+	testRate *sendLimiter
 }
 
 // New builds the API server (does not listen yet).
@@ -54,6 +61,9 @@ func New(cfg Config) *Server {
 	}
 	if cfg.Burst <= 0 {
 		cfg.Burst = 20
+	}
+	if cfg.TestPerHour <= 0 {
+		cfg.TestPerHour = 5
 	}
 	if cfg.Logf == nil {
 		cfg.Logf = func(string, ...any) {}
@@ -67,6 +77,7 @@ func New(cfg Config) *Server {
 			float64(cfg.RatePerMin)/60, // tokens per second
 			float64(cfg.Burst), cfg.Now,
 		),
+		testRate: newSendLimiter(cfg.TestPerHour, time.Hour, cfg.Now),
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
@@ -84,6 +95,7 @@ func (s *Server) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /subscribe", s.handleSubscribe)
 	mux.HandleFunc("POST /unsubscribe", s.handleUnsubscribe)
+	mux.HandleFunc("POST /test", s.handleTest)
 	mux.HandleFunc("GET /topics", s.handleTopics)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	return s.withCORS(s.withRateLimit(mux))
@@ -155,6 +167,83 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 	}
 	s.cfg.Store.Remove(req.Endpoint)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// testPayload is the fixed body of a test notification. It is deliberately
+// self-explanatory: the user asked "does push work?", and the answer has to
+// make sense on a lock screen days later.
+var testPayload = map[string]string{
+	"title": "Alerts are working",
+	"body":  "This is a test — real alerts fire the moment award space opens on a route you're watching.",
+	"url":   "https://rewardflights.lucy.sh/alerts",
+	"tag":   "rf_test",
+}
+
+// handleTest sends exactly one push to an EXISTING subscription, so a user can
+// confirm delivery without waiting for real availability.
+//
+// The endpoint must already be in the store: this route causes outbound sends,
+// so it must never become an open relay for spraying pushes at arbitrary
+// endpoints. It is additionally rate-limited per subscription (5/hour), far
+// harder than the shared per-IP bucket.
+func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.Sender == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ok": false, "error": "test notifications are not configured",
+		})
+		return
+	}
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	sub, known := s.cfg.Store.Lookup(req.Endpoint)
+	if !known {
+		// Same answer for "never subscribed" and "malformed": an unknown
+		// endpoint is simply not ours to push to.
+		writeJSON(w, http.StatusNotFound, map[string]any{
+			"ok": false, "error": "unknown subscription",
+		})
+		return
+	}
+	if ok, retryAfter := s.testRate.allow(req.Endpoint); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"ok": false, "error": "too many test notifications; try again later",
+		})
+		return
+	}
+
+	payload, err := json.Marshal(testPayload)
+	if err != nil {
+		writeJSON(w, http.StatusInternalServerError, map[string]any{"ok": false, "error": "internal error"})
+		return
+	}
+	status, err := s.cfg.Sender.Send(sub, payload)
+	switch {
+	case err != nil:
+		s.cfg.Logf("WARN alert-test-failed %s: %v", sub.Endpoint, err)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok": false, "error": "push service unreachable",
+		})
+	case webpush.Expired(status):
+		// The push service says this browser is gone: drop it and tell the
+		// page, so it can prompt a re-subscribe instead of failing silently.
+		s.cfg.Logf("alert-test-expired %s (status %d), removing", sub.Endpoint, status)
+		s.cfg.Store.Remove(sub.Endpoint)
+		writeJSON(w, http.StatusGone, map[string]any{
+			"ok": false, "error": "subscription expired",
+		})
+	case status < 200 || status >= 300:
+		s.cfg.Logf("WARN alert-test-failed %s: status %d", sub.Endpoint, status)
+		writeJSON(w, http.StatusBadGateway, map[string]any{
+			"ok": false, "error": fmt.Sprintf("push service returned %d", status),
+		})
+	default:
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	}
 }
 
 func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
@@ -319,6 +408,72 @@ func (l *limiter) evict(now time.Time) {
 	for client, b := range l.buckets {
 		if now.Sub(b.seen) > idle {
 			delete(l.buckets, client)
+		}
+	}
+}
+
+// sendLimiter is a sliding-window counter keyed by subscription endpoint: at
+// most `limit` sends per `window`. It guards the only route that causes
+// outbound traffic, so the key is the SUBSCRIPTION (the thing that gets
+// pushed to), not the caller's IP — an attacker rotating IPs still cannot
+// make us spam one device.
+//
+// Timestamps are kept per key and pruned lazily on access; keys whose window
+// has fully drained are dropped.
+type sendLimiter struct {
+	limit  int
+	window time.Duration
+	now    func() time.Time
+
+	mu    sync.Mutex
+	sends map[string][]time.Time // sha256(endpoint) -> recent send times
+}
+
+func newSendLimiter(limit int, window time.Duration, now func() time.Time) *sendLimiter {
+	return &sendLimiter{limit: limit, window: window, now: now, sends: map[string][]time.Time{}}
+}
+
+// allow records a send for endpoint if the window has room, reporting whether
+// it may proceed and, when not, a Retry-After in whole seconds (when the
+// oldest send in the window ages out).
+func (l *sendLimiter) allow(endpoint string) (bool, int) {
+	sum := sha256.Sum256([]byte(endpoint))
+	k := hex.EncodeToString(sum[:])
+
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	now := l.now()
+	cutoff := now.Add(-l.window)
+
+	// Prune this key, and opportunistically any key that has fully drained.
+	kept := l.sends[k][:0]
+	for _, t := range l.sends[k] {
+		if t.After(cutoff) {
+			kept = append(kept, t)
+		}
+	}
+	if len(kept) == 0 {
+		delete(l.sends, k)
+	} else {
+		l.sends[k] = kept
+	}
+	if len(l.sends) > 10000 {
+		l.evict(cutoff)
+	}
+
+	if len(kept) >= l.limit {
+		retry := int(kept[0].Add(l.window).Sub(now).Seconds())
+		return false, max(retry, 1)
+	}
+	l.sends[k] = append(kept, now)
+	return true, 0
+}
+
+// evict drops keys with no sends left inside the window. Caller holds the lock.
+func (l *sendLimiter) evict(cutoff time.Time) {
+	for k, times := range l.sends {
+		if len(times) == 0 || !times[len(times)-1].After(cutoff) {
+			delete(l.sends, k)
 		}
 	}
 }

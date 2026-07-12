@@ -17,6 +17,7 @@ import (
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alerts"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
 )
 
 // watchConfig parameterizes the long-running watcher.
@@ -29,12 +30,13 @@ type watchConfig struct {
 	Push     bool          // push -Out after commit (implies Commit + pre-sync)
 	TokenCmd string        // shell command printing a git token to stdout; empty -> plain git
 
-	Alerts        alerts.Config // seat alerts; enabled when VapidKeyPath is set
-	AlertsStore   string        // subscription store file
-	AlertsMaxSubs int           // subscription cap
-	AlertsListen  string        // subscription API listen address; empty -> no API
-	AlertsRate    int           // API requests/min per client IP
-	AlertsBurst   int           // API rate-limit burst
+	Alerts            alerts.Config // seat alerts; enabled when VapidKeyPath is set
+	AlertsStore       string        // subscription store file
+	AlertsMaxSubs     int           // subscription cap
+	AlertsListen      string        // subscription API listen address; empty -> no API
+	AlertsRate        int           // API requests/min per client IP
+	AlertsBurst       int           // API rate-limit burst
+	AlertsTestPerHour int           // POST /test sends per hour per subscription
 }
 
 // runWatch is the constantly-running mode: it watches the local source
@@ -91,9 +93,16 @@ func runWatch(cfg watchConfig) error {
 		}
 
 		if cfg.AlertsListen != "" {
+			// The API's POST /test needs to send a push itself, so it gets
+			// its own sender over the same VAPID key the watcher publishes with.
+			vapid, err := webpush.LoadVapid(cfg.Alerts.VapidKeyPath, cfg.Alerts.VapidSubject)
+			if err != nil {
+				return err
+			}
 			api := alertapi.New(alertapi.Config{
-				Addr: cfg.AlertsListen, Store: store,
-				RatePerMin: cfg.AlertsRate, Burst: cfg.AlertsBurst, Logf: logf,
+				Addr: cfg.AlertsListen, Store: store, Sender: webpush.NewSender(vapid),
+				RatePerMin: cfg.AlertsRate, Burst: cfg.AlertsBurst,
+				TestPerHour: cfg.AlertsTestPerHour, Logf: logf,
 			})
 			go func() {
 				logf("watch: subscription API listening on %s", cfg.AlertsListen)

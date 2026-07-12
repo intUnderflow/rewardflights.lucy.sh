@@ -63,12 +63,12 @@ func (rt *rewriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 // redirectPush points the package's push client at target for this test.
 func redirectPush(t *testing.T, target string) {
 	t.Helper()
-	original := pushClient.Transport
-	pushClient.Transport = &rewriteTransport{
+	original := pushSender.Transport
+	pushSender.Transport = &rewriteTransport{
 		host: strings.TrimPrefix(target, "http://"),
 		base: http.DefaultTransport,
 	}
-	t.Cleanup(func() { pushClient.Transport = original })
+	t.Cleanup(func() { pushSender.Transport = original })
 }
 
 // TestStorePublisher drives the real Web Push transport with subscribers read

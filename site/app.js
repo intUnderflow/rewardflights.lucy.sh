@@ -548,6 +548,7 @@ async function boot() {
 
   loadChanges();
   schedulePoll();
+  refreshAlertCount();   // header link reflects what this device is watching
 }
 
 async function loadChanges() {
@@ -693,6 +694,7 @@ function route({ focus = false } = {}) {
     renderTrip(m[1].toUpperCase(), m[2].toUpperCase());
   else if ((m = path.match(/^\/from\/([A-Z]{3})\/?$/i)))
     renderFrom(m[1].toUpperCase());
+  else if (/^\/alerts\/?$/.test(path)) renderAlerts();
   else renderNotFound();
 
   // On a real navigation, move focus into the new page so keyboard and screen-
@@ -984,7 +986,7 @@ async function buildAlertsPanel(mount) {
   mount.innerHTML = "";
   const sec = el(`<section class="module alerts-mod">
     <h2><span class="dot" aria-hidden="true"></span>Your alerts
-      <button type="button" class="alerts-off-all">Turn all off</button></h2>
+      <a class="alerts-manage" href="/alerts">Manage →</a></h2>
     <div class="card-list"></div>
   </section>`);
   const list = $(".card-list", sec);
@@ -1014,6 +1016,7 @@ async function buildAlertsPanel(mount) {
       try {
         await saveTopics(data.sub, keep);
         announce(`Alerts off for ${o} to ${d}.`);
+        refreshAlertCount();
         rerender();
       } catch (err) {
         btn.disabled = false; btn.textContent = "Turn off";
@@ -1023,18 +1026,6 @@ async function buildAlertsPanel(mount) {
     list.append(row);
   }
 
-  $(".alerts-off-all", sec).addEventListener("click", async (e) => {
-    const btn = e.currentTarget;
-    btn.disabled = true; btn.textContent = "…";
-    try {
-      await saveTopics(data.sub, new Set());   // empty ⇒ drops the subscription
-      announce("All alerts turned off.");
-      rerender();
-    } catch (err) {
-      btn.disabled = false; btn.textContent = "Turn all off";
-      announce(String(err.message || err));
-    }
-  });
   mount.append(sec);
 }
 
@@ -1291,6 +1282,7 @@ function alertBell(routeKey, kind, defaultMask) {
           for (const [bit] of legend) topics.delete(topicFor(routeKey, kind, bit));
           await saveTopics(sub, topics);
           setLabel(0);
+          refreshAlertCount();
           status.textContent = "Alerts off for this route.";
           announce(status.textContent);
           setTimeout(close, 1200);
@@ -1317,6 +1309,7 @@ function alertBell(routeKey, kind, defaultMask) {
         }
         await saveTopics(sub, topics);
         setLabel(want.length);
+        refreshAlertCount();
         status.textContent = want.length
           ? `Watching ${want.length} cabin${want.length > 1 ? "s" : ""}. We'll notify you the moment space opens.`
           : "Alerts off for this route.";
@@ -2262,6 +2255,173 @@ function renderFrom(o) {
     </a>`));
   }
   mainEl.append(grid);
+}
+
+/* ---------------- pages: my alerts ---------------- */
+
+/* The header link doubles as the discovery path for alerts, so it carries the
+   count. Kept in sync by refreshAlertCount() after any change. */
+function refreshAlertCount() {
+  const link = $("#alerts-link");
+  if (!link) return;
+  currentAlerts().then((data) => {
+    const n = data ? groupTopics(data.topics).length : 0;
+    link.hidden = false;
+    $(".al-count", link).textContent = n ? String(n) : "";
+    link.classList.toggle("on", n > 0);
+    link.title = n ? `${n} route${n > 1 ? "s" : ""} you're watching` : "Alerts";
+  });
+}
+
+function renderAlerts() {
+  current.page = "alerts"; current.params = null;
+  setTitle("My alerts");
+  mainEl.innerHTML = "";
+  mainEl.append(el(`<div class="section-pad">
+    <p class="crumbs"><a href="/">Search</a></p>
+    <h1 class="page-title">My alerts</h1>
+    <p class="page-sub">We'll notify you the moment award space opens on a route you're watching —
+      free, instantly, in whichever cabins you pick.</p>
+  </div>`));
+
+  const body = el(`<div id="alerts-page-body"><div class="sk-line" style="height:80px;margin-top:22px"></div></div>`);
+  mainEl.append(body);
+  drawAlertsPage(body);
+}
+
+async function drawAlertsPage(body) {
+  body.innerHTML = "";
+
+  // Cases where the browser can't do alerts at all — explain, don't pretend.
+  if (!pushSupported()) {
+    body.append(el(`<div class="empty-state">
+      <div class="big">${isIOS() && !isStandalone() ? "Add Reward Flights to your Home Screen" : "This browser can't do alerts"}</div>
+      <p>${isIOS() && !isStandalone()
+        ? `iPhone only allows notifications for installed web apps. Tap <b>Share</b>, then
+           <b>Add to Home Screen</b>, open Reward Flights from there, and your alerts will work.`
+        : `It doesn't support push notifications. Chrome, Firefox, Edge and Safari all do.`}</p>
+    </div>`));
+    return;
+  }
+  if (Notification.permission === "denied") {
+    body.append(el(`<div class="empty-state"><div class="big">Notifications are blocked</div>
+      <p>${permissionHelpHTML("denied")}</p></div>`));
+    return;
+  }
+
+  const data = await currentAlerts();
+  const groups = data ? groupTopics(data.topics) : [];
+
+  if (!groups.length) {
+    body.append(el(`<div class="empty-state">
+      <div class="big">You're not watching anything yet</div>
+      <p>Open any route and hit <b>🔔 Alert me</b> to be told the moment award space opens —
+         pick the cabins you care about, and we'll only bother you when they're bookable.</p>
+      <p><a class="btn" href="/">Find a route</a></p>
+    </div>`));
+    body.append(alertsFooterHTML());
+    return;
+  }
+
+  const head = el(`<div class="alerts-head">
+    <p class="alerts-count">Watching <b>${groups.length}</b> route${groups.length > 1 ? "s" : ""}</p>
+    <div class="alerts-actions">
+      <button type="button" class="btn" id="alerts-test">Send a test notification</button>
+      <button type="button" class="alerts-off-all" id="alerts-all-off">Turn all off</button>
+    </div>
+  </div>`);
+  body.append(head);
+
+  const list = el(`<div class="card-list alerts-list"></div>`);
+  for (const g of groups) {
+    const [o, d] = g.route.split("-");
+    const href = `${g.kind === "rt" ? "/trip" : "/route"}/${g.route}`;
+    const arrow = g.kind === "rt" ? "⇄" : "→";
+    const row = el(`<div class="alert-row">
+      <a class="alert-route" href="${href}">
+        <span class="rc-route">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</span>
+        <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
+      </a>
+      <span class="alert-cabs" aria-label="${esc(g.bits.map(cabinLabel).join(", "))}">${
+        g.bits.map((bit) => `<span class="swatch ${bitClass(bit)}" title="${esc(cabinLabel(bit))}"></span>`).join("")
+      }</span>
+      <span class="alert-kind">${g.kind === "rt" ? "round trip" : "one way"}</span>
+      <button type="button" class="alert-off" aria-label="Turn off alerts for ${o} to ${d}">Turn off</button>
+    </div>`);
+    $(".alert-off", row).addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = "…";
+      const keep = new Set([...data.topics].filter((t) => {
+        const p = parseTopic(t);
+        return !(p && p.route === g.route && p.kind === g.kind);
+      }));
+      try {
+        await saveTopics(data.sub, keep);
+        announce(`Alerts off for ${o} to ${d}.`);
+        refreshAlertCount();
+        drawAlertsPage(body);
+      } catch (err) {
+        btn.disabled = false; btn.textContent = "Turn off";
+        status(body, String(err.message || err));
+      }
+    });
+    list.append(row);
+  }
+  body.append(list, el(`<p class="alerts-status" role="status"></p>`), alertsFooterHTML());
+
+  $("#alerts-all-off", head).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "…";
+    try {
+      await saveTopics(data.sub, new Set());
+      announce("All alerts turned off.");
+      refreshAlertCount();
+      drawAlertsPage(body);
+    } catch (err) {
+      btn.disabled = false; btn.textContent = "Turn all off";
+      status(body, String(err.message || err));
+    }
+  });
+
+  // Proof it works, without waiting for real availability to open.
+  $("#alerts-test", head).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "Sending…";
+    try {
+      const res = await fetch(`${PUSH_API}/test`, {
+        method: "POST", headers: { "content-type": "application/json" },
+        body: JSON.stringify({ endpoint: data.sub.endpoint }),
+      });
+      if (res.status === 410) throw new Error("This device's subscription expired — turn an alert off and on again to renew it.");
+      if (res.status === 429) throw new Error("Too many test notifications — try again later.");
+      if (!res.ok) throw new Error(`Couldn't send a test (${res.status}).`);
+      status(body, "Sent — it should arrive in a second or two.");
+    } catch (err) {
+      status(body, String(err.message || err));
+    } finally {
+      btn.disabled = false; btn.textContent = "Send a test notification";
+    }
+  });
+}
+
+function status(body, msg) {
+  const el2 = $(".alerts-status", body);
+  if (el2) { el2.textContent = msg; announce(msg); }
+}
+
+function alertsFooterHTML() {
+  return el(`<div class="alerts-explainer">
+    <h2>How alerts work</h2>
+    <ul>
+      <li><b>Round trips are checked as a whole.</b> We only tell you a round trip has opened when
+        <i>both</i> legs have award space in the same cabin, within your trip-length window — not
+        when "something changed" on the route.</li>
+      <li><b>No spam.</b> Award space flickers; we hold a cooldown per route and cabin, and batch
+        changes, so a churny route can't flood you.</li>
+      <li><b>Nothing about you is stored.</b> No account, no email — just an anonymous
+        notification handle from your browser, which you can revoke here at any time.</li>
+    </ul>
+  </div>`);
 }
 
 function renderNotFound() {

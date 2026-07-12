@@ -17,10 +17,8 @@
 package alerts
 
 import (
-	"bytes"
 	"encoding/json"
 	"fmt"
-	"io"
 	"maps"
 	"net/http"
 	"os"
@@ -325,6 +323,10 @@ func buildPublication(topic string, dates []string) (Publication, error) {
 	return pub, nil
 }
 
+// pushSender delivers to the push services. It is a package var so tests can
+// point its transport at a local server while exercising real endpoint URLs.
+var pushSender = &http.Client{Timeout: webpush.SendTimeout}
+
 // storePublisher returns the real Web Push publish func: it reads the
 // topic's subscribers straight from the local store, encrypts the payload per
 // RFC 8291 for each, and POSTs to each push endpoint with VAPID auth.
@@ -334,12 +336,8 @@ func buildPublication(topic string, dates []string) (Publication, error) {
 // Per-endpoint failures are logged; dead subscriptions (404/410 from the push
 // service) are removed from the store; a rare missed notification is preferred
 // over a re-send storm, so the batch is always considered drained.
-// pushClient sends to the push services. It is a package var so tests can
-// point its transport at a local server while exercising real endpoint URLs.
-var pushClient = &http.Client{Timeout: 5 * time.Second}
-
 func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, logf func(string, ...any)) PublishFunc {
-	client := pushClient
+	sender := &webpush.Sender{Client: pushSender, Vapid: vapid}
 	return func(p Publication) error {
 		subs := store.Get(p.Topic)
 		if len(subs) == 0 {
@@ -352,18 +350,11 @@ func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, logf func(str
 			return err
 		}
 		for _, sub := range subs {
-			body, err := webpush.Encrypt(sub, payload)
-			if err != nil {
-				// Undecodable keys can never succeed: drop like a dead endpoint.
-				logf("WARN alert-push-badsub %s: %v", sub.Endpoint, err)
-				store.Remove(sub.Endpoint)
-				continue
-			}
-			status, err := sendPush(client, vapid, sub.Endpoint, body)
+			status, err := sender.Send(sub, payload)
 			switch {
 			case err != nil:
 				logf("WARN alert-push-failed %s: %v", sub.Endpoint, err)
-			case status == http.StatusNotFound || status == http.StatusGone:
+			case webpush.Expired(status):
 				// The browser is gone for good: the push service tells us so.
 				logf("alert-push-expired %s (status %d), removing", sub.Endpoint, status)
 				store.Remove(sub.Endpoint)
@@ -373,29 +364,6 @@ func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, logf func(str
 		}
 		return nil
 	}
-}
-
-// sendPush POSTs one encrypted message to a push endpoint.
-func sendPush(client *http.Client, vapid *webpush.Vapid, endpoint string, body []byte) (int, error) {
-	auth, err := vapid.Authorization(endpoint, time.Now())
-	if err != nil {
-		return 0, err
-	}
-	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewReader(body))
-	if err != nil {
-		return 0, err
-	}
-	req.Header.Set("TTL", "86400")
-	req.Header.Set("Content-Encoding", "aes128gcm")
-	req.Header.Set("Content-Type", "application/octet-stream")
-	req.Header.Set("Authorization", auth)
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, err
-	}
-	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode, nil
 }
 
 // loadState reads the persisted state; anything missing or malformed starts

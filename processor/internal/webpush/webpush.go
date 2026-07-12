@@ -9,6 +9,7 @@
 package webpush
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/ecdh"
@@ -24,7 +25,9 @@ import (
 	"encoding/pem"
 	"errors"
 	"fmt"
+	"io"
 	"math/big"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
@@ -125,6 +128,57 @@ func encrypt(uaPublic, authSecret, salt []byte, asKey *ecdh.PrivateKey, plaintex
 	out = append(out, byte(len(asPublic)))
 	out = append(out, asPublic...)
 	return gcm.Seal(out, nonce, record, nil), nil
+}
+
+// Sender delivers encrypted messages to push services. Its Client is
+// exported so callers (and tests) can supply their own transport/timeout.
+type Sender struct {
+	Client *http.Client
+	Vapid  *Vapid
+}
+
+// SendTimeout bounds a single push delivery.
+const SendTimeout = 5 * time.Second
+
+// NewSender wraps a VAPID key with a 5s-timeout HTTP client.
+func NewSender(vapid *Vapid) *Sender {
+	return &Sender{Client: &http.Client{Timeout: SendTimeout}, Vapid: vapid}
+}
+
+// Send encrypts payload for sub (RFC 8291) and POSTs it to the subscription's
+// endpoint with VAPID authorization. It returns the push service's HTTP status
+// — callers decide what 404/410 (subscription gone) and 5xx (transient) mean.
+// A non-nil error means the message never reached the service at all.
+func (s *Sender) Send(sub Subscription, payload []byte) (int, error) {
+	body, err := Encrypt(sub, payload)
+	if err != nil {
+		return 0, err
+	}
+	auth, err := s.Vapid.Authorization(sub.Endpoint, time.Now())
+	if err != nil {
+		return 0, err
+	}
+	req, err := http.NewRequest(http.MethodPost, sub.Endpoint, bytes.NewReader(body))
+	if err != nil {
+		return 0, err
+	}
+	req.Header.Set("TTL", "86400")
+	req.Header.Set("Content-Encoding", "aes128gcm")
+	req.Header.Set("Content-Type", "application/octet-stream")
+	req.Header.Set("Authorization", auth)
+	resp, err := s.Client.Do(req)
+	if err != nil {
+		return 0, err
+	}
+	io.Copy(io.Discard, resp.Body)
+	resp.Body.Close()
+	return resp.StatusCode, nil
+}
+
+// Expired reports whether a push-service status means the subscription is
+// permanently gone and should be dropped from the store.
+func Expired(status int) bool {
+	return status == http.StatusNotFound || status == http.StatusGone
 }
 
 // Vapid mints RFC 8292 Authorization header values for push endpoints.

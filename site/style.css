@@ -325,9 +325,51 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 }
 .bell-offbtn:hover { border-color: var(--amber-ink); color: var(--amber-ink); }
 
+/* ---------- alerts link in the header ---------- */
+.topbar-right { display: flex; align-items: center; gap: 16px; }
+.alerts-link {
+  display: inline-flex; align-items: center; gap: 6px; text-decoration: none;
+  font-size: 12.5px; font-weight: 700; color: var(--ink-2);
+  border: 1px solid var(--line-2); border-radius: 999px; padding: 4px 11px;
+}
+.alerts-link:hover { color: var(--ink); border-color: var(--ink-3); }
+.alerts-link.on { color: var(--gold); border-color: var(--gold); }
+.alerts-link .al-count:not(:empty) {
+  font-family: var(--font-data); font-size: 11px; background: var(--gold);
+  color: var(--surface); border-radius: 999px; padding: 0 6px; line-height: 16px;
+}
+@media (max-width: 560px) {
+  .alerts-link { padding: 4px 8px; }
+  .topbar-right { gap: 10px; }
+}
+
+/* ---------- my-alerts page ---------- */
+.alerts-head {
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin: 26px 0 14px;
+}
+.alerts-count { margin: 0; color: var(--ink-2); font-size: 14px; }
+.alerts-count b { color: var(--ink); }
+.alerts-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+.alerts-list { margin-bottom: 12px; }
+.alerts-status { min-height: 1.2em; margin: 0 0 8px; font-size: 13px; color: var(--gold); }
+.alerts-explainer {
+  margin-top: 34px; padding-top: 20px; border-top: 1px solid var(--line);
+  color: var(--ink-2); font-size: 13.5px;
+}
+.alerts-explainer h2 {
+  font-family: var(--font-data); font-size: 12px; letter-spacing: .14em;
+  text-transform: uppercase; color: var(--ink-2); margin: 0 0 12px;
+}
+.alerts-explainer ul { margin: 0; padding-left: 18px; display: grid; gap: 8px; max-width: 62em; }
+.alerts-explainer b { color: var(--ink); }
+
 /* ---------- "Your alerts" (home) ---------- */
 .alerts-mod { margin-bottom: 30px; }
 .alerts-mod h2 { justify-content: flex-start; }
+.alerts-manage { margin-left: auto; font-size: 12px; color: var(--gold); text-decoration: none;
+  letter-spacing: 0; text-transform: none; font-family: var(--font-ui); }
+.alerts-manage:hover { text-decoration: underline; }
 .alerts-off-all {
   margin-left: auto; border: 1px solid var(--line-2); background: none;
   color: var(--ink-2); border-radius: 999px; padding: 3px 11px; cursor: pointer;

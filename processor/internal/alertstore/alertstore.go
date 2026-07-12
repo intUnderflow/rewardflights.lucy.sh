@@ -215,6 +215,21 @@ func (s *Store) Remove(endpoint string) {
 	}
 }
 
+// Lookup returns the subscription registered for an endpoint. The bool
+// distinguishes "not a known subscription" from "known but subscribed to no
+// topics" — Topics cannot, since both yield an empty list.
+func (s *Store) Lookup(endpoint string) (webpush.Subscription, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sub, ok := s.subs[key(endpoint)]
+	if !ok {
+		return webpush.Subscription{}, false
+	}
+	return webpush.Subscription{
+		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth,
+	}, true
+}
+
 // Topics reports the topics an endpoint is subscribed to (nil if unknown).
 func (s *Store) Topics(endpoint string) []string {
 	s.mu.RLock()

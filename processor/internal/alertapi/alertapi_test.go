@@ -1,8 +1,14 @@
 package alertapi
 
 import (
+	"crypto/ecdh"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
@@ -12,6 +18,7 @@ import (
 	"time"
 
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
 )
 
 const (
@@ -305,5 +312,273 @@ func TestMethodRouting(t *testing.T) {
 		if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
 			t.Errorf("%s %s = %d, want 404/405", tc.method, tc.path, rec.Code)
 		}
+	}
+}
+
+// --- POST /test ---------------------------------------------------------
+
+// testPushServer stands in for a push service, returning a scripted status
+// and capturing what was sent.
+type testPushServer struct {
+	*httptest.Server
+	status int // status to return (0 -> 201)
+	sends  []capturedSend
+}
+
+type capturedSend struct {
+	path    string
+	headers http.Header
+	body    []byte
+}
+
+func newPushServer(t *testing.T) *testPushServer {
+	t.Helper()
+	ps := &testPushServer{}
+	ps.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		ps.sends = append(ps.sends, capturedSend{path: r.URL.Path, headers: r.Header.Clone(), body: body})
+		status := ps.status
+		if status == 0 {
+			status = http.StatusCreated
+		}
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(ps.Close)
+	return ps
+}
+
+// rewriteTransport routes all requests to the local push server, preserving
+// the path — so handlers can use real (allowlisted) endpoint URLs.
+type rewriteTransport struct{ host string }
+
+func (rt *rewriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	clone := r.Clone(r.Context())
+	clone.URL.Scheme = "http"
+	clone.URL.Host = rt.host
+	return http.DefaultTransport.RoundTrip(clone)
+}
+
+// testAPIWithPush builds an API whose sender delivers to ps.
+func testAPIWithPush(t *testing.T, ps *testPushServer) (http.Handler, *alertstore.Store, *time.Time) {
+	t.Helper()
+	store, err := alertstore.Open(alertstore.Options{
+		Path: filepath.Join(t.TempDir(), "subs.json"), Debounce: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vapid, err := webpush.NewVapid(key, "mailto:alerts@rewardflights.lucy.sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sender := &webpush.Sender{
+		Client: &http.Client{Transport: &rewriteTransport{host: strings.TrimPrefix(ps.URL, "http://")}},
+		Vapid:  vapid,
+	}
+	now := time.Unix(1783810462, 0)
+	srv := New(Config{
+		Store: store, Sender: sender, RatePerMin: 600, Burst: 200, TestPerHour: 5,
+		Now: func() time.Time { return now },
+	})
+	return srv.Handler(), store, &now
+}
+
+// subscribeReal registers a subscription with real push keys (so the payload
+// can actually be encrypted).
+func subscribeReal(t *testing.T, store *alertstore.Store, endpoint string) {
+	t.Helper()
+	key, err := ecdh.P256().GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	secret := make([]byte, 16)
+	if _, err := rand.Read(secret); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.Upsert(alertstore.Subscription{
+		Endpoint: endpoint,
+		P256dh:   base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()),
+		Auth:     base64.RawURLEncoding.EncodeToString(secret),
+		Topics:   []string{"rf_LON-TYO_rt_C"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTestUnknownEndpoint(t *testing.T) {
+	ps := newPushServer(t)
+	h, store, _ := testAPIWithPush(t, ps)
+
+	// Never-subscribed endpoint (even a valid push host) must not be pushed to.
+	rec, body := do(t, h, "POST", "/test", `{"endpoint":"https://fcm.googleapis.com/fcm/send/stranger"}`, nil)
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
+	}
+	if body["error"] != "unknown subscription" {
+		t.Errorf("body = %v", body)
+	}
+	if len(ps.sends) != 0 {
+		t.Errorf("must not send to an unknown endpoint (%d sends)", len(ps.sends))
+	}
+	if store.Count() != 0 {
+		t.Errorf("must not create a subscription")
+	}
+	// An arbitrary non-push host is equally rejected, with no outbound request.
+	rec, _ = do(t, h, "POST", "/test", `{"endpoint":"https://evil.example/collect"}`, nil)
+	if rec.Code != http.StatusNotFound || len(ps.sends) != 0 {
+		t.Errorf("arbitrary endpoint: %d, %d sends", rec.Code, len(ps.sends))
+	}
+}
+
+func TestTestSendsOnePush(t *testing.T) {
+	ps := newPushServer(t)
+	h, store, _ := testAPIWithPush(t, ps)
+	subscribeReal(t, store, endpoint)
+
+	rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	if rec.Code != http.StatusOK || body["ok"] != true {
+		t.Fatalf("status = %d, body = %v", rec.Code, body)
+	}
+	if len(ps.sends) != 1 {
+		t.Fatalf("sent %d pushes, want exactly 1", len(ps.sends))
+	}
+	send := ps.sends[0]
+	if send.path != "/fcm/send/abc123" {
+		t.Errorf("pushed to %q", send.path)
+	}
+	if send.headers.Get("TTL") != "86400" ||
+		send.headers.Get("Content-Encoding") != "aes128gcm" ||
+		send.headers.Get("Content-Type") != "application/octet-stream" {
+		t.Errorf("headers = %v", send.headers)
+	}
+	if !strings.HasPrefix(send.headers.Get("Authorization"), "vapid t=") {
+		t.Errorf("missing VAPID auth: %q", send.headers.Get("Authorization"))
+	}
+	// aes128gcm framing: salt(16) | rs(4) | idlen(1)=65 | keyid(65) | ciphertext.
+	if len(send.body) < 21+65+17 || send.body[20] != 65 {
+		t.Errorf("body is not an aes128gcm message (len %d)", len(send.body))
+	}
+	// The subscription survives a successful test.
+	if store.Count() != 1 {
+		t.Errorf("store count = %d, want 1", store.Count())
+	}
+}
+
+func TestTestExpiredSubscription(t *testing.T) {
+	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
+		t.Run(fmt.Sprint(status), func(t *testing.T) {
+			ps := newPushServer(t)
+			ps.status = status
+			h, store, _ := testAPIWithPush(t, ps)
+			subscribeReal(t, store, endpoint)
+
+			rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+			if rec.Code != http.StatusGone {
+				t.Fatalf("status = %d, want 410", rec.Code)
+			}
+			if body["error"] != "subscription expired" {
+				t.Errorf("body = %v", body)
+			}
+			if store.Count() != 0 {
+				t.Errorf("expired subscription must be removed from the store")
+			}
+		})
+	}
+}
+
+func TestTestPushServiceFailure(t *testing.T) {
+	ps := newPushServer(t)
+	ps.status = http.StatusInternalServerError
+	h, store, _ := testAPIWithPush(t, ps)
+	subscribeReal(t, store, endpoint)
+
+	rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	if rec.Code != http.StatusBadGateway {
+		t.Fatalf("status = %d, want 502", rec.Code)
+	}
+	if body["ok"] != false || !strings.Contains(fmt.Sprint(body["error"]), "500") {
+		t.Errorf("body = %v", body)
+	}
+	// A transient push-service failure must NOT cost the user their subscription.
+	if store.Count() != 1 {
+		t.Errorf("subscription must be retained on 5xx (count = %d)", store.Count())
+	}
+}
+
+func TestTestPerEndpointRateLimit(t *testing.T) {
+	ps := newPushServer(t)
+	h, store, now := testAPIWithPush(t, ps)
+	const other = "https://fcm.googleapis.com/fcm/send/second"
+	subscribeReal(t, store, endpoint)
+	subscribeReal(t, store, other)
+
+	// 5 tests in an hour are allowed; the 6th is throttled.
+	for i := range 5 {
+		if rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil); rec.Code != http.StatusOK {
+			t.Fatalf("test %d: status = %d, want 200", i+1, rec.Code)
+		}
+	}
+	rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	if rec.Code != http.StatusTooManyRequests {
+		t.Fatalf("6th test: status = %d, want 429", rec.Code)
+	}
+	if body["ok"] != false {
+		t.Errorf("429 body = %v", body)
+	}
+	retry, err := strconv.Atoi(rec.Header().Get("Retry-After"))
+	if err != nil || retry < 1 || retry > 3600 {
+		t.Errorf("Retry-After = %q", rec.Header().Get("Retry-After"))
+	}
+	if len(ps.sends) != 5 {
+		t.Errorf("throttled request must not send (%d sends, want 5)", len(ps.sends))
+	}
+
+	// A DIFFERENT subscription has its own budget.
+	if rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, other), nil); rec.Code != http.StatusOK {
+		t.Errorf("other endpoint: status = %d, want 200 (per-subscription budget)", rec.Code)
+	}
+	if len(ps.sends) != 6 {
+		t.Errorf("sends = %d, want 6", len(ps.sends))
+	}
+
+	// The window slides: an hour later the budget is back.
+	*now = now.Add(time.Hour + time.Second)
+	if rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil); rec.Code != http.StatusOK {
+		t.Errorf("after the window: status = %d, want 200", rec.Code)
+	}
+}
+
+func TestTestCORSAndDisabled(t *testing.T) {
+	ps := newPushServer(t)
+	h, store, _ := testAPIWithPush(t, ps)
+	subscribeReal(t, store, endpoint)
+
+	// Preflight.
+	rec, _ := do(t, h, "OPTIONS", "/test", "", map[string]string{
+		"Origin": origin, "Access-Control-Request-Method": "POST",
+	})
+	if rec.Code != http.StatusNoContent {
+		t.Errorf("preflight status = %d", rec.Code)
+	}
+	if rec.Header().Get("Access-Control-Allow-Origin") != origin {
+		t.Errorf("ACAO = %q", rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+	// The real request carries CORS headers too.
+	rec, _ = do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), map[string]string{"Origin": origin})
+	if rec.Code != http.StatusOK || rec.Header().Get("Access-Control-Allow-Origin") != origin {
+		t.Errorf("post: %d ACAO = %q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
+	}
+
+	// Without a sender configured the route reports unavailable, never panics.
+	noSender, _, _ := testAPI(t)
+	rec, _ = do(t, noSender, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Errorf("sender-less API: %d, want 503", rec.Code)
 	}
 }
