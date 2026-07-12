@@ -49,10 +49,11 @@ const Schema = 2
 
 const (
 	DefaultMaxSubs = 100000
-	// DefaultMaxBytes caps the on-disk subscription store. This is a backstop
-	// against a runaway or hostile writer filling the host's disk — nothing
-	// legitimate comes close (100k subscriptions is on the order of 50 MB).
-	DefaultMaxBytes  = 10 << 30 // 10 GiB
+	// DefaultMaxBytes caps the on-disk subscription store. A backstop against a
+	// runaway or hostile writer filling the host's disk, not a working limit:
+	// 100k subscriptions is on the order of 50 MB, so this leaves ~40x headroom
+	// while staying a small fraction of the host's free space.
+	DefaultMaxBytes  = 2 << 30 // 2 GiB
 	defaultDebounce  = time.Second
 	subscriptionFile = 0o600 // subscriptions are personal data: owner-only
 )
