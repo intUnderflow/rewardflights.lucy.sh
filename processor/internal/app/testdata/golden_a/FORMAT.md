@@ -6,8 +6,8 @@ data, derived from
 by the processor in
 [intUnderflow/rewardflights.lucy.sh](https://github.com/intUnderflow/rewardflights.lucy.sh).
 Every file documented here is owned and rewritten by that processor — do not
-edit them by hand. `README.md`, `LICENSE` and `DbCL-1.0.txt` are maintained by
-humans and are outside this document's scope.
+edit them by hand. `README.md` is maintained by humans and is outside this
+document's scope.
 
 ## Serialization (all JSON files)
 
@@ -100,7 +100,7 @@ index = days from 2026-01-01 to 2026-07-12
  "changes": "changes/recent.json",
  "counts": {"airlines": 1, "places": 173, "routeDates": 72116, "routes": 345},
  "epoch": "2026-01-01",
- "license": {…},
+ "source": {…},
  "mode": "bundle",
  "schema": 1,
  "t": 1770000000,
@@ -128,7 +128,7 @@ index = days from 2026-01-01 to 2026-07-12
  },
  "days": 517,
  "epoch": "2026-01-01",
- "license": {…},
+ "source": {…},
  "places": {
   "LON": {
    "country": "United Kingdom",
@@ -163,7 +163,7 @@ index = days from 2026-01-01 to 2026-07-12
     404s). A listed month that still 404s is "detail pending", not an error.
 - `origins/<ORIGIN>.json` is byte-compatible in shape: `routes` is filtered to
   routes starting at that origin, and `places` to the codes those routes
-  reference. Everything else (airlines, epoch, days, license) is identical.
+  reference. Everything else (airlines, epoch, days, source) is identical.
 
 ## `places.json`
 
@@ -251,12 +251,10 @@ Dates that merely rolled into the past are **not** reported as closed.
 Enforced by the processor at generation time: `availability.json` ≤ 300 KiB
 gzipped; every other file ≤ 50 KiB gzipped.
 
-## License
+## Provenance
 
-Contains data from
-[github.com/intUnderflow/rewardflights](https://github.com/intUnderflow/rewardflights),
-© its contributors, made available under the
-[Open Database License (ODbL) v1.0](https://opendatacommons.org/licenses/odbl/1-0/)
-(SPDX: `ODbL-1.0`); individual contents under the Database Contents License
-(DbCL) v1.0. Every availability file carries a machine-readable `license`
-block with the same attribution.
+This dataset is derived from
+[github.com/intUnderflow/rewardflights](https://github.com/intUnderflow/rewardflights).
+It carries no license of its own. Every file embeds a machine-readable
+`source` block naming that repo, with a no-warranty note: availability facts
+are provided as-is, with no guarantee of accuracy or bookability.

@@ -43,11 +43,12 @@ type AirlineInfo struct {
 // ~355 days, so 450 leaves generous headroom.
 const futureCapDays = 450
 
-// licenseBlock is embedded in manifest.json and every availability file.
-var licenseBlock = map[string]any{
-	"attribution": "Contains data from github.com/intUnderflow/rewardflights, © its contributors, Open Database License (ODbL) v1.0",
-	"spdx":        "ODbL-1.0",
-	"url":         "https://opendatacommons.org/licenses/odbl/1-0/",
+// provenanceBlock is embedded (as "source") in manifest.json and every
+// availability file. The dataset carries no license of its own; this is
+// provenance + a no-warranty note for downstream consumers.
+var provenanceBlock = map[string]any{
+	"repo": "https://github.com/intUnderflow/rewardflights",
+	"note": "Derived from github.com/intUnderflow/rewardflights. Availability facts provided as-is, with no warranty and no guarantee of accuracy or bookability.",
 }
 
 // ParsePlaces parses the embedded curated place table.
@@ -246,7 +247,7 @@ func Build(in Inputs) (*Output, error) {
 	availability := func(routes, places map[string]any) map[string]any {
 		return map[string]any{
 			"airlines": airlinesJSON, "days": days, "epoch": epochStr,
-			"license": licenseBlock, "places": places, "routes": routes,
+			"source": provenanceBlock, "places": places, "routes": routes,
 			"schema": 1, "t": in.SourceTime, "v": in.SHA,
 		}
 	}
@@ -287,7 +288,7 @@ func Build(in Inputs) (*Output, error) {
 			"airlines": len(airlinesJSON), "places": len(placesJSON),
 			"routeDates": routeDates, "routes": len(routesJSON),
 		},
-		"epoch": epochStr, "license": licenseBlock, "mode": "bundle",
+		"epoch": epochStr, "source": provenanceBlock, "mode": "bundle",
 		"schema": 1, "t": in.SourceTime, "v": in.SHA,
 	}); err != nil {
 		return nil, err

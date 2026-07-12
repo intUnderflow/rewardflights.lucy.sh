@@ -5,13 +5,13 @@ Status: FINAL v1 (synthesized from design panel + measured snappiness study, 202
 ## System overview
 
 ```
-github.com/intUnderflow/rewardflights          (source: scraper output, ODbL)
-        │  polled every 30 min by GitHub Actions in THIS repo
+github.com/intUnderflow/rewardflights          (source: scraper output)
+        │  watched live by a long-running processor on the source host
         ▼
 processor/ (Go, stdlib-only)
         │  deterministic transform; commit only on change
         ▼
-github.com/intUnderflow/rewardflights.lucy.sh-data   (derived, ODbL share-alike)
+github.com/intUnderflow/rewardflights.lucy.sh-data   (derived, no license; provenance-tagged)
         │  fetched client-side from raw.githubusercontent.com
         │  (verified: ACAO:*, gzip, max-age=300; ETag NOT CORS-readable)
         ▼
@@ -75,14 +75,14 @@ flights/<ORIG>/<DEST>/<YYYY-MM>.json per-flight detail, all airlines merged
                                      1000-entry dir listings at 10x scale)
 changes/recent.json                  rolling opened/closed feed (see below)
 places.json                          standalone copy of the places table
-README.md, FORMAT.md, LICENSE, DbCL-1.0.txt
+README.md, FORMAT.md
 ```
 
 `manifest.json`:
 ```json
 {"bundle":"availability.json","changes":"changes/recent.json",
  "counts":{"airlines":1,"places":173,"routeDates":72116,"routes":345},
- "epoch":"2026-01-01","license":{…},"mode":"bundle","schema":1,
+ "epoch":"2026-01-01","source":{…},"mode":"bundle","schema":1,
  "t":1770000000,"v":"<source sha>"}
 ```
 
@@ -92,8 +92,8 @@ README.md, FORMAT.md, LICENSE, DbCL-1.0.txt
                              "4":"Business","8":"First"},
                    "name":"British Airways","slug":"british-airways"}},
  "days":517,"epoch":"2026-01-01",
- "license":{"attribution":"Contains data from github.com/intUnderflow/rewardflights, © its contributors, Open Database License (ODbL) v1.0",
-            "spdx":"ODbL-1.0","url":"https://opendatacommons.org/licenses/odbl/1-0/"},
+ "source":{"repo":"https://github.com/intUnderflow/rewardflights",
+           "note":"Derived from …; provided as-is, no warranty."},
  "places":{"LON":{"country":"United Kingdom","name":"London",
                   "search":["Heathrow","LHR","Gatwick","LGW","City","LCY","Stansted","STN","Luton","LTN"]},…},
  "routes":{"LON-TYO":{"a":{"BA":"000…680C…"},"fm":["2026-10"]}},
@@ -148,7 +148,7 @@ README.md, FORMAT.md, LICENSE, DbCL-1.0.txt
   truncated source checkout mass-deleting the derived tree.
 - Managed-path ownership: processor owns manifest.json, availability.json,
   places.json, FORMAT.md, origins/**, flights/**, changes/**; write-if-
-  different, delete stale, NEVER touches README/LICENSE/DbCL/.git.
+  different, delete stale, NEVER touches README/.git.
 - Malformed source entries: WARN + skip, never abort the run; hard fail only
   on structural problems (unreadable roots, zero data, budget breach,
   guardrail).
@@ -191,19 +191,27 @@ Missing sha/time → read from `git -C src log -1`. Machine-parseable summary:
   October"), "recently opened" module from changes feed.
 - Failure: 8s timeout, ×2 retry w/ jittered backoff, amber stale banner when
   serving snapshot only; never white-screen.
-- ODbL attribution in footer, rendered from the bundle's `license` block.
+- Provenance/attribution to the source repo shown in the footer.
 
-## Automation (.github/workflows/process-data.yml)
+## Automation (constantly-running watcher)
 
-- `schedule */30` + `workflow_dispatch`; concurrency-gated.
-- Skip when data repo manifest `v` == source HEAD SHA.
-- Run processor → determinism canary (second run must print written=0
-  deleted=0) → commit `data: source <short-sha>` → push (PAT secret
-  `DATA_REPO_TOKEN`, contents:write on the data repo).
+`processor -watch -push -src <...> -out <...> -token-cmd '<...>'`
+
+- Polls the local source checkout's HEAD (`-interval`, default 2s). Because the
+  source is produced on the same host, watching locally is instant — no webhook.
+- On a new source commit: fetch+reset the out repo to origin/main (guarantees a
+  fast-forward push), regenerate, and if anything changed, commit
+  `data: source <short-sha>` and push using a token from `-token-cmd`.
+- Never exits on a transient error (logs and retries next tick); the service
+  supervisor restarts the process itself if it dies.
+- Idempotent: regenerating unchanged data stages nothing, so no empty commits.
+- Host-specific service config (launchd/systemd, token command) lives on the
+  host, not in the repo.
 
 ## Licensing
-Source ODbL → derived repo ODbL share-alike + DbCL for contents; attribution
-in README, FORMAT.md, license block in data, and site footer.
+Code (processor + site) is CC BY-NC-SA 4.0. The derived data carries no license
+of its own; each file embeds a `source` provenance block naming the source repo,
+with a no-warranty note. Bundled fonts remain under the SIL OFL.
 
 ## Deliberately deferred (format already accommodates)
 - `mode:"shard"` client path + SHA-pinned shard URLs (bundle > 300KB gz)

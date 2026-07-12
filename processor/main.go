@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
 )
@@ -31,11 +32,27 @@ func main() {
 	sourceSHA := flag.String("source-sha", "", "source commit SHA embedded as \"v\" (default: HEAD of -src)")
 	sourceTime := flag.Int64("source-time", 0, "source commit unix timestamp embedded as \"t\" (default: committer time of HEAD of -src)")
 	force := flag.Bool("force", false, "override the 50% routeDates shrink guardrail")
+	watch := flag.Bool("watch", false, "run continuously: watch -src HEAD and regenerate on every new source commit")
+	interval := flag.Duration("interval", 2*time.Second, "watch mode: how often to poll -src HEAD")
+	commit := flag.Bool("commit", false, "watch mode: git commit -out when the derived data changes")
+	push := flag.Bool("push", false, "watch mode: git push -out after committing (implies -commit)")
+	tokenCmd := flag.String("token-cmd", "", "watch mode: shell command printing a git token to stdout for the push (e.g. the GitHub App mint script); empty uses the ambient git credentials")
 	flag.Parse()
 
 	if *src == "" || *out == "" {
 		fmt.Fprintln(os.Stderr, "usage: processor -src <rewardflights checkout> -out <derived repo checkout> [-source-sha SHA] [-source-time UNIX] [-force]")
+		fmt.Fprintln(os.Stderr, "       processor -watch -src <...> -out <...> [-interval 2s] [-push] [-token-cmd '<cmd>']")
 		os.Exit(2)
+	}
+
+	if *watch {
+		if err := runWatch(watchConfig{
+			Src: *src, Out: *out, Force: *force,
+			Interval: *interval, Commit: *commit, Push: *push, TokenCmd: *tokenCmd,
+		}); err != nil {
+			fatal(err)
+		}
+		return
 	}
 
 	sha, unix := *sourceSHA, *sourceTime
