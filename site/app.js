@@ -2603,7 +2603,7 @@ async function drawAlertsPage(body) {
   const list = el(`<div class="card-list alerts-list"></div>`);
   const rerender = () => drawAlertsPage(body);
   for (const w of watches) list.append(alertRow(w, data, rerender, { editable: true }));
-  body.append(list, el(`<p class="alerts-status" role="status"></p>`), alertsFooterHTML());
+  body.append(list, el(`<p class="alerts-status" role="status"></p>`), troubleshootHTML(), alertsFooterHTML());
 
   $("#alerts-all-off", head).addEventListener("click", async (e) => {
     const btn = e.currentTarget;
@@ -2641,7 +2641,26 @@ async function drawAlertsPage(body) {
       }
       if (res.status === 429) throw new Error("That's enough tests for now — try again later.");
       if (!res.ok) throw new Error(`Couldn't send a test (${res.status}).`);
-      status(body, "Sent — it should arrive in a second or two.");
+
+      // Fire a LOCAL notification too. It never touches the network, so the two
+      // together tell the user which half is broken:
+      //   neither appears  → the OS is blocking this browser (macOS does this
+      //                      silently; the site permission still reads "granted")
+      //   only this one    → we sent it but it didn't reach the device
+      // Without this, "nothing happened" is indistinguishable from "we failed".
+      try {
+        const reg = await ensureSW();
+        await reg.showNotification("Notifications are working here", {
+          body: "This one came from your browser. The other came from our server — if you only see this one, tell us.",
+          tag: "rf_local_check",
+          icon: "/assets/icon-192.png",
+        });
+      } catch { /* local check is a diagnostic, never a failure */ }
+      status(body, "Sent two notifications — one from your browser, one from our server.");
+      // Whatever the outcome, say where to look. On macOS a blocked browser is
+      // the usual culprit and nothing in the browser hints at it.
+      const help = $(".alerts-help", body);
+      if (help) help.hidden = false;
     } catch (err) {
       status(body, String(err.message || err));
     } finally {
@@ -2653,6 +2672,32 @@ async function drawAlertsPage(body) {
 function status(body, msg) {
   const el2 = $(".alerts-status", body);
   if (el2) { el2.textContent = msg; announce(msg); }
+}
+
+/* Shown after a test: the browser can say "granted" while the OS silently drops
+   every notification, and nothing in the browser hints at it. */
+function troubleshootHTML() {
+  const mac = /Macintosh|Mac OS X/.test(navigator.userAgent);
+  const chromey = /Chrome|Chromium|Edg/.test(navigator.userAgent) && !/Firefox/.test(navigator.userAgent);
+  const browser = /Edg/.test(navigator.userAgent) ? "Microsoft Edge"
+    : /Firefox/.test(navigator.userAgent) ? "Firefox"
+      : /Chrome|Chromium/.test(navigator.userAgent) ? "Google Chrome" : "your browser";
+  return el(`<div class="alerts-help" hidden>
+    <h2>Didn't see them?</h2>
+    <ul>
+      ${mac ? `<li><b>macOS blocks notifications per app</b>, separately from the website's
+        permission — this is the usual culprit, and nothing in the browser tells you.
+        Open <b>System Settings → Notifications → ${esc(browser)}</b> and turn
+        <b>Allow notifications</b> on. Check <b>Do Not Disturb / Focus</b> is off too.</li>` : ""}
+      ${isIOS() ? `<li><b>On iPhone</b>, alerts only work if you opened Reward Flights from your
+        <b>Home Screen</b> (Share → Add to Home Screen), not from a Safari tab.</li>` : ""}
+      <li>If you saw the <b>browser</b> notification but not the <b>server</b> one, delivery is the
+        problem, not your settings — turn an alert off and on again to renew this device's
+        subscription, then test once more.</li>
+      ${chromey ? `<li>Notifications can also be muted for the site itself: click the icon at the
+        left of the address bar → <b>Notifications</b>.</li>` : ""}
+    </ul>
+  </div>`);
 }
 
 function alertsFooterHTML() {
