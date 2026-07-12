@@ -37,11 +37,23 @@ import (
 )
 
 // Subscription is one browser push subscription and everything it watches.
+//
+// The delivery-telemetry fields exist because a push service returns 201
+// whether the notification was shown or silently dropped by the OS, and no web
+// API exposes that suppression — so a device's alerts can be dead for weeks
+// with nobody the wiser. The service worker ACKs each push it actually
+// receives (POST /ack); comparing lastAckAt against lastPushAt is the only
+// signal we have that a device is still really reachable.
 type Subscription struct {
 	Endpoint string  `json:"endpoint"`
 	P256dh   string  `json:"p256dh"`
 	Auth     string  `json:"auth"`
 	Watches  []Watch `json:"watches"`
+
+	LastPushAt int64 `json:"lastPushAt,omitempty"` // last push accepted by the push service
+	LastAckAt  int64 `json:"lastAckAt,omitempty"`  // last ACK from the service worker
+	PushCount  int64 `json:"pushCount,omitempty"`
+	AckCount   int64 `json:"ackCount,omitempty"`
 }
 
 // Schema is the current on-disk store schema.
@@ -212,6 +224,21 @@ type storedSub struct {
 	Auth     string   `json:"auth"`
 	Watches  []Watch  `json:"watches,omitempty"`
 	Topics   []string `json:"topics,omitempty"` // schema 1 only
+
+	LastPushAt int64 `json:"lastPushAt,omitempty"`
+	LastAckAt  int64 `json:"lastAckAt,omitempty"`
+	PushCount  int64 `json:"pushCount,omitempty"`
+	AckCount   int64 `json:"ackCount,omitempty"`
+}
+
+// toStored projects a Subscription to its on-disk shape. Used by both Flush
+// and subSize, so what we persist and what we byte-account never drift.
+func toStored(sub *Subscription) storedSub {
+	return storedSub{
+		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth, Watches: sub.Watches,
+		LastPushAt: sub.LastPushAt, LastAckAt: sub.LastAckAt,
+		PushCount: sub.PushCount, AckCount: sub.AckCount,
+	}
 }
 
 // load validates and (for schema 1) migrates one stored subscription.
@@ -222,7 +249,11 @@ func (s *Store) load(sub storedSub, schema int) (*Subscription, error) {
 	if sub.P256dh == "" || sub.Auth == "" {
 		return nil, errors.New("p256dh and auth are required")
 	}
-	out := &Subscription{Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth}
+	out := &Subscription{
+		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth,
+		LastPushAt: sub.LastPushAt, LastAckAt: sub.LastAckAt,
+		PushCount: sub.PushCount, AckCount: sub.AckCount,
+	}
 
 	if schema == 1 {
 		watches, err := watchesFromTopics(sub.Topics, s.now().Unix())
@@ -578,6 +609,67 @@ func (s *Store) MarkFired(endpoint string, ids []string, t int64) {
 	}
 }
 
+// MarkPushed records that a push was ACCEPTED by the push service (a 2xx).
+// It is not evidence the notification was shown — only that it was handed off
+// — which is exactly why we also track ACKs. A no-op for an unknown endpoint.
+func (s *Store) MarkPushed(endpoint string, t int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[key(endpoint)]
+	if !ok {
+		return
+	}
+	sub.LastPushAt = t
+	sub.PushCount++
+	s.reaccount(key(endpoint))
+	s.touch()
+}
+
+// MarkAcked records that the service worker confirmed it received a push.
+// A no-op for an unknown endpoint.
+func (s *Store) MarkAcked(endpoint string, t int64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	sub, ok := s.subs[key(endpoint)]
+	if !ok {
+		return
+	}
+	sub.LastAckAt = t
+	sub.AckCount++
+	s.reaccount(key(endpoint))
+	s.touch()
+}
+
+// DeliveryStatus returns a subscription's push/ack telemetry. ok is false for
+// an unknown endpoint.
+func (s *Store) DeliveryStatus(endpoint string) (lastPushAt, lastAckAt, pushCount, ackCount int64, ok bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	sub, found := s.subs[key(endpoint)]
+	if !found {
+		return 0, 0, 0, 0, false
+	}
+	return sub.LastPushAt, sub.LastAckAt, sub.PushCount, sub.AckCount, true
+}
+
+// AckSlack is how far before the last push an ACK may land and still count as
+// "the device acknowledged our most recent send" — absorbing clock skew and
+// send/ack ordering (the ACK for push N can race ahead of MarkPushed for
+// push N+1).
+const AckSlack = 300
+
+// Reachable reports whether a device still appears to be receiving pushes:
+// it has acked at least once, at or after (within AckSlack of) our most recent
+// send. A device we have never pushed to is reachable by default — nothing has
+// been sent, so nothing can be concluded. Everything else is the "we've been
+// sending pushes this device never acknowledges" state the UI surfaces.
+func Reachable(lastPushAt, lastAckAt, pushCount, ackCount int64) bool {
+	if pushCount == 0 {
+		return true
+	}
+	return ackCount > 0 && lastAckAt >= lastPushAt-AckSlack
+}
+
 // PurgeExpired drops watches that expired more than ExpiryGraceDays ago and
 // removes any subscription the purge leaves with nothing to watch (EC-1).
 func (s *Store) PurgeExpired(today int) (watches, subs int) {
@@ -685,6 +777,24 @@ func (s *Store) Count() int {
 	return len(s.subs)
 }
 
+// DeliveryTotals reports the aggregate reachability picture for /healthz:
+// how many subscriptions have ever acked, and how many are currently
+// unreachable (pushes sent, none acknowledged at/after the last send). Watching
+// unreachable climb is how we notice a platform silently eating our pushes.
+func (s *Store) DeliveryTotals() (acked, unreachable int) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	for _, sub := range s.subs {
+		if sub.AckCount > 0 {
+			acked++
+		}
+		if !Reachable(sub.LastPushAt, sub.LastAckAt, sub.PushCount, sub.AckCount) {
+			unreachable++
+		}
+	}
+	return acked, unreachable
+}
+
 // WatchCount reports the total number of watches across all subscriptions.
 func (s *Store) WatchCount() int {
 	s.mu.RLock()
@@ -739,7 +849,9 @@ func (s *Store) Flush() error {
 		sub := cloneSub(s.subs[k])
 		file.Subs = append(file.Subs, storedSub{
 			Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth,
-			Watches: sub.Watches,
+			Watches:    sub.Watches,
+			LastPushAt: sub.LastPushAt, LastAckAt: sub.LastAckAt,
+			PushCount: sub.PushCount, AckCount: sub.AckCount,
 		})
 	}
 	s.mu.RUnlock()

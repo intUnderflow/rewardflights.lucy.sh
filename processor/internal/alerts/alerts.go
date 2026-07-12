@@ -844,6 +844,10 @@ func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, logf func(str
 		case status < 200 || status >= 300:
 			return fmt.Errorf("push service returned %d", status)
 		}
+		// Accepted by the push service. This is delivery telemetry, not
+		// detection, so it stamps wall-clock time — the same clock the ACK
+		// will arrive on — and never the bundle's source time.
+		store.MarkPushed(sub.Endpoint, time.Now().Unix())
 		return nil
 	}
 }

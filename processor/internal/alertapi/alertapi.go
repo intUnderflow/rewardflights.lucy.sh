@@ -48,12 +48,18 @@ const maxBody = 32 << 10
 // separately (any port on loopback).
 const prodOrigin = "https://rewardflights.lucy.sh"
 
+// ackPerHour caps /ack writes per subscription endpoint. A healthy service
+// worker acks once per push (a few a day); this only stops a client turning
+// the endpoint into a write amplifier.
+const ackPerHour = 60
+
 // Server is the running API.
 type Server struct {
 	cfg      Config
 	http     *http.Server
 	limiter  *limiter
 	testRate *sendLimiter
+	ackRate  *sendLimiter
 }
 
 // New builds the API server (does not listen yet).
@@ -80,6 +86,7 @@ func New(cfg Config) *Server {
 			float64(cfg.Burst), cfg.Now,
 		),
 		testRate: newSendLimiter(cfg.TestPerHour, time.Hour, cfg.Now),
+		ackRate:  newSendLimiter(ackPerHour, time.Hour, cfg.Now),
 	}
 	s.http = &http.Server{
 		Addr:              cfg.Addr,
@@ -98,6 +105,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /subscribe", s.handleSubscribe)
 	mux.HandleFunc("POST /unsubscribe", s.handleUnsubscribe)
 	mux.HandleFunc("POST /test", s.handleTest)
+	mux.HandleFunc("POST /ack", s.handleAck)
 	mux.HandleFunc("GET /watches", s.handleWatches)
 	mux.HandleFunc("GET /topics", s.handleTopics)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
@@ -267,9 +275,49 @@ func (s *Server) handleWatches(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "endpoint is required")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
-		"watches": s.withStatus(s.cfg.Store.Watches(endpoint)),
-	})
+	body := map[string]any{"watches": s.withStatus(s.cfg.Store.Watches(endpoint))}
+	if lastPush, lastAck, pushCount, ackCount, ok := s.cfg.Store.DeliveryStatus(endpoint); ok {
+		body["device"] = map[string]any{
+			"lastPushAt": lastPush,
+			"lastAckAt":  lastAck,
+			"pushCount":  pushCount,
+			"ackCount":   ackCount,
+			"reachable":  alertstore.Reachable(lastPush, lastAck, pushCount, ackCount),
+		}
+	}
+	writeJSON(w, http.StatusOK, body)
+}
+
+// handleAck records a service-worker acknowledgement that a push was actually
+// received. It is the only positive evidence we have that a device's alerts
+// are reaching it — a push service reports 201 whether the OS showed the
+// notification or dropped it. The endpoint must already exist (an ack never
+// creates a subscription), and it is rate-limited per endpoint so it cannot be
+// used to spam writes.
+func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Endpoint string `json:"endpoint"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if req.Endpoint == "" {
+		badRequest(w, "endpoint is required")
+		return
+	}
+	if _, ok := s.cfg.Store.Lookup(req.Endpoint); !ok {
+		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "unknown subscription"})
+		return
+	}
+	if ok, retryAfter := s.ackRate.allow(req.Endpoint); !ok {
+		w.Header().Set("Retry-After", strconv.Itoa(retryAfter))
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{
+			"ok": false, "error": "too many acknowledgements; try again later",
+		})
+		return
+	}
+	s.cfg.Store.MarkAcked(req.Endpoint, s.cfg.Now().Unix())
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 }
 
 func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
@@ -360,6 +408,9 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 			"ok": false, "error": fmt.Sprintf("push service returned %d", status),
 		})
 	default:
+		// Accepted by the push service: record the send so the device's
+		// reachability is measured against this test too.
+		s.cfg.Store.MarkPushed(sub.Endpoint, s.cfg.Now().Unix())
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	}
 }
@@ -381,10 +432,13 @@ func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
+	acked, unreachable := s.cfg.Store.DeliveryTotals()
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":      true,
-		"subs":    s.cfg.Store.Count(),
-		"watches": s.cfg.Store.WatchCount(),
+		"ok":          true,
+		"subs":        s.cfg.Store.Count(),
+		"watches":     s.cfg.Store.WatchCount(),
+		"acked":       acked,       // subscriptions that have ever acknowledged a push
+		"unreachable": unreachable, // pushes sent, never acknowledged: the failure signal
 	})
 }
 

@@ -709,3 +709,136 @@ func TestByteCeilingProtectsTheDisk(t *testing.T) {
 		t.Fatalf("shrinking a subscription must be allowed even at the ceiling: %v", err)
 	}
 }
+
+func TestDeliveryTelemetry(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	if _, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"))); err != nil {
+		t.Fatal(err)
+	}
+
+	// Nothing sent yet.
+	lp, la, pc, ac, ok := s.DeliveryStatus(endpointA)
+	if !ok || lp != 0 || la != 0 || pc != 0 || ac != 0 {
+		t.Fatalf("fresh subscription telemetry = %d/%d/%d/%d ok=%v", lp, la, pc, ac, ok)
+	}
+	if _, _, _, _, ok := s.DeliveryStatus(endpointB); ok {
+		t.Error("unknown endpoint must report ok=false")
+	}
+
+	// A push, then two.
+	s.MarkPushed(endpointA, 1000)
+	s.MarkPushed(endpointA, 2000)
+	lp, la, pc, ac, _ = s.DeliveryStatus(endpointA)
+	if lp != 2000 || pc != 2 || la != 0 || ac != 0 {
+		t.Errorf("after 2 pushes = lastPush %d push %d lastAck %d ack %d", lp, pc, la, ac)
+	}
+
+	// An ack.
+	s.MarkAcked(endpointA, 2100)
+	lp, la, pc, ac, _ = s.DeliveryStatus(endpointA)
+	if lp != 2000 || pc != 2 || la != 2100 || ac != 1 {
+		t.Errorf("after ack = lastPush %d push %d lastAck %d ack %d", lp, pc, la, ac)
+	}
+
+	// Unknown endpoints are no-ops (no subscription is created).
+	s.MarkPushed(endpointB, 5000)
+	s.MarkAcked(endpointB, 5000)
+	if s.Count() != 1 {
+		t.Errorf("marking an unknown endpoint must not create a subscription (count=%d)", s.Count())
+	}
+
+	// Telemetry survives a round-trip to disk.
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	s2 := openStore(t, s.path)
+	lp, la, pc, ac, ok = s2.DeliveryStatus(endpointA)
+	if !ok || lp != 2000 || la != 2100 || pc != 2 || ac != 1 {
+		t.Errorf("telemetry did not persist: %d/%d/%d/%d ok=%v", lp, la, pc, ac, ok)
+	}
+}
+
+// TestDeliveryByteAccounting guards the invariant the whole size-limit backstop
+// rests on: an in-place telemetry mutation must reaccount, so store.bytes stays
+// in step with what a Flush would actually serialize.
+func TestDeliveryByteAccounting(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	if _, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"))); err != nil {
+		t.Fatal(err)
+	}
+	for i := range 50 { // exercise the omitempty->present transition and growth
+		s.MarkPushed(endpointA, int64(1000+i))
+		s.MarkAcked(endpointA, int64(1000+i))
+	}
+	assertByteAccountingConsistent(t, s)
+}
+
+// assertByteAccountingConsistent verifies the store's running byte tally matches
+// a fresh recomputation from the current subscriptions. If a mutation path
+// forgot to reaccount, the tally drifts and the size-limit backstop silently
+// stops guarding the real file size — so this is checked directly against the
+// private counters rather than through any public API.
+func assertByteAccountingConsistent(t *testing.T, s *Store) {
+	t.Helper()
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	var want int64
+	for k, subrec := range s.subs {
+		size := subSize(subrec)
+		if got := s.subBytes[k]; got != size {
+			t.Errorf("per-sub byte tally drifted for %q: tracked %d, actual %d", k, got, size)
+		}
+		want += size
+	}
+	if s.bytes != want {
+		t.Errorf("store byte tally drifted: tracked %d, sum of subs %d", s.bytes, want)
+	}
+	if len(s.subBytes) != len(s.subs) {
+		t.Errorf("subBytes has %d entries but there are %d subscriptions (leak)", len(s.subBytes), len(s.subs))
+	}
+}
+
+func TestReachable(t *testing.T) {
+	cases := []struct {
+		name                                   string
+		lastPush, lastAck, pushCount, ackCount int64
+		want                                   bool
+	}{
+		{"never pushed", 0, 0, 0, 0, true},
+		{"never pushed but somehow acked", 0, 500, 0, 1, true},
+		{"acked after push", 1000, 1000, 1, 1, true},
+		{"acked within slack before push", 1000, 1000 - AckSlack, 3, 2, true},
+		{"acked just outside slack", 1000, 1000 - AckSlack - 1, 3, 2, false},
+		{"pushed, never acked", 1000, 0, 5, 0, false},
+		{"acked long before the last push", 5000, 1000, 4, 1, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := Reachable(tc.lastPush, tc.lastAck, tc.pushCount, tc.ackCount); got != tc.want {
+				t.Errorf("Reachable(%d,%d,%d,%d) = %v, want %v",
+					tc.lastPush, tc.lastAck, tc.pushCount, tc.ackCount, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestDeliveryTotals(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	for _, e := range []string{endpointA, endpointB, endpointC} {
+		if _, err := s.Upsert(sub(e, rt("LON-TYO", "C"))); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A: healthy (acked after push). B: pushed, never acked. C: never pushed.
+	s.MarkPushed(endpointA, 1000)
+	s.MarkAcked(endpointA, 1000)
+	s.MarkPushed(endpointB, 1000)
+
+	acked, unreachable := s.DeliveryTotals()
+	if acked != 1 {
+		t.Errorf("acked = %d, want 1 (only A)", acked)
+	}
+	if unreachable != 1 {
+		t.Errorf("unreachable = %d, want 1 (only B; C never pushed)", unreachable)
+	}
+}
