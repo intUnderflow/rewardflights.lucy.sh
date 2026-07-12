@@ -43,6 +43,47 @@ const NEW_BADGE_MS = 48 * 3600 * 1000;
 const BIT_CLASS = { 1: "cab-m", 2: "cab-w", 4: "cab-c", 8: "cab-f" };
 const bitClass = (bit) => BIT_CLASS[bit] || "cab-x";
 
+/* Cabin bit → BA redemption CabinCode (M/W/C/F). */
+const CABIN_CODE = { 1: "M", 2: "W", 4: "C", 8: "F" };
+
+/* Deep link into BA's Avios redemption search, pre-filled with the route,
+   date, and cabin. Uses the metro/city codes we hold (departurePoint=LON,
+   not a single airport) so the search covers the whole city — matching the
+   granularity of our data. A return date is optional. */
+function baBookingURL(origin, dest, outIso, bit, returnIso) {
+  const ddmmyyyy = (iso) => { const [y, m, d] = iso.split("-"); return `${d}/${m}/${y}`; };
+  const oneWay = !returnIso;
+  const params = [
+    ["eId", "100002"],
+    ["pageid", "PLANREDEMPTIONJOURNEY"],
+    ["tab_selected", "redeem"],
+    ["redemption_type", "STD_RED"],
+    ["amex_redemption_type", ""],
+    ["upgradeOutbound", "true"],
+    ["WebApplicationID", "BOD"],
+    ["Output", ""],
+    ["hdnAgencyCode", ""],
+    ["departurePoint", origin],
+    ["destinationPoint", dest],
+    ["departInputDate", ddmmyyyy(outIso)],
+  ];
+  if (!oneWay) params.push(["returnInputDate", ddmmyyyy(returnIso)]);
+  params.push(
+    ["oneWay", oneWay ? "true" : "false"],
+    ["RestrictionType", "Restricted"],
+    ["NumberOfAdults", "1"],
+    ["NumberOfYoungAdults", "0"],
+    ["NumberOfChildren", "0"],
+    ["NumberOfInfants", "0"],
+    ["aviosapp", "true"],
+    ["CabinCode", CABIN_CODE[bit] || ""],
+  );
+  // Values are codes/dates/flags — no characters that need percent-encoding,
+  // and BA expects literal "/" in the dates, so join as-is.
+  return "https://www.britishairways.com/travel/redeem/execclub/_gf/en_gb?" +
+    params.map(([k, v]) => `${k}=${v}`).join("&");
+}
+
 /* ---------------- tiny utils ---------------- */
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -60,6 +101,7 @@ const fmtMonthShort = new Intl.DateTimeFormat("en-GB", { month: "short", timeZon
 const fmtDate = new Intl.DateTimeFormat("en-GB", { weekday: "long", day: "numeric", month: "long", year: "numeric", timeZone: "UTC" });
 const fmtTime = new Intl.DateTimeFormat("en-GB", { hour: "2-digit", minute: "2-digit" });
 const fmtShort = new Intl.DateTimeFormat("en-GB", { day: "numeric", month: "short" });
+const fmtRet = new Intl.DateTimeFormat("en-GB", { weekday: "short", day: "numeric", month: "short", timeZone: "UTC" });
 
 function timeAgo(unixSec) {
   const s = Math.max(0, (Date.now() - unixSec * 1000) / 1000);
@@ -1005,23 +1047,63 @@ async function openDayPanel(routeKey, idx) {
   panelEl.setAttribute("aria-modal", "true");
   panelEl.setAttribute("aria-labelledby", "dp-title");
   panelEl.innerHTML = "";
+  // Return-leg candidates: dates on the reverse route (dest→origin) on or
+  // after this outbound date. Used to optionally deep-link a round trip.
+  const revKey = `${d}-${o}`;
+  const revBits = store.bundle.routes[revKey] ? routeBits(revKey) : null;
+  const returns = [];
+  if (revBits) {
+    for (let i = idx; i < revBits.length; i++) {
+      if (revBits[i]) returns.push({ iso: isoOf(dayDate(i)), bits: revBits[i] });
+    }
+  }
+  const returnOptions = returns.map((r) =>
+    `<option value="${r.iso}">${esc(fmtRet.format(dayDate(dayIndexOf(r.iso))))} — ${esc(cabNames(r.bits))}</option>`
+  ).join("");
+
   panelEl.append(el(`<div>
     <button class="dp-close" type="button" aria-label="Close">×</button>
     <p class="dp-date">${esc(fmtDate.format(dayDate(idx)))}</p>
     <p class="dp-route" id="dp-title">${o} <span style="color:var(--gold)" aria-hidden="true">→</span> ${d}</p>
+    <p class="dp-lead">Award seats available — search British Airways to book:</p>
     <div class="dp-cabs">${legend.map(([bit, label]) => `
-      <div class="dp-cab"><span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>${esc(label)}
-        <span class="code">award seats</span></div>`).join("")}
+      <a class="dp-cab" data-bit="${bit}" target="_blank" rel="noopener noreferrer"
+         href="${baBookingURL(o, d, iso, bit, null)}">
+        <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
+        <span class="dp-cab-label">${esc(label)}</span>
+        <span class="dp-cab-go">Search one way ↗</span>
+      </a>`).join("")}
     </div>
+    ${returns.length ? `<div class="dp-return">
+      <label for="dp-return-date">Return leg (${d} → ${o})</label>
+      <select id="dp-return-date">
+        <option value="">One way only</option>
+        ${returnOptions}
+      </select>
+    </div>` : ""}
     <div class="dp-flights" id="dp-flights"></div>
-    <p class="dp-book"><a class="btn" href="https://www.britishairways.com/en-gb/executive-club/spending-avios" target="_blank" rel="noopener noreferrer">Book with Avios on ba.com ↗</a></p>
-    <p class="dp-note">Seen in data as of ${esc(freshLabel())}. Availability moves fast — verify before planning.</p>
+    <p class="dp-note">Links open BA's Avios redemption search for the whole city pair.
+      Seen in data as of ${esc(freshLabel())}. Availability moves fast — verify before planning.</p>
   </div>`));
   panelEl.hidden = false; scrimEl.hidden = false;
   document.body.classList.add("modal-open");
   setInert(true);
   $(".dp-close", panelEl).addEventListener("click", closeDayPanel);
   panelEl.addEventListener("keydown", trapTab);
+
+  // Wire the return picker: rewrite each cabin link between one-way and round
+  // trip as the user picks a return date.
+  const returnSelect = $("#dp-return-date", panelEl);
+  if (returnSelect) {
+    returnSelect.addEventListener("change", () => {
+      const ret = returnSelect.value || null;
+      for (const link of panelEl.querySelectorAll(".dp-cab")) {
+        const bit = Number(link.dataset.bit);
+        link.href = baBookingURL(o, d, iso, bit, ret);
+        $(".dp-cab-go", link).textContent = ret ? "Search return ↗" : "Search one way ↗";
+      }
+    });
+  }
   $(".dp-close", panelEl).focus();
 
   // Flight-level detail, only where the data says it exists (no 404 probing —
