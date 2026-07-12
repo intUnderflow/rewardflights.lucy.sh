@@ -221,6 +221,41 @@ async function saveTopics(sub, topics) {
   if (!res.ok) throw new Error(`couldn't save alerts (${res.status})`);
 }
 
+/* Topic → {route, kind, bit}. Inverse of topicFor. */
+function parseTopic(t) {
+  const m = /^rf_([A-Z]{3}-[A-Z]{3})_(ow|rt)_([MWCF])$/.exec(t || "");
+  if (!m) return null;
+  const bit = { M: 1, W: 2, C: 4, F: 8 }[m[3]];
+  return { route: m[1], kind: m[2], bit };
+}
+
+/* Everything this device is watching, grouped into one row per route+kind. */
+function groupTopics(topics) {
+  const g = new Map();
+  for (const t of topics) {
+    const p = parseTopic(t);
+    if (!p) continue;
+    const k = `${p.route}|${p.kind}`;
+    if (!g.has(k)) g.set(k, { route: p.route, kind: p.kind, bits: [] });
+    g.get(k).bits.push(p.bit);
+  }
+  return [...g.values()]
+    .map((x) => ({ ...x, bits: x.bits.sort((a, b) => a - b) }))
+    .sort((a, b) => a.route.localeCompare(b.route) || a.kind.localeCompare(b.kind));
+}
+
+/* The current subscription and its topics, or null if this device isn't
+   watching anything. Never throws — alerts are an enhancement, and the page
+   must render fine when the alert service is unreachable. */
+async function currentAlerts() {
+  try {
+    if (!pushSupported() || Notification.permission !== "granted") return null;
+    const sub = await getSubscription();
+    if (!sub) return null;
+    return { sub, topics: await fetchTopics(sub) };
+  } catch { return null; }
+}
+
 /* ---------------- tiny utils ---------------- */
 
 const $ = (sel, el = document) => el.querySelector(sel);
@@ -936,8 +971,82 @@ function refreshHomeModules() {
   if (mount) buildHomeModules(mount);
 }
 
+/* "Your alerts" — the one place to see everything this device is watching and
+   switch any of it off. Without this, unsubscribing means remembering every
+   route you ever subscribed to and visiting each one. Rendered async (it needs
+   the push subscription) and simply absent when there's nothing to show. */
+async function buildAlertsPanel(mount) {
+  const data = await currentAlerts();
+  if (!data || !data.topics.size) { mount.innerHTML = ""; return; }
+
+  const rerender = () => buildAlertsPanel(mount);
+  const groups = groupTopics(data.topics);
+  mount.innerHTML = "";
+  const sec = el(`<section class="module alerts-mod">
+    <h2><span class="dot" aria-hidden="true"></span>Your alerts
+      <button type="button" class="alerts-off-all">Turn all off</button></h2>
+    <div class="card-list"></div>
+  </section>`);
+  const list = $(".card-list", sec);
+
+  for (const g of groups) {
+    const [o, d] = g.route.split("-");
+    const href = `${g.kind === "rt" ? "/trip" : "/route"}/${g.route}`;
+    const arrow = g.kind === "rt" ? "⇄" : "→";
+    const cabs = g.bits.map((bit) =>
+      `<span class="swatch ${bitClass(bit)}" title="${esc(cabinLabel(bit))}"></span>`).join("");
+    const row = el(`<div class="alert-row">
+      <a class="alert-route" href="${href}">
+        <span class="rc-route">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</span>
+        <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
+      </a>
+      <span class="alert-cabs" aria-label="${esc(g.bits.map(cabinLabel).join(", "))}">${cabs}</span>
+      <span class="alert-kind">${g.kind === "rt" ? "round trip" : "one way"}</span>
+      <button type="button" class="alert-off" aria-label="Turn off alerts for ${o} to ${d}">Turn off</button>
+    </div>`);
+    $(".alert-off", row).addEventListener("click", async (e) => {
+      const btn = e.currentTarget;
+      btn.disabled = true; btn.textContent = "…";
+      const keep = new Set([...data.topics].filter((t) => {
+        const p = parseTopic(t);
+        return !(p && p.route === g.route && p.kind === g.kind);
+      }));
+      try {
+        await saveTopics(data.sub, keep);
+        announce(`Alerts off for ${o} to ${d}.`);
+        rerender();
+      } catch (err) {
+        btn.disabled = false; btn.textContent = "Turn off";
+        announce(String(err.message || err));
+      }
+    });
+    list.append(row);
+  }
+
+  $(".alerts-off-all", sec).addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    btn.disabled = true; btn.textContent = "…";
+    try {
+      await saveTopics(data.sub, new Set());   // empty ⇒ drops the subscription
+      announce("All alerts turned off.");
+      rerender();
+    } catch (err) {
+      btn.disabled = false; btn.textContent = "Turn all off";
+      announce(String(err.message || err));
+    }
+  });
+  mount.append(sec);
+}
+
+function cabinLabel(bit) {
+  return cabinLegend().find(([b]) => b === bit)?.[1] || "Other";
+}
+
 function buildHomeModules(mount) {
   mount.innerHTML = "";
+  const alertsMount = el(`<div id="alerts-mod-mount"></div>`);
+  mount.append(alertsMount);
+  buildAlertsPanel(alertsMount);   // async; renders itself if there's anything
   const modules = el(`<div class="modules"></div>`);
   const opened = recentlyOpened();
   if (opened.length) {
@@ -1150,7 +1259,7 @@ function alertBell(routeKey, kind, defaultMask) {
     const start = mine.size ? mine : new Set(legend.filter(([bit]) => bit & defaultMask).map(([b]) => b));
 
     pop.innerHTML = "";
-    pop.append(el(`<p class="bell-title">Alert me when a
+    pop.append(el(`<p class="bell-title">${mine.size ? "Alerting you when a" : "Alert me when a"}
       ${kind === "rt" ? "round trip" : "one-way seat"} opens on ${o} ${arrow} ${d}</p>`));
     const cabs = el(`<div class="bell-cabs" role="group" aria-label="Cabins to watch"></div>`);
     for (const [bit, label] of legend) {
@@ -1166,9 +1275,33 @@ function alertBell(routeKey, kind, defaultMask) {
       cabs.append(row);
     }
     pop.append(cabs);
-    const save = el(`<button type="button" class="btn bell-save">Save alerts</button>`);
+    const save = el(`<button type="button" class="btn bell-save">${mine.size ? "Update alerts" : "Save alerts"}</button>`);
     const status = el(`<p class="bell-note" role="status"></p>`);
-    pop.append(save, status);
+    pop.append(save);
+    // Already watching this route? Offer a one-click off switch — untick-all-
+    // then-save is not a thing anyone should have to discover.
+    if (mine.size) {
+      const off = el(`<button type="button" class="bell-offbtn">Turn off alerts for this route</button>`);
+      off.addEventListener("click", async () => {
+        off.disabled = true;
+        status.textContent = "Turning off…";
+        try {
+          const sub = await getSubscription({ create: true });
+          const topics = await fetchTopics(sub).catch(() => new Set());
+          for (const [bit] of legend) topics.delete(topicFor(routeKey, kind, bit));
+          await saveTopics(sub, topics);
+          setLabel(0);
+          status.textContent = "Alerts off for this route.";
+          announce(status.textContent);
+          setTimeout(close, 1200);
+        } catch (err) {
+          off.disabled = false;
+          status.textContent = String(err.message || err);
+        }
+      });
+      pop.append(off);
+    }
+    pop.append(status);
 
     save.addEventListener("click", async () => {
       save.disabled = true;
