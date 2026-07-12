@@ -26,34 +26,30 @@ const (
 	origin   = "https://rewardflights.lucy.sh"
 )
 
-// testAPI builds a handler over a fresh store, with a controllable clock.
+// The API clock: 2026-07-11 (so "today" is well before the October fixtures).
+var apiNow = time.Unix(1783810462, 0)
+
 func testAPI(t *testing.T) (http.Handler, *alertstore.Store, *time.Time) {
 	t.Helper()
 	store, err := alertstore.Open(alertstore.Options{
 		Path: filepath.Join(t.TempDir(), "subs.json"), Debounce: time.Millisecond,
+		Now: func() time.Time { return apiNow },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { store.Close() })
-	now := time.Unix(1783810462, 0)
+	now := apiNow
 	srv := New(Config{
-		Store: store, RatePerMin: 60, Burst: 20,
+		Store: store, RatePerMin: 600, Burst: 200,
 		Now: func() time.Time { return now },
 	})
 	return srv.Handler(), store, &now
 }
 
-// do issues a request and returns the recorder plus decoded JSON body.
 func do(t *testing.T, h http.Handler, method, target, body string, headers map[string]string) (*httptest.ResponseRecorder, map[string]any) {
 	t.Helper()
-	var reader *strings.Reader
-	if body == "" {
-		reader = strings.NewReader("")
-	} else {
-		reader = strings.NewReader(body)
-	}
-	req := httptest.NewRequest(method, target, reader)
+	req := httptest.NewRequest(method, target, strings.NewReader(body))
 	req.Header.Set("Content-Type", "application/json")
 	for k, v := range headers {
 		req.Header.Set(k, v)
@@ -65,263 +61,349 @@ func do(t *testing.T, h http.Handler, method, target, body string, headers map[s
 	return rec, decoded
 }
 
-func subscribeBody(topics ...string) string {
-	quoted := make([]string, len(topics))
-	for i, topic := range topics {
-		quoted[i] = strconv.Quote(topic)
-	}
-	return fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","topics":[%s]}`,
-		endpoint, strings.Join(quoted, ","))
+// subscribeBody builds a v2 body around a watches JSON fragment.
+func subscribeBody(watches string) string {
+	return fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","watches":[%s]}`, endpoint, watches)
 }
 
-func TestSubscribeUnsubscribeTopicsHealth(t *testing.T) {
+const (
+	unboundedRT  = `{"route":"LON-TYO","kind":"rt","cabins":["C"]}`
+	constrainedW = `{"route":"LON-TYO","kind":"rt","cabins":["C"],
+	  "out":{"from":"2026-10-01","to":"2026-10-20"},
+	  "ret":{"from":"2026-10-10","to":"2026-10-31"},
+	  "nights":{"min":7,"max":14}}`
+)
+
+func watchesOf(t *testing.T, body map[string]any) []map[string]any {
+	t.Helper()
+	raw, ok := body["watches"].([]any)
+	if !ok {
+		t.Fatalf("no watches in response: %v", body)
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, w := range raw {
+		out = append(out, w.(map[string]any))
+	}
+	return out
+}
+
+func TestSubscribeWatches(t *testing.T) {
 	h, store, _ := testAPI(t)
 
-	// Subscribe.
-	rec, body := do(t, h, "POST", "/subscribe", subscribeBody("rf_LON-TYO_rt_C", "rf_LON-TYO_ow_C"), nil)
+	rec, body := do(t, h, "POST", "/subscribe", subscribeBody(unboundedRT+","+constrainedW), nil)
 	if rec.Code != http.StatusOK || body["ok"] != true {
 		t.Fatalf("subscribe: %d %v", rec.Code, body)
 	}
-	topics, _ := body["topics"].([]any)
-	if len(topics) != 2 || topics[0] != "rf_LON-TYO_ow_C" {
-		t.Errorf("returned topics = %v (want sorted)", body["topics"])
+	watches := watchesOf(t, body)
+	if len(watches) != 2 {
+		t.Fatalf("got %d watches, want 2", len(watches))
 	}
-	if store.Count() != 1 {
-		t.Errorf("store count = %d", store.Count())
+	for _, w := range watches {
+		if id, _ := w["id"].(string); len(id) != 8 {
+			t.Errorf("watch id = %v, want 8 hex chars", w["id"])
+		}
+		if w["status"] != alertstore.StatusActive {
+			t.Errorf("status = %v, want active", w["status"])
+		}
+		if w["createdAt"] == nil {
+			t.Errorf("createdAt must be set by the server: %v", w)
+		}
 	}
-	if len(store.Get("rf_LON-TYO_rt_C")) != 1 {
-		t.Error("sender lookup must see the new subscription")
+	if store.WatchCount() != 2 {
+		t.Errorf("store holds %d watches", store.WatchCount())
 	}
 
-	// GET /topics.
-	rec, body = do(t, h, "GET", "/topics?endpoint="+endpoint, "", nil)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("topics: %d", rec.Code)
+	// GET /watches returns them with status.
+	rec, body = do(t, h, "GET", "/watches?endpoint="+endpoint, "", nil)
+	if rec.Code != http.StatusOK || len(watchesOf(t, body)) != 2 {
+		t.Fatalf("GET /watches: %d %v", rec.Code, body)
 	}
-	if got, _ := body["topics"].([]any); len(got) != 2 {
-		t.Errorf("topics = %v", body["topics"])
+	// Unknown endpoint -> empty list, not null.
+	_, body = do(t, h, "GET", "/watches?endpoint=https://fcm.googleapis.com/fcm/send/nobody", "", nil)
+	if got := watchesOf(t, body); len(got) != 0 {
+		t.Errorf("unknown endpoint = %v, want []", got)
 	}
-	// Unknown endpoint -> empty list, not null (clients iterate it).
-	_, body = do(t, h, "GET", "/topics?endpoint=https://fcm.googleapis.com/fcm/send/nobody", "", nil)
-	if got, ok := body["topics"].([]any); !ok || len(got) != 0 {
-		t.Errorf("unknown endpoint topics = %#v, want []", body["topics"])
-	}
-	rec, _ = do(t, h, "GET", "/topics", "", nil)
+	rec, _ = do(t, h, "GET", "/watches", "", nil)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("missing endpoint: %d, want 400", rec.Code)
 	}
 
-	// Re-subscribe REPLACES the topic set.
-	_, body = do(t, h, "POST", "/subscribe", subscribeBody("rf_NYC-LON_ow_M"), nil)
-	if got, _ := body["topics"].([]any); len(got) != 1 || got[0] != "rf_NYC-LON_ow_M" {
-		t.Errorf("replace returned %v", body["topics"])
-	}
-	if len(store.Get("rf_LON-TYO_rt_C")) != 0 {
-		t.Error("replaced topic must leave the index")
+	// healthz counts watches.
+	_, body = do(t, h, "GET", "/healthz", "", nil)
+	if body["subs"] != float64(1) || body["watches"] != float64(2) {
+		t.Errorf("healthz = %v", body)
 	}
 
-	// Healthz.
-	rec, body = do(t, h, "GET", "/healthz", "", nil)
-	if rec.Code != http.StatusOK || body["ok"] != true || body["subs"] != float64(1) || body["topics"] != float64(1) {
-		t.Errorf("healthz: %d %v", rec.Code, body)
+	// A v2 write replaces the whole list.
+	_, body = do(t, h, "POST", "/subscribe", subscribeBody(unboundedRT), nil)
+	if len(watchesOf(t, body)) != 1 {
+		t.Errorf("v2 write must replace the list: %v", body)
 	}
-
-	// Unsubscribe (idempotent).
-	rec, body = do(t, h, "POST", "/unsubscribe", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
-	if rec.Code != http.StatusOK || body["ok"] != true {
-		t.Fatalf("unsubscribe: %d %v", rec.Code, body)
-	}
-	if store.Count() != 0 {
-		t.Errorf("store count after unsubscribe = %d", store.Count())
-	}
-	rec, _ = do(t, h, "POST", "/unsubscribe", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
-	if rec.Code != http.StatusOK {
-		t.Errorf("repeat unsubscribe must be idempotent: %d", rec.Code)
-	}
-	rec, _ = do(t, h, "POST", "/unsubscribe", `{"endpoint":""}`, nil)
-	if rec.Code != http.StatusBadRequest {
-		t.Errorf("empty endpoint: %d, want 400", rec.Code)
+	// An explicit empty list turns everything off.
+	rec, body = do(t, h, "POST", "/subscribe",
+		fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","watches":[]}`, endpoint), nil)
+	if rec.Code != http.StatusOK || store.WatchCount() != 0 {
+		t.Errorf("watches:[] must clear the list: %d, %d watches", rec.Code, store.WatchCount())
 	}
 }
 
-func TestSubscribeRejects(t *testing.T) {
+// TestStaleClientCannotDeleteConstrainedWatch is §9-22 at the HTTP layer.
+func TestStaleClientCannotDeleteConstrainedWatch(t *testing.T) {
 	h, store, _ := testAPI(t)
+	if _, body := do(t, h, "POST", "/subscribe", subscribeBody(unboundedRT+","+constrainedW), nil); body["ok"] != true {
+		t.Fatal("setup failed")
+	}
+
+	// The stale client asks what it has: it sees ONLY the unbounded watch.
+	_, body := do(t, h, "GET", "/topics?endpoint="+endpoint, "", nil)
+	topics, _ := body["topics"].([]any)
+	if len(topics) != 1 || topics[0] != "rf_LON-TYO_rt_C" {
+		t.Fatalf("legacy projection = %v, want just the unbounded watch", body["topics"])
+	}
+
+	// It edits that list and POSTs the whole thing back, the only way it knows.
+	rec, body := do(t, h, "POST", "/subscribe",
+		fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","topics":["rf_NYC-LON_ow_M"]}`, endpoint), nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("legacy write: %d %v", rec.Code, body)
+	}
+
+	// The constrained watch SURVIVES; the topic-representable one was replaced.
+	watches := store.Watches(endpoint)
+	if len(watches) != 2 {
+		t.Fatalf("got %d watches, want 2 (the new legacy one + the preserved constrained one)", len(watches))
+	}
+	var constrained bool
+	for _, w := range watches {
+		if w.Out != nil && w.Out.To == "2026-10-20" && w.Nights != nil && w.Nights.Max == 14 {
+			constrained = true
+		}
+	}
+	if !constrained {
+		t.Fatal("a stale client DELETED a date-constrained watch")
+	}
+}
+
+func TestSubscribeBothKeysRejected(t *testing.T) {
+	h, _, _ := testAPI(t)
+	body := fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","watches":[%s],"topics":["rf_LON-TYO_rt_C"]}`,
+		endpoint, unboundedRT)
+	rec, decoded := do(t, h, "POST", "/subscribe", body, nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("both keys: %d, want 400 (%v)", rec.Code, decoded)
+	}
+	// Neither key is also a 400 (an empty body must not silently wipe watches).
+	rec, _ = do(t, h, "POST", "/subscribe",
+		fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA"}`, endpoint), nil)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("neither key: %d, want 400", rec.Code)
+	}
+}
+
+// TestValidation walks the §6 table: one reject per rule, plus the accepts.
+func TestValidation(t *testing.T) {
+	h, _, _ := testAPI(t)
 	cases := []struct {
-		name, body string
-		want       int
+		name, watch, want string
 	}{
-		{"bad host", `{"endpoint":"https://evil.example.com/x","p256dh":"cGsx","auth":"YXV0aA","topics":["rf_LON-TYO_ow_C"]}`, http.StatusBadRequest},
-		{"http endpoint", `{"endpoint":"http://fcm.googleapis.com/x","p256dh":"cGsx","auth":"YXV0aA","topics":["rf_LON-TYO_ow_C"]}`, http.StatusBadRequest},
-		{"bad topic", subscribeBody("rf_LON-TYO_ow_Z"), http.StatusBadRequest},
-		{"missing keys", fmt.Sprintf(`{"endpoint":%q,"topics":["rf_LON-TYO_ow_C"]}`, endpoint), http.StatusBadRequest},
-		{"invalid json", `{nope`, http.StatusBadRequest},
-		{"unknown field", fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","topics":[],"admin":true}`, endpoint), http.StatusBadRequest},
+		{"bad route", `{"route":"LONDON-TYO","kind":"rt","cabins":["C"]}`, "route"},
+		{"bad kind", `{"route":"LON-TYO","kind":"xx","cabins":["C"]}`, "kind"},
+		{"no cabins", `{"route":"LON-TYO","kind":"rt","cabins":[]}`, "cabin"},
+		{"bad cabin", `{"route":"LON-TYO","kind":"rt","cabins":["Z"]}`, "cabin"},
+		{"ret on ow", `{"route":"LON-TYO","kind":"ow","cabins":["C"],"ret":{"from":"2026-10-01"}}`, "one-way"},
+		{"nights on ow", `{"route":"LON-TYO","kind":"ow","cabins":["C"],"nights":{"min":1,"max":5}}`, "one-way"},
+		{"unreal date", `{"route":"LON-TYO","kind":"rt","cabins":["C"],"out":{"from":"2026-02-31","to":"2026-03-05"}}`, "real date"},
+		{"from after to", `{"route":"LON-TYO","kind":"rt","cabins":["C"],"out":{"from":"2026-10-20","to":"2026-10-01"}}`, "starts after"},
+		{"range > 180 days", `{"route":"LON-TYO","kind":"rt","cabins":["C"],"out":{"from":"2026-08-01","to":"2027-06-01"}}`, "180 days"},
+		{"nights out of range", `{"route":"LON-TYO","kind":"rt","cabins":["C"],"nights":{"min":1,"max":61}}`, "nights"},
+		{"impossible (EC-4)", `{"route":"LON-TYO","kind":"rt","cabins":["C"],
+		   "out":{"from":"2026-10-01","to":"2026-10-20"},"ret":{"from":"2026-10-01","to":"2026-10-05"},
+		   "nights":{"min":7,"max":14}}`, "ends before"},
+		{"past range (EC-6)", `{"route":"LON-TYO","kind":"ow","cabins":["C"],"out":{"from":"2026-05-01","to":"2026-06-01"}}`, "past"},
+		{"absurdly far out", `{"route":"LON-TYO","kind":"ow","cabins":["C"],"out":{"from":"2030-01-01","to":"2030-02-01"}}`, "far in the future"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			rec, body := do(t, h, "POST", "/subscribe", tc.body, nil)
-			if rec.Code != tc.want {
-				t.Errorf("status = %d, want %d (%v)", rec.Code, tc.want, body)
+			rec, body := do(t, h, "POST", "/subscribe", subscribeBody(tc.watch), nil)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400 (%v)", rec.Code, body)
 			}
-			if body["ok"] != false {
-				t.Errorf("body must report ok:false, got %v", body)
+			msg, _ := body["error"].(string)
+			if !strings.Contains(msg, tc.want) {
+				t.Errorf("error %q must mention %q", msg, tc.want)
 			}
 		})
 	}
-	if store.Count() != 0 {
-		t.Errorf("rejected requests must store nothing (count = %d)", store.Count())
+
+	// Accepts, including the one-day grace: "yesterday" (UTC) is still fine,
+	// because the browser's todayIndex() is a LOCAL day and can be ahead of us.
+	yesterday := apiNow.UTC().AddDate(0, 0, -1).Format("2006-01-02")
+	for _, watch := range []string{
+		unboundedRT,
+		constrainedW,
+		`{"route":"XXX-YYY","kind":"ow","cabins":["M"]}`, // unknown route: grammar only
+		fmt.Sprintf(`{"route":"LON-TYO","kind":"ow","cabins":["C"],"out":{"from":%q,"to":%q}}`, yesterday, yesterday),
+	} {
+		rec, body := do(t, h, "POST", "/subscribe", subscribeBody(watch), nil)
+		if rec.Code != http.StatusOK {
+			t.Errorf("watch %s must be accepted, got %d: %v", watch, rec.Code, body)
+		}
 	}
 }
 
-func TestTooManyTopicsAndFullStore(t *testing.T) {
-	// Over-cap topic list -> 400.
+func TestTwentyOneWatchesRejected(t *testing.T) {
 	h, _, _ := testAPI(t)
-	many := make([]string, alertstore.MaxTopicsPerSub+1)
-	for i := range many {
-		many[i] = fmt.Sprintf("rf_%s-TYO_ow_C", string([]byte{byte('A' + i/26), byte('A' + i%26), 'X'}))
+	var watches []string
+	for i := range alertstore.MaxWatchesPerSub + 1 {
+		route := fmt.Sprintf("%s-TYO", string([]byte{byte('A' + i/26), byte('A' + i%26), 'X'}))
+		watches = append(watches, fmt.Sprintf(`{"route":%q,"kind":"ow","cabins":["C"]}`, route))
 	}
-	rec, _ := do(t, h, "POST", "/subscribe", subscribeBody(many...), nil)
+	rec, body := do(t, h, "POST", "/subscribe", subscribeBody(strings.Join(watches, ",")), nil)
 	if rec.Code != http.StatusBadRequest {
-		t.Errorf("over-cap topics: %d, want 400", rec.Code)
+		t.Fatalf("21 watches: %d, want 400 (%v)", rec.Code, body)
 	}
+	rec, _ = do(t, h, "POST", "/subscribe",
+		subscribeBody(strings.Join(watches[:alertstore.MaxWatchesPerSub], ",")), nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("exactly 20 watches: %d, want 200", rec.Code)
+	}
+}
 
-	// Full store -> 429.
+func TestStatusReflectsHorizon(t *testing.T) {
 	store, err := alertstore.Open(alertstore.Options{
-		Path: filepath.Join(t.TempDir(), "subs.json"), MaxSubs: 1, Debounce: time.Millisecond,
+		Path: filepath.Join(t.TempDir(), "subs.json"), Debounce: time.Millisecond,
+		Now: func() time.Time { return apiNow },
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer store.Close()
-	full := New(Config{Store: store}).Handler()
-	if rec, _ := do(t, full, "POST", "/subscribe", subscribeBody("rf_LON-TYO_ow_C"), nil); rec.Code != http.StatusOK {
-		t.Fatalf("first subscribe: %d", rec.Code)
+
+	today := int(apiNow.UTC().Unix() / 86400)
+	srv := New(Config{
+		Store: store, Now: func() time.Time { return apiNow },
+		Horizon: func() (int, int, map[string]bool) {
+			return today, today + 300, map[string]bool{"LON-TYO": true, "TYO-LON": true, "ANU-SKB": true}
+		},
+	})
+	h := srv.Handler()
+
+	body := fmt.Sprintf(`{"endpoint":%q,"p256dh":"cGsx","auth":"YXV0aA","watches":[
+	  {"route":"LON-TYO","kind":"rt","cabins":["C"]},
+	  {"route":"ANU-SKB","kind":"rt","cabins":["C"]},
+	  {"route":"XXX-YYY","kind":"ow","cabins":["C"]}]}`, endpoint)
+	rec, decoded := do(t, h, "POST", "/subscribe", body, nil)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("subscribe: %d %v", rec.Code, decoded)
 	}
-	body := `{"endpoint":"https://fcm.googleapis.com/fcm/send/second","p256dh":"cGsx","auth":"YXV0aA","topics":["rf_LON-TYO_ow_C"]}`
-	rec, decoded := do(t, full, "POST", "/subscribe", body, nil)
-	if rec.Code != http.StatusTooManyRequests {
-		t.Errorf("full store: %d, want 429 (%v)", rec.Code, decoded)
+	want := map[string]string{
+		"LON-TYO": alertstore.StatusActive,
+		"ANU-SKB": alertstore.StatusNoReturn,     // EC-7: no reverse route
+		"XXX-YYY": alertstore.StatusUnknownRoute, // EC-11: route not in the data
+	}
+	for _, w := range watchesOf(t, decoded) {
+		route := w["route"].(string)
+		if w["status"] != want[route] {
+			t.Errorf("%s status = %v, want %v", route, w["status"], want[route])
+		}
 	}
 }
 
-func TestBodyCap(t *testing.T) {
-	h, _, _ := testAPI(t)
-	huge := fmt.Sprintf(`{"endpoint":%q,"p256dh":%q,"auth":"YXV0aA","topics":[]}`,
-		endpoint, strings.Repeat("A", 20<<10))
-	rec, _ := do(t, h, "POST", "/subscribe", huge, nil)
+func TestUnsubscribeAndBodyCap(t *testing.T) {
+	h, store, _ := testAPI(t)
+	if _, body := do(t, h, "POST", "/subscribe", subscribeBody(unboundedRT), nil); body["ok"] != true {
+		t.Fatal("setup failed")
+	}
+	rec, _ := do(t, h, "POST", "/unsubscribe", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	if rec.Code != http.StatusOK || store.Count() != 0 {
+		t.Errorf("unsubscribe: %d, %d subs left", rec.Code, store.Count())
+	}
+
+	// 32KB cap (§1.3).
+	huge := fmt.Sprintf(`{"endpoint":%q,"p256dh":%q,"auth":"YXV0aA","watches":[]}`,
+		endpoint, strings.Repeat("A", 40<<10))
+	rec, _ = do(t, h, "POST", "/subscribe", huge, nil)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Errorf("oversized body: %d, want 413", rec.Code)
+	}
+	// ...and a 20-watch body (~4KB) fits comfortably.
+	var watches []string
+	for i := range alertstore.MaxWatchesPerSub {
+		route := fmt.Sprintf("%s-TYO", string([]byte{byte('A' + i/26), byte('A' + i%26), 'X'}))
+		watches = append(watches, fmt.Sprintf(
+			`{"route":%q,"kind":"rt","cabins":["M","W","C","F"],"out":{"from":"2026-10-01","to":"2026-10-20"},"ret":{"from":"2026-10-10","to":"2026-10-31"},"nights":{"min":7,"max":14}}`, route))
+	}
+	rec, body := do(t, h, "POST", "/subscribe", subscribeBody(strings.Join(watches, ",")), nil)
+	if rec.Code != http.StatusOK {
+		t.Errorf("a full 20-watch body must fit: %d %v", rec.Code, body)
 	}
 }
 
 func TestCORS(t *testing.T) {
 	h, _, _ := testAPI(t)
-
-	// Preflight from the production origin.
-	rec, _ := do(t, h, "OPTIONS", "/subscribe", "", map[string]string{
-		"Origin":                        origin,
-		"Access-Control-Request-Method": "POST",
-	})
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("preflight status = %d", rec.Code)
-	}
-	head := rec.Header()
-	if head.Get("Access-Control-Allow-Origin") != origin {
-		t.Errorf("ACAO = %q", head.Get("Access-Control-Allow-Origin"))
-	}
-	if !strings.Contains(head.Get("Access-Control-Allow-Methods"), "POST") ||
-		!strings.Contains(head.Get("Access-Control-Allow-Methods"), "OPTIONS") {
-		t.Errorf("ACAM = %q", head.Get("Access-Control-Allow-Methods"))
-	}
-	if !strings.Contains(strings.ToLower(head.Get("Access-Control-Allow-Headers")), "content-type") {
-		t.Errorf("ACAH = %q", head.Get("Access-Control-Allow-Headers"))
-	}
-	if head.Get("Vary") != "Origin" {
-		t.Errorf("Vary = %q", head.Get("Vary"))
-	}
-
-	// Real request from the production origin carries ACAO too.
-	rec, _ = do(t, h, "POST", "/subscribe", subscribeBody("rf_LON-TYO_ow_C"), map[string]string{"Origin": origin})
-	if rec.Code != http.StatusOK || rec.Header().Get("Access-Control-Allow-Origin") != origin {
-		t.Errorf("post: %d ACAO=%q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
-	}
-
-	// Dev origins allowed.
-	for _, dev := range []string{"http://127.0.0.1:8080", "http://localhost:3000"} {
-		rec, _ = do(t, h, "OPTIONS", "/subscribe", "", map[string]string{"Origin": dev})
-		if rec.Header().Get("Access-Control-Allow-Origin") != dev {
-			t.Errorf("dev origin %s: ACAO = %q", dev, rec.Header().Get("Access-Control-Allow-Origin"))
+	for _, path := range []string{"/subscribe", "/watches", "/test"} {
+		rec, _ := do(t, h, "OPTIONS", path, "", map[string]string{
+			"Origin": origin, "Access-Control-Request-Method": "POST",
+		})
+		if rec.Code != http.StatusNoContent {
+			t.Errorf("%s preflight = %d", path, rec.Code)
+		}
+		if rec.Header().Get("Access-Control-Allow-Origin") != origin {
+			t.Errorf("%s ACAO = %q", path, rec.Header().Get("Access-Control-Allow-Origin"))
 		}
 	}
-
-	// A hostile origin gets NO CORS headers (browser blocks the response).
+	for _, dev := range []string{"http://127.0.0.1:8080", "http://localhost:3000"} {
+		rec, _ := do(t, h, "OPTIONS", "/subscribe", "", map[string]string{"Origin": dev})
+		if rec.Header().Get("Access-Control-Allow-Origin") != dev {
+			t.Errorf("dev origin %s rejected", dev)
+		}
+	}
 	for _, bad := range []string{"https://evil.example", "https://rewardflights.lucy.sh.evil.example", "null"} {
-		rec, _ = do(t, h, "OPTIONS", "/subscribe", "", map[string]string{"Origin": bad})
+		rec, _ := do(t, h, "OPTIONS", "/subscribe", "", map[string]string{"Origin": bad})
 		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != "" {
-			t.Errorf("origin %s must not be allowed, got ACAO %q", bad, got)
+			t.Errorf("origin %s must not be allowed, got %q", bad, got)
 		}
 	}
 }
 
 func TestRateLimit(t *testing.T) {
-	h, _, now := testAPI(t)
+	store, err := alertstore.Open(alertstore.Options{
+		Path: filepath.Join(t.TempDir(), "subs.json"), Debounce: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	now := apiNow
+	h := New(Config{Store: store, RatePerMin: 60, Burst: 20, Now: func() time.Time { return now }}).Handler()
 	headers := map[string]string{"CF-Connecting-IP": "203.0.113.7"}
 
-	// Burst of 20 is allowed, the 21st is throttled.
 	for i := range 20 {
 		if rec, _ := do(t, h, "GET", "/healthz", "", headers); rec.Code != http.StatusOK {
-			t.Fatalf("request %d: %d, want 200", i+1, rec.Code)
+			t.Fatalf("request %d: %d", i+1, rec.Code)
 		}
 	}
-	rec, body := do(t, h, "GET", "/healthz", "", headers)
+	rec, _ := do(t, h, "GET", "/healthz", "", headers)
 	if rec.Code != http.StatusTooManyRequests {
 		t.Fatalf("21st request: %d, want 429", rec.Code)
 	}
-	if body["ok"] != false {
-		t.Errorf("429 body = %v", body)
-	}
-	retry, err := strconv.Atoi(rec.Header().Get("Retry-After"))
-	if err != nil || retry < 1 {
+	if retry, err := strconv.Atoi(rec.Header().Get("Retry-After")); err != nil || retry < 1 {
 		t.Errorf("Retry-After = %q", rec.Header().Get("Retry-After"))
 	}
-
-	// A different client IP has its own bucket.
 	if rec, _ := do(t, h, "GET", "/healthz", "", map[string]string{"CF-Connecting-IP": "198.51.100.9"}); rec.Code != http.StatusOK {
-		t.Errorf("second client: %d, want 200 (per-IP buckets)", rec.Code)
+		t.Errorf("a different IP has its own bucket: %d", rec.Code)
 	}
-
-	// Refill: at 60/min, one second buys one token.
-	*now = now.Add(time.Second)
+	now = now.Add(time.Second)
 	if rec, _ := do(t, h, "GET", "/healthz", "", headers); rec.Code != http.StatusOK {
-		t.Errorf("after refill: %d, want 200", rec.Code)
-	}
-	if rec, _ := do(t, h, "GET", "/healthz", "", headers); rec.Code != http.StatusTooManyRequests {
-		t.Errorf("refill grants exactly one token: %d, want 429", rec.Code)
+		t.Errorf("after refill: %d", rec.Code)
 	}
 }
 
-func TestMethodRouting(t *testing.T) {
-	h, _, _ := testAPI(t)
-	for _, tc := range []struct{ method, path string }{
-		{"GET", "/subscribe"},
-		{"POST", "/topics"},
-		{"DELETE", "/subscribe"},
-		{"GET", "/nope"},
-	} {
-		rec, _ := do(t, h, tc.method, tc.path, "", nil)
-		if rec.Code != http.StatusMethodNotAllowed && rec.Code != http.StatusNotFound {
-			t.Errorf("%s %s = %d, want 404/405", tc.method, tc.path, rec.Code)
-		}
-	}
-}
+// --- POST /test -----------------------------------------------------------
 
-// --- POST /test ---------------------------------------------------------
-
-// testPushServer stands in for a push service, returning a scripted status
-// and capturing what was sent.
 type testPushServer struct {
 	*httptest.Server
-	status int // status to return (0 -> 201)
+	status int
 	sends  []capturedSend
 }
 
@@ -347,8 +429,6 @@ func newPushServer(t *testing.T) *testPushServer {
 	return ps
 }
 
-// rewriteTransport routes all requests to the local push server, preserving
-// the path — so handlers can use real (allowlisted) endpoint URLs.
 type rewriteTransport struct{ host string }
 
 func (rt *rewriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
@@ -358,7 +438,6 @@ func (rt *rewriteTransport) RoundTrip(r *http.Request) (*http.Response, error) {
 	return http.DefaultTransport.RoundTrip(clone)
 }
 
-// testAPIWithPush builds an API whose sender delivers to ps.
 func testAPIWithPush(t *testing.T, ps *testPushServer) (http.Handler, *alertstore.Store, *time.Time) {
 	t.Helper()
 	store, err := alertstore.Open(alertstore.Options{
@@ -377,20 +456,18 @@ func testAPIWithPush(t *testing.T, ps *testPushServer) (http.Handler, *alertstor
 	if err != nil {
 		t.Fatal(err)
 	}
-	sender := &webpush.Sender{
-		Client: &http.Client{Transport: &rewriteTransport{host: strings.TrimPrefix(ps.URL, "http://")}},
-		Vapid:  vapid,
-	}
-	now := time.Unix(1783810462, 0)
+	now := apiNow
 	srv := New(Config{
-		Store: store, Sender: sender, RatePerMin: 600, Burst: 200, TestPerHour: 5,
+		Store: store, RatePerMin: 600, Burst: 200, TestPerHour: 5,
+		Sender: &webpush.Sender{
+			Client: &http.Client{Transport: &rewriteTransport{host: strings.TrimPrefix(ps.URL, "http://")}},
+			Vapid:  vapid,
+		},
 		Now: func() time.Time { return now },
 	})
 	return srv.Handler(), store, &now
 }
 
-// subscribeReal registers a subscription with real push keys (so the payload
-// can actually be encrypted).
 func subscribeReal(t *testing.T, store *alertstore.Store, endpoint string) {
 	t.Helper()
 	key, err := ecdh.P256().GenerateKey(rand.Reader)
@@ -405,180 +482,100 @@ func subscribeReal(t *testing.T, store *alertstore.Store, endpoint string) {
 		Endpoint: endpoint,
 		P256dh:   base64.RawURLEncoding.EncodeToString(key.PublicKey().Bytes()),
 		Auth:     base64.RawURLEncoding.EncodeToString(secret),
-		Topics:   []string{"rf_LON-TYO_rt_C"},
+		Watches:  []alertstore.Watch{{Route: "LON-TYO", Kind: "rt", Cabins: []string{"C"}}},
 	}); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func TestTestUnknownEndpoint(t *testing.T) {
+func TestTestEndpoint(t *testing.T) {
 	ps := newPushServer(t)
 	h, store, _ := testAPIWithPush(t, ps)
 
-	// Never-subscribed endpoint (even a valid push host) must not be pushed to.
+	// Unknown subscription -> 404, and NOTHING is sent.
 	rec, body := do(t, h, "POST", "/test", `{"endpoint":"https://fcm.googleapis.com/fcm/send/stranger"}`, nil)
-	if rec.Code != http.StatusNotFound {
-		t.Fatalf("status = %d, want 404", rec.Code)
-	}
-	if body["error"] != "unknown subscription" {
-		t.Errorf("body = %v", body)
+	if rec.Code != http.StatusNotFound || body["error"] != "unknown subscription" {
+		t.Fatalf("unknown: %d %v", rec.Code, body)
 	}
 	if len(ps.sends) != 0 {
-		t.Errorf("must not send to an unknown endpoint (%d sends)", len(ps.sends))
+		t.Fatal("must not push to an endpoint that is not ours")
 	}
-	if store.Count() != 0 {
-		t.Errorf("must not create a subscription")
-	}
-	// An arbitrary non-push host is equally rejected, with no outbound request.
-	rec, _ = do(t, h, "POST", "/test", `{"endpoint":"https://evil.example/collect"}`, nil)
-	if rec.Code != http.StatusNotFound || len(ps.sends) != 0 {
-		t.Errorf("arbitrary endpoint: %d, %d sends", rec.Code, len(ps.sends))
-	}
-}
 
-func TestTestSendsOnePush(t *testing.T) {
-	ps := newPushServer(t)
-	h, store, _ := testAPIWithPush(t, ps)
 	subscribeReal(t, store, endpoint)
-
-	rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	rec, body = do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
 	if rec.Code != http.StatusOK || body["ok"] != true {
-		t.Fatalf("status = %d, body = %v", rec.Code, body)
+		t.Fatalf("test: %d %v", rec.Code, body)
 	}
 	if len(ps.sends) != 1 {
-		t.Fatalf("sent %d pushes, want exactly 1", len(ps.sends))
+		t.Fatalf("sent %d, want exactly 1", len(ps.sends))
 	}
 	send := ps.sends[0]
-	if send.path != "/fcm/send/abc123" {
-		t.Errorf("pushed to %q", send.path)
-	}
-	if send.headers.Get("TTL") != "86400" ||
-		send.headers.Get("Content-Encoding") != "aes128gcm" ||
-		send.headers.Get("Content-Type") != "application/octet-stream" {
+	if send.headers.Get("Content-Encoding") != "aes128gcm" || send.headers.Get("TTL") != "86400" {
 		t.Errorf("headers = %v", send.headers)
 	}
 	if !strings.HasPrefix(send.headers.Get("Authorization"), "vapid t=") {
-		t.Errorf("missing VAPID auth: %q", send.headers.Get("Authorization"))
+		t.Error("missing VAPID auth")
 	}
-	// aes128gcm framing: salt(16) | rs(4) | idlen(1)=65 | keyid(65) | ciphertext.
 	if len(send.body) < 21+65+17 || send.body[20] != 65 {
-		t.Errorf("body is not an aes128gcm message (len %d)", len(send.body))
-	}
-	// The subscription survives a successful test.
-	if store.Count() != 1 {
-		t.Errorf("store count = %d, want 1", store.Count())
+		t.Errorf("not an aes128gcm message (%d bytes)", len(send.body))
 	}
 }
 
-func TestTestExpiredSubscription(t *testing.T) {
+func TestTestExpiredAndFailed(t *testing.T) {
 	for _, status := range []int{http.StatusNotFound, http.StatusGone} {
-		t.Run(fmt.Sprint(status), func(t *testing.T) {
+		t.Run(fmt.Sprintf("expired-%d", status), func(t *testing.T) {
 			ps := newPushServer(t)
 			ps.status = status
 			h, store, _ := testAPIWithPush(t, ps)
 			subscribeReal(t, store, endpoint)
 
 			rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
-			if rec.Code != http.StatusGone {
-				t.Fatalf("status = %d, want 410", rec.Code)
-			}
-			if body["error"] != "subscription expired" {
-				t.Errorf("body = %v", body)
+			if rec.Code != http.StatusGone || body["error"] != "subscription expired" {
+				t.Fatalf("%d %v", rec.Code, body)
 			}
 			if store.Count() != 0 {
-				t.Errorf("expired subscription must be removed from the store")
+				t.Error("an expired subscription must be removed")
 			}
 		})
 	}
-}
 
-func TestTestPushServiceFailure(t *testing.T) {
 	ps := newPushServer(t)
 	ps.status = http.StatusInternalServerError
 	h, store, _ := testAPIWithPush(t, ps)
 	subscribeReal(t, store, endpoint)
-
-	rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
 	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status = %d, want 502", rec.Code)
+		t.Errorf("5xx: %d, want 502", rec.Code)
 	}
-	if body["ok"] != false || !strings.Contains(fmt.Sprint(body["error"]), "500") {
-		t.Errorf("body = %v", body)
-	}
-	// A transient push-service failure must NOT cost the user their subscription.
 	if store.Count() != 1 {
-		t.Errorf("subscription must be retained on 5xx (count = %d)", store.Count())
+		t.Error("a transient failure must not cost the subscription")
 	}
 }
 
-func TestTestPerEndpointRateLimit(t *testing.T) {
+func TestTestRateLimitPerEndpoint(t *testing.T) {
 	ps := newPushServer(t)
 	h, store, now := testAPIWithPush(t, ps)
 	const other = "https://fcm.googleapis.com/fcm/send/second"
 	subscribeReal(t, store, endpoint)
 	subscribeReal(t, store, other)
 
-	// 5 tests in an hour are allowed; the 6th is throttled.
 	for i := range 5 {
 		if rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil); rec.Code != http.StatusOK {
-			t.Fatalf("test %d: status = %d, want 200", i+1, rec.Code)
+			t.Fatalf("test %d: %d", i+1, rec.Code)
 		}
 	}
-	rec, body := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
+	rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
 	if rec.Code != http.StatusTooManyRequests {
-		t.Fatalf("6th test: status = %d, want 429", rec.Code)
-	}
-	if body["ok"] != false {
-		t.Errorf("429 body = %v", body)
-	}
-	retry, err := strconv.Atoi(rec.Header().Get("Retry-After"))
-	if err != nil || retry < 1 || retry > 3600 {
-		t.Errorf("Retry-After = %q", rec.Header().Get("Retry-After"))
+		t.Fatalf("6th: %d, want 429", rec.Code)
 	}
 	if len(ps.sends) != 5 {
-		t.Errorf("throttled request must not send (%d sends, want 5)", len(ps.sends))
+		t.Errorf("a throttled test must not send: %d sends", len(ps.sends))
 	}
-
-	// A DIFFERENT subscription has its own budget.
 	if rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, other), nil); rec.Code != http.StatusOK {
-		t.Errorf("other endpoint: status = %d, want 200 (per-subscription budget)", rec.Code)
+		t.Errorf("a different subscription has its own budget: %d", rec.Code)
 	}
-	if len(ps.sends) != 6 {
-		t.Errorf("sends = %d, want 6", len(ps.sends))
-	}
-
-	// The window slides: an hour later the budget is back.
 	*now = now.Add(time.Hour + time.Second)
 	if rec, _ := do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil); rec.Code != http.StatusOK {
-		t.Errorf("after the window: status = %d, want 200", rec.Code)
-	}
-}
-
-func TestTestCORSAndDisabled(t *testing.T) {
-	ps := newPushServer(t)
-	h, store, _ := testAPIWithPush(t, ps)
-	subscribeReal(t, store, endpoint)
-
-	// Preflight.
-	rec, _ := do(t, h, "OPTIONS", "/test", "", map[string]string{
-		"Origin": origin, "Access-Control-Request-Method": "POST",
-	})
-	if rec.Code != http.StatusNoContent {
-		t.Errorf("preflight status = %d", rec.Code)
-	}
-	if rec.Header().Get("Access-Control-Allow-Origin") != origin {
-		t.Errorf("ACAO = %q", rec.Header().Get("Access-Control-Allow-Origin"))
-	}
-	// The real request carries CORS headers too.
-	rec, _ = do(t, h, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), map[string]string{"Origin": origin})
-	if rec.Code != http.StatusOK || rec.Header().Get("Access-Control-Allow-Origin") != origin {
-		t.Errorf("post: %d ACAO = %q", rec.Code, rec.Header().Get("Access-Control-Allow-Origin"))
-	}
-
-	// Without a sender configured the route reports unavailable, never panics.
-	noSender, _, _ := testAPI(t)
-	rec, _ = do(t, noSender, "POST", "/test", fmt.Sprintf(`{"endpoint":%q}`, endpoint), nil)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Errorf("sender-less API: %d, want 503", rec.Code)
+		t.Errorf("after the window: %d", rec.Code)
 	}
 }

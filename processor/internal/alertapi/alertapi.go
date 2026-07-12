@@ -32,6 +32,7 @@ type Config struct {
 	Addr        string            // listen address, e.g. 127.0.0.1:8787
 	Store       *alertstore.Store // subscription store (required)
 	Sender      *webpush.Sender   // push sender for POST /test; nil disables that route
+	Horizon     HorizonFunc       // current data horizon, for watch status; nil -> skip those checks
 	RatePerMin  int               // requests per minute per client (default 60)
 	Burst       int               // token-bucket burst (default 20)
 	TestPerHour int               // POST /test sends per hour per subscription (default 5)
@@ -39,8 +40,9 @@ type Config struct {
 	Now         func() time.Time // injected in tests; defaults to time.Now
 }
 
-// maxBody bounds request bodies: a subscription with 60 topics is ~3KB.
-const maxBody = 16 << 10
+// maxBody bounds request bodies: 20 watches is ~4KB, so 32KB leaves headroom
+// (ALERTS-SPEC §1.3).
+const maxBody = 32 << 10
 
 // allowedOrigins is the exact production origin; dev origins are matched
 // separately (any port on loopback).
@@ -96,6 +98,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /subscribe", s.handleSubscribe)
 	mux.HandleFunc("POST /unsubscribe", s.handleUnsubscribe)
 	mux.HandleFunc("POST /test", s.handleTest)
+	mux.HandleFunc("GET /watches", s.handleWatches)
 	mux.HandleFunc("GET /topics", s.handleTopics)
 	mux.HandleFunc("GET /healthz", s.handleHealth)
 	return s.withCORS(s.withRateLimit(mux))
@@ -122,22 +125,65 @@ func (s *Server) ListenAndServe(ctx context.Context) error {
 	}
 }
 
-// subscribeRequest is the POST /subscribe body.
+// HorizonFunc reports the current data horizon: today's absolute day, one past
+// the last encoded day, and the set of routes present in the bundle. The
+// watcher injects it; a nil func (cold start, tests) means route- and
+// date-dependent statuses are simply not computed.
+type HorizonFunc func() (today, endDay int, routes map[string]bool)
+
+// subscribeRequest is the POST /subscribe body. Watches and Topics are
+// pointers so "absent" is distinguishable from "explicitly empty": sending
+// {"watches": []} means "turn everything off", which is not the same as a
+// legacy client that omits the key entirely.
 type subscribeRequest struct {
-	Endpoint string   `json:"endpoint"`
-	P256dh   string   `json:"p256dh"`
-	Auth     string   `json:"auth"`
-	Topics   []string `json:"topics"`
+	Endpoint string              `json:"endpoint"`
+	P256dh   string              `json:"p256dh"`
+	Auth     string              `json:"auth"`
+	Watches  *[]alertstore.Watch `json:"watches"`
+	Topics   *[]string           `json:"topics"`
 }
 
+// watchOut is a stored watch plus its read-time status.
+type watchOut struct {
+	alertstore.Watch
+	Status string `json:"status"`
+}
+
+// handleSubscribe accepts either the v2 watches list (full replace) or the
+// legacy topics list (merge — §2.2). A stale, cached app.js keeps posting
+// topics; it must be able to edit what it understands without destroying the
+// date-constrained watches it cannot express.
 func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	var req subscribeRequest
 	if !decode(w, r, &req) {
 		return
 	}
-	topics, err := s.cfg.Store.Upsert(alertstore.Subscription{
-		Endpoint: req.Endpoint, P256dh: req.P256dh, Auth: req.Auth, Topics: req.Topics,
-	})
+	if req.Watches != nil && req.Topics != nil {
+		badRequest(w, "send either watches or topics, not both")
+		return
+	}
+	if req.Watches == nil && req.Topics == nil {
+		badRequest(w, "watches or topics is required")
+		return
+	}
+
+	sub := alertstore.Subscription{Endpoint: req.Endpoint, P256dh: req.P256dh, Auth: req.Auth}
+	var (
+		saved []alertstore.Watch
+		err   error
+	)
+	if req.Topics != nil {
+		saved, err = s.cfg.Store.UpsertTopics(sub, *req.Topics)
+	} else {
+		for _, watch := range *req.Watches {
+			if err := s.validateDates(watch); err != nil {
+				badRequest(w, err.Error())
+				return
+			}
+		}
+		sub.Watches = *req.Watches
+		saved, err = s.cfg.Store.Upsert(sub)
+	}
 	switch {
 	case errors.Is(err, alertstore.ErrFull):
 		writeJSON(w, http.StatusTooManyRequests, map[string]any{
@@ -145,13 +191,78 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	case err != nil:
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": err.Error()})
+		badRequest(w, err.Error())
 		return
 	}
-	if topics == nil {
-		topics = []string{}
+	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "watches": s.withStatus(saved)})
+}
+
+// validateDates applies the clock-dependent rules (§6). The store owns every
+// time-independent rule, so a stored watch always reloads cleanly even after
+// its dates fall into the past.
+//
+// Structural validation runs FIRST: "2026-02-31 is not a real date" is a more
+// useful answer than "those dates are in the past", even though both are true.
+func (s *Server) validateDates(watch alertstore.Watch) error {
+	if _, err := alertstore.Normalize(watch); err != nil {
+		return err
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "topics": topics})
+	today := int(s.cfg.Now().UTC().Unix() / 86400)
+	for name, rng := range map[string]*alertstore.Range{"out": watch.Out, "ret": watch.Ret} {
+		if rng == nil {
+			continue
+		}
+		if rng.To != "" {
+			to, err := alertstore.ParseDay(rng.To)
+			if err != nil {
+				return fmt.Errorf("%s.to must be a YYYY-MM-DD date", name)
+			}
+			// One day of grace: todayIndex() in the browser is the user's LOCAL
+			// calendar day, which can be a day ahead of our UTC day (EC-6).
+			if to < today-1 {
+				return fmt.Errorf("your %s dates are in the past", name)
+			}
+		}
+		if rng.From != "" {
+			from, err := alertstore.ParseDay(rng.From)
+			if err != nil {
+				return fmt.Errorf("%s.from must be a YYYY-MM-DD date", name)
+			}
+			if from > today+alertstore.MaxFutureDays {
+				return fmt.Errorf("%s.from is too far in the future", name)
+			}
+		}
+	}
+	return nil
+}
+
+// withStatus annotates watches with their read-time status.
+func (s *Server) withStatus(watches []alertstore.Watch) []watchOut {
+	today := int(s.cfg.Now().UTC().Unix() / 86400)
+	var routes map[string]bool
+	if s.cfg.Horizon != nil {
+		var horizonToday int
+		horizonToday, _, routes = s.cfg.Horizon()
+		if horizonToday > 0 {
+			today = horizonToday
+		}
+	}
+	out := make([]watchOut, 0, len(watches))
+	for _, watch := range watches {
+		out = append(out, watchOut{Watch: watch, Status: watch.Status(today, routes)})
+	}
+	return out
+}
+
+func (s *Server) handleWatches(w http.ResponseWriter, r *http.Request) {
+	endpoint := r.URL.Query().Get("endpoint")
+	if endpoint == "" {
+		badRequest(w, "endpoint is required")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"watches": s.withStatus(s.cfg.Store.Watches(endpoint)),
+	})
 }
 
 func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
@@ -162,7 +273,7 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if req.Endpoint == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "endpoint is required"})
+		badRequest(w, "endpoint is required")
 		return
 	}
 	s.cfg.Store.Remove(req.Endpoint)
@@ -246,10 +357,13 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// handleTopics is the LEGACY projection (§2.2, deprecated): it shows only
+// topic-representable watches. A stale client therefore cannot even see a
+// date-constrained watch, which is precisely why it cannot delete one.
 func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 	endpoint := r.URL.Query().Get("endpoint")
 	if endpoint == "" {
-		writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": "endpoint is required"})
+		badRequest(w, "endpoint is required")
 		return
 	}
 	topics := s.cfg.Store.Topics(endpoint)
@@ -261,9 +375,9 @@ func (s *Server) handleTopics(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleHealth(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
-		"ok":     true,
-		"subs":   s.cfg.Store.Count(),
-		"topics": len(s.cfg.Store.ActiveTopics()),
+		"ok":      true,
+		"subs":    s.cfg.Store.Count(),
+		"watches": s.cfg.Store.WatchCount(),
 	})
 }
 
@@ -285,6 +399,12 @@ func decode(w http.ResponseWriter, r *http.Request, dst any) bool {
 		return false
 	}
 	return true
+}
+
+// badRequest writes a 400 with a human-readable message: these are shown to
+// the user by the bell panel, so they must read like sentences.
+func badRequest(w http.ResponseWriter, msg string) {
+	writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": msg})
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {

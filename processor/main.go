@@ -51,7 +51,6 @@ func main() {
 	alertsTestPerHour := flag.Int("alerts-test-per-hour", 5, "watch mode: POST /test notifications per hour per subscription")
 	alertsCooldown := flag.Duration("alerts-cooldown", 3*time.Hour, "watch mode: minimum off-time before a day re-alerts")
 	alertsBatch := flag.Duration("alerts-batch", time.Hour, "watch mode: minimum interval between publishes per topic")
-	alertsWindow := flag.Int("alerts-window", 30, "watch mode: round-trip return window in nights")
 	flag.Parse()
 
 	if *src == "" || *out == "" {
@@ -70,7 +69,6 @@ func main() {
 				StatePath:    *alertsState,
 				Cooldown:     *alertsCooldown,
 				Batch:        *alertsBatch,
-				Window:       *alertsWindow,
 			},
 			AlertsStore:       *alertsStore,
 			AlertsMaxSubs:     *alertsMaxSubs,

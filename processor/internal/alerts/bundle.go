@@ -64,49 +64,12 @@ func parseBundle(raw []byte) (*bundleState, error) {
 	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen, merged: merged}, nil
 }
 
-// computeOnSets derives, per (type, route, cabin), the set of ABSOLUTE days
-// in [today, horizonEnd) that are "on":
-//
-//   - ow: the outbound day has the cabin.
-//   - rt: additionally some return day r in [d+1, d+window] — r inside both
-//     the reverse route's data and the horizon — has the same cabin on the
-//     reverse route. Emitted only when the reverse route exists at all.
-func computeOnSets(b *bundleState, today, horizonEnd, window int) map[setKey]map[int]bool {
-	on := map[setKey]map[int]bool{}
-	add := func(k setKey, d int) {
-		if on[k] == nil {
-			on[k] = map[int]bool{}
-		}
-		on[k][d] = true
-	}
-	for route, out := range b.merged {
-		rev, hasRev := b.merged[reverseRoute(route)]
-		limit := min(horizonEnd, b.epochDay+len(out))
-		for d := max(today, b.epochDay); d < limit; d++ {
-			bits := out[d-b.epochDay]
-			if bits == 0 {
-				continue
-			}
-			for _, c := range cabinBits {
-				if bits&c.bit == 0 {
-					continue
-				}
-				add(setKey{"ow", route, c.letter}, d)
-				if !hasRev {
-					continue
-				}
-				rLimit := min(d+window, min(horizonEnd, b.epochDay+len(rev))-1)
-				for r := d + 1; r <= rLimit; r++ {
-					if rev[r-b.epochDay]&c.bit != 0 {
-						add(setKey{"rt", route, c.letter}, d)
-						break
-					}
-				}
-			}
-		}
-	}
-	return on
-}
+// cabinOrder is the canonical M W C F ordering, used everywhere cabins are
+// enumerated so that output is deterministic.
+var cabinOrder = []struct {
+	bit    byte
+	letter byte
+}{{1, 'M'}, {2, 'W'}, {4, 'C'}, {8, 'F'}}
 
 // reverseRoute flips ORIG-DEST; empty when the key is not route-shaped.
 func reverseRoute(route string) string {

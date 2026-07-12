@@ -238,6 +238,35 @@ client-side. `/trip/ORIG-DEST` (segmented control navigates to/from the one-way
   (`/from/`) counts round-trippable days (1–30 window) with "outbound only"
   badges.
 
+## Seat alerts
+
+Free, instant Web Push when award space opens on a route someone is watching.
+Full design: [ALERTS-SPEC.md](ALERTS-SPEC.md). In brief:
+
+- An alert is a **watch**: route + direction (round trip / one way) + cabins +
+  *when the person can actually travel* (outbound window, return window, trip
+  length). Unbounded windows mean "any time" — the common case, and the default.
+- A round trip is only reported when **both legs** have space in the **same
+  cabin** inside the trip-length window. The unit of news is a (outbound,
+  return) PAIR, not a day.
+- **Pair-newness reduces to leg-gains**: a pair is newly bookable iff it is
+  bookable now AND at least one of its two legs gained that cabin this cycle.
+  So detection enumerates the handful of changed leg-days and expands each into
+  its window — never the pair space. This is what makes per-subscriber date
+  constraints affordable (~30µs for 1k subscribers × 20 watches).
+  *The pre-2026-07 engine only looked at outbound gains and therefore silently
+  dropped every round trip created by a **return**-leg opening — measured at
+  41% of all newly-bookable round trips over an 18.8h replay of real data.*
+- Anti-spam state is **global, not per-subscriber**: flapping is a property of
+  the data, not the person. Cooldown is derived from an openedAt/closedAt ledger
+  sized by events in the last 3h. Batching is per device (≤1 push/hour, ≤24/day).
+- The site shows a **live match count** for a watch (computed in-browser from the
+  in-memory dataset, zero network), because a well-set date window can be
+  legitimately silent for weeks and would otherwise look broken.
+- Delivery: RFC 8291 + VAPID, sent from the watcher. Subscriptions live on the
+  same host (no third-party store); we keep no account, email, or IP — only a
+  revocable push endpoint.
+
 ## Licensing
 Code (processor + site) is CC BY-NC-SA 4.0. The derived data carries no license
 of its own; each file embeds a `source` provenance block naming the source repo,

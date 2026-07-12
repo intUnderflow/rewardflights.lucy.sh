@@ -18,9 +18,14 @@ const (
 	endpointC = "https://updates.push.services.mozilla.com/wpush/v2/zzz"
 )
 
+var fixedNow = time.Unix(1783810462, 0) // 2026-07-11
+
 func openStore(t *testing.T, path string) *Store {
 	t.Helper()
-	s, err := Open(Options{Path: path, Debounce: time.Millisecond})
+	s, err := Open(Options{
+		Path: path, Debounce: time.Millisecond,
+		Now: func() time.Time { return fixedNow },
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -28,96 +33,366 @@ func openStore(t *testing.T, path string) *Store {
 	return s
 }
 
-func sub(endpoint string, topics ...string) Subscription {
-	return Subscription{Endpoint: endpoint, P256dh: "cGsx", Auth: "YXV0aA", Topics: topics}
+// sub builds a subscription with real-looking (but fake) push keys.
+func sub(endpoint string, watches ...Watch) Subscription {
+	return Subscription{Endpoint: endpoint, P256dh: "cGsx", Auth: "YXV0aA", Watches: watches}
 }
 
-func TestUpsertGetTopicsCount(t *testing.T) {
-	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+func rt(route string, cabins ...string) Watch {
+	return Watch{Route: route, Kind: KindRT, Cabins: cabins}
+}
 
-	topics, err := s.Upsert(sub(endpointA, "rf_LON-TYO_rt_C", "rf_LON-TYO_ow_C", "rf_LON-TYO_rt_C"))
+func ow(route string, cabins ...string) Watch {
+	return Watch{Route: route, Kind: KindOW, Cabins: cabins}
+}
+
+// constrained is the date-bounded watch the whole feature exists for.
+func constrained() Watch {
+	return Watch{
+		Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+		Out:    &Range{From: "2026-10-01", To: "2026-10-20"},
+		Ret:    &Range{From: "2026-10-10", To: "2026-10-31"},
+		Nights: &Nights{Min: 7, Max: 14},
+	}
+}
+
+func TestNormalizeAndID(t *testing.T) {
+	w, err := Normalize(Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"F", "C", "C"}})
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Deduplicated and sorted.
-	if want := []string{"rf_LON-TYO_ow_C", "rf_LON-TYO_rt_C"}; !slices.Equal(topics, want) {
-		t.Errorf("stored topics = %v, want %v", topics, want)
+	if !slices.Equal(w.Cabins, []string{"C", "F"}) {
+		t.Errorf("cabins = %v, want sorted M<W<C<F and deduped", w.Cabins)
 	}
-	if _, err := s.Upsert(sub(endpointB, "rf_LON-TYO_rt_C")); err != nil {
-		t.Fatal(err)
+	if len(w.ID) != 8 {
+		t.Errorf("id = %q, want 8 hex chars", w.ID)
 	}
-
-	if got := s.Get("rf_LON-TYO_rt_C"); len(got) != 2 {
-		t.Errorf("topic index: %d subs, want 2", len(got))
+	// Content-addressed: same content -> same id, regardless of input order.
+	same, _ := Normalize(Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C", "F"}})
+	if same.ID != w.ID {
+		t.Errorf("ids differ for identical content: %s vs %s", same.ID, w.ID)
 	}
-	if got := s.Get("rf_LON-TYO_ow_C"); len(got) != 1 || got[0].Endpoint != endpointA {
-		t.Errorf("topic index: %v", got)
-	}
-	if got := s.Get("rf_NYC-LON_ow_M"); len(got) != 0 {
-		t.Errorf("unknown topic must be empty, got %v", got)
-	}
-	if got := s.Count(); got != 2 {
-		t.Errorf("count = %d, want 2", got)
-	}
-	if got := s.ActiveTopics(); !slices.Equal(got, []string{"rf_LON-TYO_ow_C", "rf_LON-TYO_rt_C"}) {
-		t.Errorf("active topics = %v", got)
-	}
-
-	// Upsert REPLACES the topic set (not a merge) and reindexes.
-	if _, err := s.Upsert(sub(endpointA, "rf_NYC-LON_ow_M")); err != nil {
-		t.Fatal(err)
-	}
-	if got := s.Topics(endpointA); !slices.Equal(got, []string{"rf_NYC-LON_ow_M"}) {
-		t.Errorf("after replace, topics = %v", got)
-	}
-	if got := s.Get("rf_LON-TYO_ow_C"); len(got) != 0 {
-		t.Errorf("stale topic index entry survived: %v", got)
-	}
-	if got := s.Get("rf_LON-TYO_rt_C"); len(got) != 1 || got[0].Endpoint != endpointB {
-		t.Errorf("rt index after replace = %v", got)
-	}
-	if got := s.Count(); got != 2 {
-		t.Errorf("replace must not duplicate: count = %d", got)
-	}
-
-	// Remove is idempotent and cleans the index.
-	s.Remove(endpointA)
-	s.Remove(endpointA)
-	if s.Topics(endpointA) != nil {
-		t.Error("removed endpoint still present")
-	}
-	if got := s.Get("rf_NYC-LON_ow_M"); len(got) != 0 {
-		t.Errorf("index entry survived removal: %v", got)
-	}
-	if got := s.Count(); got != 1 {
-		t.Errorf("count after removal = %d, want 1", got)
+	// Different constraints -> different id.
+	other, _ := Normalize(constrained())
+	if other.ID == w.ID {
+		t.Error("constrained watch must not collide with the unbounded one")
 	}
 }
 
-func TestPersistenceAcrossRestart(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "nested", "subs.json")
-	s := openStore(t, path)
-	if _, err := s.Upsert(sub(endpointA, "rf_LON-TYO_rt_C")); err != nil {
+func TestNormalizeRejects(t *testing.T) {
+	cases := []struct {
+		name string
+		w    Watch
+		want string
+	}{
+		{"bad route", Watch{Route: "LONDON-TYO", Kind: KindRT, Cabins: []string{"C"}}, "route"},
+		{"lowercase route", Watch{Route: "lon-tyo", Kind: KindRT, Cabins: []string{"C"}}, "route"},
+		{"bad kind", Watch{Route: "LON-TYO", Kind: "xx", Cabins: []string{"C"}}, "kind"},
+		{"no cabins", Watch{Route: "LON-TYO", Kind: KindRT}, "cabin"},
+		{"bad cabin", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"Z"}}, "cabin"},
+		{"ret on ow", Watch{Route: "LON-TYO", Kind: KindOW, Cabins: []string{"C"},
+			Ret: &Range{From: "2026-10-01"}}, "one-way"},
+		{"nights on ow", Watch{Route: "LON-TYO", Kind: KindOW, Cabins: []string{"C"},
+			Nights: &Nights{Min: 1, Max: 5}}, "one-way"},
+		{"impossible date", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Out: &Range{From: "2026-02-31", To: "2026-03-05"}}, "not a real date"},
+		{"from after to", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Out: &Range{From: "2026-10-20", To: "2026-10-01"}}, "starts after"},
+		{"range too long", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Out: &Range{From: "2026-01-01", To: "2026-12-01"}}, "at most 180 days"},
+		{"nights too many", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Nights: &Nights{Min: 1, Max: 61}}, "nights"},
+		{"nights inverted", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Nights: &Nights{Min: 9, Max: 2}}, "nights"},
+		// EC-4: the return window ends before the outbound plus the minimum stay.
+		{"impossible: ret too early", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Out:    &Range{From: "2026-10-01", To: "2026-10-20"},
+			Ret:    &Range{From: "2026-10-01", To: "2026-10-05"},
+			Nights: &Nights{Min: 7, Max: 14}}, "ends before"},
+		{"impossible: ret too late", Watch{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"},
+			Out:    &Range{From: "2026-10-01", To: "2026-10-05"},
+			Ret:    &Range{From: "2026-11-01", To: "2026-11-10"},
+			Nights: &Nights{Min: 1, Max: 14}}, "starts more than"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Normalize(tc.w)
+			if err == nil {
+				t.Fatalf("must be rejected")
+			}
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("error %q must mention %q", err, tc.want)
+			}
+		})
+	}
+
+	// The accept cases: unbounded, half-bounded, and the fully constrained one.
+	for _, w := range []Watch{
+		rt("LON-TYO", "C"),
+		ow("NYC-LON", "M", "F"),
+		{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"}, Out: &Range{From: "2026-10-01"}},
+		{Route: "LON-TYO", Kind: KindRT, Cabins: []string{"C"}, Nights: &Nights{Min: 2, Max: 4}},
+		constrained(),
+	} {
+		if _, err := Normalize(w); err != nil {
+			t.Errorf("%+v must be accepted: %v", w, err)
+		}
+	}
+}
+
+func TestUpsertReplacesAndCarriesHistory(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+
+	saved, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"), constrained()))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Upsert(sub(endpointC, "rf_LON-TYO_rt_C", "rf_LON-SIN_ow_F")); err != nil {
+	if len(saved) != 2 {
+		t.Fatalf("saved %d watches, want 2", len(saved))
+	}
+	for _, w := range saved {
+		if w.CreatedAt != fixedNow.Unix() {
+			t.Errorf("createdAt = %d, want %d", w.CreatedAt, fixedNow.Unix())
+		}
+	}
+	s.MarkFired(endpointA, []string{saved[0].ID}, 1783900000)
+
+	// Re-saving the same list preserves createdAt and lastFiredAt.
+	again, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"), constrained()))
+	if err != nil {
 		t.Fatal(err)
 	}
-	if err := s.Close(); err != nil { // always flushes on shutdown
+	if again[0].LastFiredAt != 1783900000 {
+		t.Errorf("lastFiredAt was reset: %+v", again[0])
+	}
+	// Duplicates collapse for free (content-addressed ids).
+	dup, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"), rt("LON-TYO", "C")))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dup) != 1 {
+		t.Errorf("duplicate watches must collapse, got %d", len(dup))
+	}
+	// A v2 write REPLACES the whole list.
+	if got := s.Watches(endpointA); len(got) != 1 || got[0].Route != "LON-TYO" {
+		t.Errorf("v2 upsert must replace the list, got %+v", got)
+	}
+}
+
+func TestTooManyWatches(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	many := make([]Watch, MaxWatchesPerSub+1)
+	for i := range many {
+		many[i] = ow(fmt.Sprintf("%s-TYO", string([]byte{byte('A' + i/26), byte('A' + i%26), 'X'})), "C")
+	}
+	if _, err := s.Upsert(sub(endpointA, many...)); err != ErrTooManyWatch {
+		t.Errorf("err = %v, want ErrTooManyWatch", err)
+	}
+	if _, err := s.Upsert(sub(endpointA, many[:MaxWatchesPerSub]...)); err != nil {
+		t.Errorf("exactly %d watches must be accepted: %v", MaxWatchesPerSub, err)
+	}
+}
+
+// TestLegacyTopicMigration is §2.1: a schema-1 file becomes watches with no
+// loss of meaning, and the v1 file is preserved.
+func TestLegacyTopicMigration(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subs.json")
+	v1 := `{"schema":1,"subs":[{"endpoint":"` + endpointA + `","p256dh":"cGsx","auth":"YXV0aA",
+	  "topics":["rf_LON-TYO_rt_C","rf_LON-TYO_rt_F","rf_LON-TYO_ow_C","rf_NYC-LON_ow_M"]}]}`
+	if err := os.WriteFile(path, []byte(v1), 0o600); err != nil {
 		t.Fatal(err)
 	}
 
-	// On-disk shape: schema + sorted subs, one atomic file, no .tmp left over.
+	s := openStore(t, path)
+	watches := s.Watches(endpointA)
+	if len(watches) != 3 {
+		t.Fatalf("got %d watches, want 3 (grouped by route+kind): %+v", len(watches), watches)
+	}
+	// Cabins are unioned per (route, kind); ranges stay unbounded; rt gets the
+	// default nights window — which is exactly the old joint condition.
+	want := map[string][]string{
+		"LON-TYO|ow": {"C"},
+		"LON-TYO|rt": {"C", "F"},
+		"NYC-LON|ow": {"M"},
+	}
+	for _, w := range watches {
+		key := w.Route + "|" + w.Kind
+		if !slices.Equal(w.Cabins, want[key]) {
+			t.Errorf("%s cabins = %v, want %v", key, w.Cabins, want[key])
+		}
+		if w.Out != nil || w.Ret != nil || w.Nights != nil {
+			t.Errorf("%s must be unbounded, got %+v", key, w)
+		}
+		if !w.TopicRepresentable() {
+			t.Errorf("%s must remain topic-representable", key)
+		}
+		if nmin, nmax := w.NightsWindow(); nmin != 1 || nmax != 30 {
+			t.Errorf("%s nights = %d-%d, want the legacy 1-30", key, nmin, nmax)
+		}
+	}
+
+	// §9-23: the v1 file is backed up, and the store rewrites itself as schema 2.
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	backup, err := os.ReadFile(path + ".v1.bak")
+	if err != nil {
+		t.Fatalf("schema-1 backup missing: %v", err)
+	}
+	if !strings.Contains(string(backup), "rf_LON-TYO_rt_C") {
+		t.Error("backup must hold the original topics")
+	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		t.Fatal(err)
 	}
 	var file storeFile
 	if err := json.Unmarshal(raw, &file); err != nil {
-		t.Fatalf("unparseable store file: %v\n%s", err, raw)
+		t.Fatal(err)
 	}
-	if file.Schema != 1 || len(file.Subs) != 2 {
-		t.Errorf("file = %+v", file)
+	if file.Schema != Schema {
+		t.Errorf("rewritten schema = %d, want %d", file.Schema, Schema)
+	}
+	if strings.Contains(string(raw), "topics") {
+		t.Error("topics must not survive on disk")
+	}
+
+	// Reopening the migrated file is stable.
+	s2 := openStore(t, path)
+	if len(s2.Watches(endpointA)) != 3 {
+		t.Error("migrated store must reload cleanly")
+	}
+}
+
+// TestStaleClientCannotDeleteConstrainedWatch is §9-22 and the load-bearing
+// rule of §2.2: a cached app.js posts the whole topic set it understands, and
+// must not be able to destroy what it cannot express.
+func TestStaleClientCannotDeleteConstrainedWatch(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	if _, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"), constrained())); err != nil {
+		t.Fatal(err)
+	}
+
+	// GET /topics hides the constrained watch entirely.
+	topics := s.Topics(endpointA)
+	if !slices.Equal(topics, []string{"rf_LON-TYO_rt_C"}) {
+		t.Fatalf("legacy projection = %v, want only the unbounded watch", topics)
+	}
+
+	// The stale client edits what it can see and saves the whole list.
+	saved, err := s.UpsertTopics(sub(endpointA), []string{"rf_LON-TYO_rt_C", "rf_NYC-LON_ow_M"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(saved) != 3 {
+		t.Fatalf("saved %d watches, want 3 (2 legacy + the preserved constrained one)", len(saved))
+	}
+
+	var found bool
+	for _, w := range s.Watches(endpointA) {
+		if w.ID == mustNormalize(t, constrained()).ID {
+			found = true
+			if w.Out == nil || w.Out.To != "2026-10-20" || w.Nights.Max != 14 {
+				t.Errorf("constrained watch was mangled: %+v", w)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the date-constrained watch was DELETED by a legacy write")
+	}
+	// And the legacy write did replace the topic-representable ones.
+	if got := s.Topics(endpointA); !slices.Equal(got, []string{"rf_LON-TYO_rt_C", "rf_NYC-LON_ow_M"}) {
+		t.Errorf("legacy topics = %v", got)
+	}
+}
+
+func mustNormalize(t *testing.T, w Watch) Watch {
+	t.Helper()
+	n, err := Normalize(w)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+func TestExpiryAndPurge(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	today, err := ParseDay("2026-07-11")
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := Watch{Route: "SFO-LON", Kind: KindOW, Cabins: []string{"C"},
+		Out: &Range{From: "2026-03-03", To: "2026-03-10"}}
+	if _, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"), old)); err != nil {
+		t.Fatal(err)
+	}
+	if !mustNormalize(t, old).Expired(today) {
+		t.Error("a past range must read as expired")
+	}
+	if mustNormalize(t, rt("LON-TYO", "C")).Expired(today) {
+		t.Error("an unbounded watch never expires")
+	}
+
+	// Expired > 30 days ago -> purged; the live watch survives.
+	watches, subs := s.PurgeExpired(today)
+	if watches != 1 || subs != 0 {
+		t.Errorf("purged %d watches / %d subs, want 1/0", watches, subs)
+	}
+	if got := s.Watches(endpointA); len(got) != 1 || got[0].Route != "LON-TYO" {
+		t.Errorf("purge removed the wrong watch: %+v", got)
+	}
+
+	// A subscription left with nothing is removed entirely.
+	if _, err := s.Upsert(sub(endpointB, old)); err != nil {
+		t.Fatal(err)
+	}
+	if watches, subs := s.PurgeExpired(today); watches != 1 || subs != 1 {
+		t.Errorf("purged %d/%d, want 1 watch and 1 subscription", watches, subs)
+	}
+	if _, ok := s.Lookup(endpointB); ok {
+		t.Error("a subscription with nothing left to watch must be removed")
+	}
+}
+
+func TestStatus(t *testing.T) {
+	today, _ := ParseDay("2026-07-11")
+	routes := map[string]bool{"LON-TYO": true, "TYO-LON": true, "ANU-SKB": true}
+
+	cases := []struct {
+		name string
+		w    Watch
+		want string
+	}{
+		{"active", rt("LON-TYO", "C"), StatusActive},
+		{"unknown route", rt("XXX-YYY", "C"), StatusUnknownRoute},
+		{"no reverse", rt("ANU-SKB", "C"), StatusNoReturn},
+		{"expired", Watch{Route: "LON-TYO", Kind: KindOW, Cabins: []string{"C"},
+			Out: &Range{From: "2026-03-01", To: "2026-03-10"}}, StatusExpired},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mustNormalize(t, tc.w).Status(today, routes); got != tc.want {
+				t.Errorf("status = %q, want %q", got, tc.want)
+			}
+		})
+	}
+	// A nil route set (no bundle yet) skips the data-dependent checks.
+	if got := mustNormalize(t, rt("XXX-YYY", "C")).Status(today, nil); got != StatusActive {
+		t.Errorf("without a bundle, status = %q, want active", got)
+	}
+}
+
+func TestPersistenceAcrossRestart(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "nested", "subs.json")
+	s := openStore(t, path)
+	if _, err := s.Upsert(sub(endpointA, constrained())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Upsert(sub(endpointC, ow("LON-SIN", "F"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
 	}
 	if _, err := os.Stat(path + ".tmp"); !os.IsNotExist(err) {
 		t.Error("temp file left behind")
@@ -126,160 +401,65 @@ func TestPersistenceAcrossRestart(t *testing.T) {
 		t.Errorf("subscriptions must be owner-only, got %v", info.Mode().Perm())
 	}
 
-	// Restart: everything is back, including the topic index.
 	s2 := openStore(t, path)
-	if got := s2.Count(); got != 2 {
-		t.Fatalf("after restart count = %d, want 2", got)
+	if s2.Count() != 2 || s2.WatchCount() != 2 {
+		t.Fatalf("after restart: %d subs / %d watches, want 2/2", s2.Count(), s2.WatchCount())
 	}
-	if got := s2.Get("rf_LON-TYO_rt_C"); len(got) != 2 {
-		t.Errorf("after restart topic index = %d subs, want 2", len(got))
-	}
-	if got := s2.Get("rf_LON-SIN_ow_F"); len(got) != 1 || got[0].Endpoint != endpointC {
-		t.Errorf("after restart: %v", got)
-	}
-	if got := s2.Topics(endpointC); !slices.Equal(got, []string{"rf_LON-SIN_ow_F", "rf_LON-TYO_rt_C"}) {
-		t.Errorf("after restart topics = %v", got)
+	got := s2.Watches(endpointA)
+	if len(got) != 1 || got[0].Out.To != "2026-10-20" || got[0].Nights.Min != 7 {
+		t.Errorf("constrained watch did not survive: %+v", got)
 	}
 }
 
-func TestDebouncedWriteAndFlush(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "subs.json")
-	s, err := Open(Options{Path: path, Debounce: 50 * time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	// A burst of upserts must not produce a file write per upsert.
-	for i := range 20 {
-		if _, err := s.Upsert(sub(fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d", i), "rf_LON-TYO_ow_M")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	// Debounce elapses -> exactly one file, with all 20.
-	deadline := time.Now().Add(2 * time.Second)
-	for time.Now().Before(deadline) {
-		if raw, err := os.ReadFile(path); err == nil {
-			var file storeFile
-			if json.Unmarshal(raw, &file) == nil && len(file.Subs) == 20 {
-				return // debounced write landed with the full set
-			}
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
-	t.Fatal("debounced write never landed with all 20 subscriptions")
-}
-
-func TestCloseFlushesImmediately(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "subs.json")
-	s, err := Open(Options{Path: path, Debounce: time.Hour}) // would never fire on its own
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, err := s.Upsert(sub(endpointA, "rf_LON-TYO_ow_M")); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := os.Stat(path); !os.IsNotExist(err) {
-		t.Fatal("write should still be debounced at this point")
-	}
-	if err := s.Close(); err != nil {
-		t.Fatal(err)
-	}
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("Close must flush pending state: %v", err)
-	}
-	if !strings.Contains(string(raw), endpointA) {
-		t.Errorf("flushed file missing the subscription: %s", raw)
-	}
-}
-
-func TestValidation(t *testing.T) {
+func TestVersionBumps(t *testing.T) {
 	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	v0 := s.Version()
+	if _, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"))); err != nil {
+		t.Fatal(err)
+	}
+	v1 := s.Version()
+	if v1 == v0 {
+		t.Fatal("Upsert must bump the version (the watcher's index depends on it)")
+	}
+	s.MarkFired(endpointA, []string{s.Watches(endpointA)[0].ID}, 1)
+	if s.Version() == v1 {
+		t.Error("MarkFired must bump the version")
+	}
+	v2 := s.Version()
+	s.Remove(endpointA)
+	if s.Version() == v2 {
+		t.Error("Remove must bump the version")
+	}
+	// A no-op remove does not.
+	v3 := s.Version()
+	s.Remove(endpointA)
+	if s.Version() != v3 {
+		t.Error("removing an unknown endpoint must not bump the version")
+	}
+}
 
-	manyTopics := make([]string, MaxTopicsPerSub+1)
-	for i := range manyTopics {
-		manyTopics[i] = fmt.Sprintf("rf_LO%d-TYO_ow_C", i%10) // distinct-ish, all valid shape
+func TestEndpointAllowlist(t *testing.T) {
+	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
+	for _, bad := range []string{
+		"http://fcm.googleapis.com/x",
+		"https://evil.example.com/x",
+		"https://fcm.googleapis.com.evil.com/x",
+		"::nonsense::",
+		"",
+	} {
+		if _, err := s.Upsert(sub(bad, rt("LON-TYO", "C"))); err == nil {
+			t.Errorf("endpoint %q must be rejected", bad)
+		}
 	}
-	// Ensure they really are distinct so normalization keeps 61.
-	for i := range manyTopics {
-		manyTopics[i] = fmt.Sprintf("rf_%s-TYO_ow_C", string([]byte{byte('A' + i/26), byte('A' + i%26), 'X'}))
-	}
-
-	cases := []struct {
-		name string
-		sub  Subscription
-		want error
-	}{
-		{"http endpoint", sub("http://fcm.googleapis.com/x", "rf_LON-TYO_ow_C"), ErrBadEndpoint},
-		{"unknown host", sub("https://evil.example.com/x", "rf_LON-TYO_ow_C"), ErrBadEndpoint},
-		{"lookalike host", sub("https://fcm.googleapis.com.evil.com/x", "rf_LON-TYO_ow_C"), ErrBadEndpoint},
-		{"not a url", sub("::nonsense::", "rf_LON-TYO_ow_C"), ErrBadEndpoint},
-		{"empty endpoint", sub("", "rf_LON-TYO_ow_C"), ErrBadEndpoint},
-		{"bad topic prefix", sub(endpointA, "notrf_LON-TYO_ow_C"), ErrBadTopic},
-		{"bad topic cabin", sub(endpointA, "rf_LON-TYO_ow_Z"), ErrBadTopic},
-		{"bad topic type", sub(endpointA, "rf_LON-TYO_xx_C"), ErrBadTopic},
-		{"bad topic route", sub(endpointA, "rf_LONDON-TYO_ow_C"), ErrBadTopic},
-		{"lowercase route", sub(endpointA, "rf_lon-tyo_ow_C"), ErrBadTopic},
-		{"too many topics", sub(endpointA, manyTopics...), ErrTooManyTopics},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			_, err := s.Upsert(tc.sub)
-			if err == nil {
-				t.Fatalf("must be rejected")
-			}
-			if !strings.Contains(err.Error(), strings.SplitN(tc.want.Error(), ":", 2)[0]) {
-				t.Errorf("err = %v, want %v", err, tc.want)
-			}
-		})
-	}
-	if got := s.Count(); got != 0 {
-		t.Errorf("rejected subscriptions must not be stored (count = %d)", got)
-	}
-
-	// Missing keys are rejected too.
-	if _, err := s.Upsert(Subscription{Endpoint: endpointA, Topics: []string{"rf_LON-TYO_ow_C"}}); err == nil {
-		t.Error("missing p256dh/auth must be rejected")
-	}
-	// Exactly MaxTopicsPerSub is allowed.
-	if _, err := s.Upsert(sub(endpointA, manyTopics[:MaxTopicsPerSub]...)); err != nil {
-		t.Errorf("exactly %d topics must be accepted: %v", MaxTopicsPerSub, err)
-	}
-	// All allowlisted hosts are accepted.
-	for _, endpoint := range []string{
+	for _, good := range []string{
 		endpointB, endpointC,
 		"https://push.services.mozilla.com/wpush/v1/x",
 		"https://sg2p.notify.windows.com/w/?token=abc",
 		"https://api.push.apple.com/3/device/x",
 	} {
-		if _, err := s.Upsert(sub(endpoint, "rf_LON-TYO_ow_C")); err != nil {
-			t.Errorf("allowlisted host %s rejected: %v", endpoint, err)
+		if _, err := s.Upsert(sub(good, rt("LON-TYO", "C"))); err != nil {
+			t.Errorf("allowlisted host %s rejected: %v", good, err)
 		}
-	}
-}
-
-func TestMaxSubs(t *testing.T) {
-	s, err := Open(Options{Path: filepath.Join(t.TempDir(), "subs.json"), MaxSubs: 2, Debounce: time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer s.Close()
-
-	for i := range 2 {
-		if _, err := s.Upsert(sub(fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d", i), "rf_LON-TYO_ow_C")); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := s.Upsert(sub("https://fcm.googleapis.com/fcm/send/overflow", "rf_LON-TYO_ow_C")); err != ErrFull {
-		t.Errorf("beyond max-subs err = %v, want ErrFull", err)
-	}
-	// An UPDATE to an existing subscription still works when full.
-	if _, err := s.Upsert(sub("https://fcm.googleapis.com/fcm/send/0", "rf_NYC-LON_rt_F")); err != nil {
-		t.Errorf("updating an existing sub while full must succeed: %v", err)
-	}
-	if got := s.Count(); got != 2 {
-		t.Errorf("count = %d, want 2", got)
 	}
 }
 
@@ -289,47 +469,17 @@ func TestCorruptFileStartsEmpty(t *testing.T) {
 		t.Fatal(err)
 	}
 	s := openStore(t, path)
-	if got := s.Count(); got != 0 {
-		t.Errorf("corrupt file must start empty, got %d", got)
+	if s.Count() != 0 {
+		t.Errorf("corrupt file must start empty, got %d", s.Count())
 	}
 	if _, err := os.Stat(path + ".corrupt"); err != nil {
-		t.Error("corrupt file must be preserved aside for forensics")
-	}
-	// The store is usable afterwards.
-	if _, err := s.Upsert(sub(endpointA, "rf_LON-TYO_ow_C")); err != nil {
-		t.Fatal(err)
+		t.Error("corrupt file must be kept aside for forensics")
 	}
 }
 
-func TestLoadDropsInvalidEntries(t *testing.T) {
-	path := filepath.Join(t.TempDir(), "subs.json")
-	// A hand-edited file smuggling in a non-push host must not be honored.
-	raw, err := json.Marshal(storeFile{Schema: 1, Subs: []Subscription{
-		sub(endpointA, "rf_LON-TYO_ow_C"),
-		sub("https://evil.example.com/x", "rf_LON-TYO_ow_C"),
-		sub(endpointB, "rf_BAD"),
-	}})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(path, raw, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	s := openStore(t, path)
-	if got := s.Count(); got != 1 {
-		t.Fatalf("count = %d, want 1 (invalid entries dropped)", got)
-	}
-	if s.Topics(endpointA) == nil {
-		t.Error("the valid entry must survive")
-	}
-}
-
-// TestConcurrentAccess exercises the RWMutex under -race: concurrent
-// upserts, removes, and sender reads must not race or corrupt the index.
 func TestConcurrentAccess(t *testing.T) {
 	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
-	const workers = 8
-	const iterations = 50
+	const workers, iterations = 8, 50
 
 	var wg sync.WaitGroup
 	for w := range workers {
@@ -338,78 +488,77 @@ func TestConcurrentAccess(t *testing.T) {
 			defer wg.Done()
 			for i := range iterations {
 				endpoint := fmt.Sprintf("https://fcm.googleapis.com/fcm/send/%d-%d", w, i)
-				if _, err := s.Upsert(sub(endpoint, "rf_LON-TYO_rt_C", "rf_LON-TYO_ow_C")); err != nil {
+				if _, err := s.Upsert(sub(endpoint, rt("LON-TYO", "C"), constrained())); err != nil {
 					t.Errorf("upsert: %v", err)
 					return
 				}
-				s.Get("rf_LON-TYO_rt_C")
+				s.Watches(endpoint)
 				s.Topics(endpoint)
-				s.ActiveTopics()
+				s.Version()
 				s.Count()
+				s.MarkFired(endpoint, []string{"deadbeef"}, 1)
 				if i%3 == 0 {
 					s.Remove(endpoint)
 				}
 			}
 		}(w)
 	}
-	// Concurrent readers, as the sender would be.
+	// Readers, as the watcher's index rebuild would be.
 	for range workers {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for range iterations {
-				for _, got := range s.Get("rf_LON-TYO_rt_C") {
-					if got.Endpoint == "" || got.P256dh == "" {
-						t.Error("sender read a torn subscription")
-						return
+				for _, snapshot := range s.Snapshot() {
+					for _, watch := range snapshot.Watches {
+						if watch.Route == "" || len(watch.Cabins) == 0 {
+							t.Error("snapshot read a torn watch")
+							return
+						}
 					}
 				}
 			}
 		}()
 	}
 	wg.Wait()
-
-	// Final state is self-consistent: every indexed sub is still stored.
-	for _, topic := range s.ActiveTopics() {
-		for _, got := range s.Get(topic) {
-			if s.Topics(got.Endpoint) == nil {
-				t.Errorf("index references a removed endpoint: %s", got.Endpoint)
-			}
-		}
-	}
 }
 
-func TestLookup(t *testing.T) {
-	s := openStore(t, filepath.Join(t.TempDir(), "subs.json"))
-	if _, err := s.Upsert(sub(endpointA, "rf_LON-TYO_rt_C")); err != nil {
+// TestFlushDuringMutationDoesNotDeadlock pins the lock order (mu, then writeMu).
+//
+// The mutating paths hold mu and take writeMu via touch→markDirty. An earlier
+// Flush held writeMu and then waited on mu — an AB-BA inversion that wedged the
+// whole watcher (not just alerts) the first time a debounced flush landed while
+// someone was subscribing. Hammer both paths concurrently; a regression hangs
+// here rather than failing subtly in production.
+func TestFlushDuringMutationDoesNotDeadlock(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := Open(Options{Path: filepath.Join(dir, "subs.json"), Debounce: time.Millisecond})
+	if err != nil {
 		t.Fatal(err)
 	}
-	// A known subscription yields the push keys the sender needs.
-	got, ok := s.Lookup(endpointA)
-	if !ok {
-		t.Fatal("known endpoint must be found")
-	}
-	if got.Endpoint != endpointA || got.P256dh != "cGsx" || got.Auth != "YXV0aA" {
-		t.Errorf("lookup = %+v", got)
-	}
-	if _, ok := s.Lookup(endpointB); ok {
-		t.Error("unknown endpoint must not be found")
-	}
+	defer s.Close()
 
-	// The bool distinguishes "known but topic-less" from "unknown" — Topics
-	// alone cannot, since both come back empty. POST /test depends on this.
-	if _, err := s.Upsert(sub(endpointB)); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := s.Lookup(endpointB); !ok {
-		t.Error("a subscription with no topics is still a known subscription")
-	}
-	if got := s.Topics(endpointB); len(got) != 0 {
-		t.Errorf("topics = %v, want empty", got)
-	}
+	done := make(chan struct{})
+	go func() { // writers: each Upsert takes mu then writeMu
+		defer close(done)
+		for i := 0; i < 300; i++ {
+			_, _ = s.Upsert(Subscription{
+				Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/dl-%d", i),
+				P256dh:   "p", Auth: "a",
+				Watches: []Watch{{Route: "LON-TYO", Kind: "rt", Cabins: []string{"C"}}},
+			})
+		}
+	}()
+	go func() { // flushers: the debounce timer does exactly this
+		for i := 0; i < 300; i++ {
+			_ = s.Flush()
+		}
+	}()
 
-	s.Remove(endpointA)
-	if _, ok := s.Lookup(endpointA); ok {
-		t.Error("removed endpoint must not be found")
+	select {
+	case <-done:
+	case <-time.After(20 * time.Second):
+		t.Fatal("deadlock: Upsert and Flush acquired mu/writeMu in opposite orders")
 	}
 }

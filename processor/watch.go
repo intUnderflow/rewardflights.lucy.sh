@@ -103,6 +103,9 @@ func runWatch(cfg watchConfig) error {
 				Addr: cfg.AlertsListen, Store: store, Sender: webpush.NewSender(vapid),
 				RatePerMin: cfg.AlertsRate, Burst: cfg.AlertsBurst,
 				TestPerHour: cfg.AlertsTestPerHour, Logf: logf,
+				// The API reports each watch's status (expired / impossible /
+				// unknown-route) against the data the watcher currently holds.
+				Horizon: alerter.Horizon,
 			})
 			go func() {
 				logf("watch: subscription API listening on %s", cfg.AlertsListen)
