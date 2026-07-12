@@ -32,11 +32,12 @@ type watchConfig struct {
 
 	Alerts            alerts.Config // seat alerts; enabled when VapidKeyPath is set
 	AlertsStore       string        // subscription store file
-	AlertsMaxSubs     int           // subscription cap
-	AlertsListen      string        // subscription API listen address; empty -> no API
-	AlertsRate        int           // API requests/min per client IP
-	AlertsBurst       int           // API rate-limit burst
-	AlertsTestPerHour int           // POST /test sends per hour per subscription
+	AlertsMaxSubs     int
+	AlertsMaxBytes    int64  // subscription cap
+	AlertsListen      string // subscription API listen address; empty -> no API
+	AlertsRate        int    // API requests/min per client IP
+	AlertsBurst       int    // API rate-limit burst
+	AlertsTestPerHour int    // POST /test sends per hour per subscription
 }
 
 // runWatch is the constantly-running mode: it watches the local source
@@ -65,7 +66,7 @@ func runWatch(cfg watchConfig) error {
 	if cfg.Alerts.VapidKeyPath != "" {
 		var err error
 		store, err = alertstore.Open(alertstore.Options{
-			Path: cfg.AlertsStore, MaxSubs: cfg.AlertsMaxSubs, Logf: logf,
+			Path: cfg.AlertsStore, MaxSubs: cfg.AlertsMaxSubs, MaxBytes: cfg.AlertsMaxBytes, Logf: logf,
 		})
 		if err != nil {
 			return err

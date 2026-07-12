@@ -2,6 +2,7 @@ package alertstore
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -560,5 +561,151 @@ func TestFlushDuringMutationDoesNotDeadlock(t *testing.T) {
 	case <-done:
 	case <-time.After(20 * time.Second):
 		t.Fatal("deadlock: Upsert and Flush acquired mu/writeMu in opposite orders")
+	}
+}
+
+// TestCloseFlushesPendingWrite guards the version-based dirty tracking: a
+// mutation that is still sitting behind the debounce timer MUST reach disk on
+// shutdown. Losing it loses a subscription, which the user cannot recover
+// without re-subscribing from the browser.
+func TestCloseFlushesPendingWrite(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subs.json")
+	s, err := Open(Options{
+		Path: path, Debounce: time.Hour, // long enough that only Close can save us
+		Now: func() time.Time { return fixedNow },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Upsert(sub(endpointA, constrained())); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatal("the write should still be debounced at this point")
+	}
+
+	if err := s.Close(); err != nil {
+		t.Fatal(err)
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("Close must flush the pending write: %v", err)
+	}
+	if !strings.Contains(string(raw), endpointA) {
+		t.Errorf("flushed file is missing the subscription: %s", raw)
+	}
+}
+
+// TestFlushIsIdempotent pins the other half of the version comparison: with
+// nothing changed, a flush must not rewrite the file (the debounced writer
+// fires on a timer and would otherwise churn the disk every second).
+func TestFlushIsIdempotent(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "subs.json")
+	s := openStore(t, path)
+	if _, err := s.Upsert(sub(endpointA, rt("LON-TYO", "C"))); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	first, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Backdate the file: a genuine rewrite would reset the mtime.
+	past := time.Now().Add(-time.Hour)
+	if err := os.Chtimes(path, past, past); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Flush(); err != nil { // nothing changed since the last write
+		t.Fatal(err)
+	}
+	again, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !again.ModTime().Equal(past) {
+		t.Error("an unchanged store must not be rewritten")
+	}
+
+	// ...but a real mutation does write again.
+	s.MarkFired(endpointA, []string{s.Watches(endpointA)[0].ID}, 1783900000)
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	final, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if final.ModTime().Equal(past) {
+		t.Error("a mutation after the last write must be persisted")
+	}
+	_ = first
+}
+
+// TestByteCeilingProtectsTheDisk pins the store's hard size limit. It exists to
+// protect the host: this store lives on a machine that also runs the data
+// pipeline, so an unbounded subscription file could take the whole thing down.
+// Growth past the ceiling is refused; shrinking out of it always works.
+func TestByteCeilingProtectsTheDisk(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := Open(Options{
+		Path:     filepath.Join(dir, "subs.json"),
+		MaxBytes: 1200, // tiny, so a handful of subscriptions reaches it
+		Debounce: time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+
+	sub := func(i int) Subscription {
+		return Subscription{
+			Endpoint: fmt.Sprintf("https://fcm.googleapis.com/fcm/send/cap-%03d", i),
+			P256dh:   "p256dh-value", Auth: "auth-value",
+			Watches: []Watch{{Route: "LON-TYO", Kind: "rt", Cabins: []string{"C"}}},
+		}
+	}
+
+	accepted := 0
+	var lastErr error
+	for i := 0; i < 50; i++ {
+		if _, err := s.Upsert(sub(i)); err != nil {
+			lastErr = err
+			break
+		}
+		accepted++
+	}
+	if !errors.Is(lastErr, ErrStoreTooLarge) {
+		t.Fatalf("expected the ceiling to stop growth, got %v after %d subs", lastErr, accepted)
+	}
+	if accepted == 0 {
+		t.Fatal("ceiling rejected everything; it must admit what fits")
+	}
+
+	// The file it would write must actually be within the ceiling.
+	if err := s.Flush(); err != nil {
+		t.Fatal(err)
+	}
+	fi, err := os.Stat(filepath.Join(dir, "subs.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fi.Size() > 1200 {
+		t.Fatalf("store file %d bytes exceeds the %d-byte ceiling", fi.Size(), 1200)
+	}
+
+	// A full store must not trap its users: removing frees room, and an existing
+	// subscriber can still shrink (edit) even while full.
+	s.Remove(sub(0).Endpoint)
+	if _, err := s.Upsert(sub(accepted)); err != nil {
+		t.Fatalf("after freeing a slot, a new subscription must fit again: %v", err)
+	}
+	shrink := sub(1)
+	shrink.Watches = nil // strictly smaller: always allowed
+	if _, err := s.Upsert(shrink); err != nil {
+		t.Fatalf("shrinking a subscription must be allowed even at the ceiling: %v", err)
 	}
 }

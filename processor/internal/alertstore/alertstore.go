@@ -48,7 +48,11 @@ type Subscription struct {
 const Schema = 2
 
 const (
-	DefaultMaxSubs   = 100000
+	DefaultMaxSubs = 100000
+	// DefaultMaxBytes caps the on-disk subscription store. This is a backstop
+	// against a runaway or hostile writer filling the host's disk — nothing
+	// legitimate comes close (100k subscriptions is on the order of 50 MB).
+	DefaultMaxBytes  = 10 << 30 // 10 GiB
 	defaultDebounce  = time.Second
 	subscriptionFile = 0o600 // subscriptions are personal data: owner-only
 )
@@ -70,12 +74,16 @@ var (
 	ErrTooManyTopics = fmt.Errorf("a subscription may hold at most %d topics", MaxTopicsPerSub)
 	ErrTooManyWatch  = fmt.Errorf("a subscription may hold at most %d watches", MaxWatchesPerSub)
 	ErrFull          = errors.New("subscription store is full")
+	ErrStoreTooLarge = errors.New("subscription store has reached its size limit")
 )
 
 // Store is the concurrency-safe subscription store.
 type Store struct {
 	path     string
 	maxSubs  int
+	maxBytes int64
+	bytes    int64            // running serialized size; guarded by mu
+	subBytes map[string]int64 // per-subscription serialized size; guarded by mu
 	debounce time.Duration
 	now      func() time.Time
 	logf     func(string, ...any)
@@ -102,6 +110,7 @@ type Store struct {
 type Options struct {
 	Path     string // JSON file; required
 	MaxSubs  int    // default DefaultMaxSubs
+	MaxBytes int64  // default DefaultMaxBytes; hard ceiling on the store file
 	Debounce time.Duration
 	Now      func() time.Time // injected in tests
 	Logf     func(string, ...any)
@@ -118,6 +127,9 @@ func Open(opts Options) (*Store, error) {
 	if opts.MaxSubs <= 0 {
 		opts.MaxSubs = DefaultMaxSubs
 	}
+	if opts.MaxBytes <= 0 {
+		opts.MaxBytes = DefaultMaxBytes
+	}
 	if opts.Debounce <= 0 {
 		opts.Debounce = defaultDebounce
 	}
@@ -130,6 +142,8 @@ func Open(opts Options) (*Store, error) {
 	s := &Store{
 		path:     opts.Path,
 		maxSubs:  opts.MaxSubs,
+		maxBytes: opts.MaxBytes,
+		subBytes: map[string]int64{},
 		debounce: opts.Debounce,
 		now:      opts.Now,
 		logf:     opts.Logf,
@@ -175,7 +189,8 @@ func Open(opts Options) (*Store, error) {
 			s.logf("WARN alert-store-dropped %s: %v", sub.Endpoint, err)
 			continue
 		}
-		s.subs[key(loaded.Endpoint)] = loaded
+		lk := key(loaded.Endpoint)
+		s.setSub(lk, loaded, subSize(loaded))
 	}
 	if file.Schema == 1 {
 		s.version++ // version > writtenVersion(0) ⇒ rewritten in schema 2 at the next flush
@@ -370,11 +385,69 @@ func (s *Store) Upsert(sub Subscription) ([]Watch, error) {
 		return nil, ErrFull
 	}
 	watches = s.carryHistory(existing, watches)
-	s.subs[k] = &Subscription{
+	next := &Subscription{
 		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth, Watches: watches,
 	}
+
+	// Hard disk backstop: never let the store grow past its byte ceiling. A
+	// write that shrinks (or is size-neutral) is always allowed, so a subscriber
+	// can still edit or delete their way out of a full store — only growth is
+	// refused.
+	size := subSize(next)
+	if grown := storeWrapperBytes + s.bytes - s.subBytes[k] + size; grown > s.maxBytes && size > s.subBytes[k] {
+		s.logf("WARN alert-store-size-limit %d bytes (limit %d): refusing to grow", s.bytes, s.maxBytes)
+		return nil, ErrStoreTooLarge
+	}
+	s.setSub(k, next, size)
 	s.touch()
 	return slices.Clone(watches), nil
+}
+
+// storeWrapperBytes is the file's fixed overhead outside the subscription list
+// ({"schema": 2, "subs": [...]}), reserved against the ceiling.
+const storeWrapperBytes = 64
+
+// subSize is a subscription's cost IN THE FILE, used for the store's byte
+// ceiling. It must never under-count — an accounting that runs low would let the
+// file exceed the limit, which defeats the point of a disk guard — so it
+// measures the same indented encoding Flush writes, plus the separator.
+func subSize(sub *Subscription) int64 {
+	b, err := json.MarshalIndent(storedSub{
+		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth, Watches: sub.Watches,
+	}, "  ", " ")
+	if err != nil {
+		return 0
+	}
+	return int64(len(b)) + 4 // ",\n" + the next entry's leading indent
+}
+
+// setSub installs a subscription and keeps the running byte total in step.
+// Caller holds mu.
+func (s *Store) setSub(k string, sub *Subscription, size int64) {
+	s.bytes += size - s.subBytes[k]
+	s.subBytes[k] = size
+	s.subs[k] = sub
+}
+
+// reaccount refreshes the byte tally for a subscription mutated in place
+// (MarkFired stamps LastFiredAt; PurgeExpired drops watches). Without this the
+// running total would drift away from the file and the ceiling would be wrong.
+// Caller holds mu.
+func (s *Store) reaccount(k string) {
+	sub, ok := s.subs[k]
+	if !ok {
+		return
+	}
+	size := subSize(sub)
+	s.bytes += size - s.subBytes[k]
+	s.subBytes[k] = size
+}
+
+// dropSub removes a subscription and its byte accounting. Caller holds mu.
+func (s *Store) dropSub(k string) {
+	s.bytes -= s.subBytes[k]
+	delete(s.subBytes, k)
+	delete(s.subs, k)
 }
 
 // UpsertTopics is the LEGACY write path (§2.2): it replaces only the
@@ -419,9 +492,15 @@ func (s *Store) UpsertTopics(sub Subscription, topics []string) ([]Watch, error)
 	merged = append(merged, fresh...)
 	merged = s.carryHistory(existing, merged)
 
-	s.subs[k] = &Subscription{
+	next := &Subscription{
 		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth, Watches: merged,
 	}
+	size := subSize(next)
+	if grown := storeWrapperBytes + s.bytes - s.subBytes[k] + size; grown > s.maxBytes && size > s.subBytes[k] {
+		s.logf("WARN alert-store-size-limit %d bytes (limit %d): refusing to grow", s.bytes, s.maxBytes)
+		return nil, ErrStoreTooLarge
+	}
+	s.setSub(k, next, size)
 	s.touch()
 	return slices.Clone(merged), nil
 }
@@ -493,6 +572,7 @@ func (s *Store) MarkFired(endpoint string, ids []string, t int64) {
 		}
 	}
 	if changed {
+		s.reaccount(key(endpoint))
 		s.touch()
 	}
 }
@@ -520,8 +600,10 @@ func (s *Store) PurgeExpired(today int) (watches, subs int) {
 		// Only a subscription emptied BY the purge is removed; one that is
 		// merely empty (a client that saved zero watches) is left alone.
 		if len(sub.Watches) == 0 {
-			delete(s.subs, k)
+			s.dropSub(k)
 			subs++
+		} else {
+			s.reaccount(k)
 		}
 	}
 	if watches > 0 {
@@ -538,7 +620,7 @@ func (s *Store) Remove(endpoint string) {
 	if _, ok := s.subs[key(endpoint)]; !ok {
 		return
 	}
-	delete(s.subs, key(endpoint))
+	s.dropSub(key(endpoint))
 	s.touch()
 }
 

@@ -46,6 +46,7 @@ func main() {
 	alertsState := flag.String("alerts-state", defaultAlertsPath("state.json"), "watch mode: path of the alerts state file (cooldown/batch persistence)")
 	alertsListen := flag.String("alerts-listen", "", "watch mode: listen address for the subscription API, e.g. 127.0.0.1:8787 (empty disables the API)")
 	alertsMaxSubs := flag.Int("alerts-max-subs", alertstore.DefaultMaxSubs, "watch mode: maximum stored subscriptions")
+	alertsMaxBytes := flag.Int64("alerts-max-bytes", alertstore.DefaultMaxBytes, "watch mode: hard ceiling on the subscription store file, in bytes (disk backstop)")
 	alertsRate := flag.Int("alerts-rate", 60, "watch mode: subscription API requests per minute per client IP")
 	alertsBurst := flag.Int("alerts-burst", 20, "watch mode: subscription API rate-limit burst")
 	alertsTestPerHour := flag.Int("alerts-test-per-hour", 5, "watch mode: POST /test notifications per hour per subscription")
@@ -72,6 +73,7 @@ func main() {
 			},
 			AlertsStore:       *alertsStore,
 			AlertsMaxSubs:     *alertsMaxSubs,
+			AlertsMaxBytes:    *alertsMaxBytes,
 			AlertsListen:      *alertsListen,
 			AlertsRate:        *alertsRate,
 			AlertsBurst:       *alertsBurst,

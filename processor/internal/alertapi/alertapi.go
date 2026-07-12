@@ -190,6 +190,13 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 			"ok": false, "error": "subscription store is full",
 		})
 		return
+	case errors.Is(err, alertstore.ErrStoreTooLarge):
+		// The store hit its disk ceiling. Existing subscribers can still edit or
+		// delete (those writes shrink it) — only growth is refused.
+		writeJSON(w, http.StatusInsufficientStorage, map[string]any{
+			"ok": false, "error": "the alert service is at capacity; try again later",
+		})
+		return
 	case err != nil:
 		badRequest(w, err.Error())
 		return
