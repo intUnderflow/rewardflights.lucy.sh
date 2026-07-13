@@ -2,6 +2,10 @@
  "places": {
   "LON": {
    "country": "United Kingdom",
+   "g": [
+    51.507,
+    -0.128
+   ],
    "name": "London",
    "search": [
     "Heathrow",
@@ -18,6 +22,10 @@
   },
   "NYC": {
    "country": "United States",
+   "g": [
+    40.713,
+    -74.006
+   ],
    "name": "New York",
    "search": [
     "JFK",
@@ -29,6 +37,10 @@
   },
   "TYO": {
    "country": "Japan",
+   "g": [
+    35.676,
+    139.65
+   ],
    "name": "Tokyo",
    "search": [
     "Haneda",

@@ -844,6 +844,8 @@ function route({ focus = false } = {}) {
     renderTrip(m[1].toUpperCase(), m[2].toUpperCase());
   else if ((m = path.match(/^\/from\/([A-Z]{3})\/?$/i)))
     renderFrom(m[1].toUpperCase());
+  else if ((m = path.match(/^\/map\/([A-Z]{3})\/?$/i)))
+    renderMap(m[1].toUpperCase());
   else if (/^\/alerts\/?$/.test(path)) renderAlerts();
   else renderNotFound();
 
@@ -2579,6 +2581,9 @@ function renderFrom(o) {
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
+    <div class="view-toggle" role="group" aria-label="View">
+      <span class="vt-on" aria-current="page">List</span><a href="/map/${o}">Map</a>
+    </div>
     <p class="page-sub">${dests.length} destinations with award seats in the next year.
       Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights).</p>
   </div>`));
@@ -2627,6 +2632,301 @@ function renderFrom(o) {
     </a>`));
   }
   mainEl.append(grid);
+}
+
+/* ---------------- pages: destination map ---------------- */
+
+/* The world base (land outline + projection constants) is a 57KB static asset
+   used only here, so it loads on first map visit, not at boot. */
+let _worldLoad = null;
+function loadWorld() {
+  if (window.WORLD1) return Promise.resolve();
+  if (!_worldLoad) {
+    _worldLoad = new Promise((resolve, reject) => {
+      const s = document.createElement("script");
+      s.src = "/assets/world-1.js?v=1";
+      s.onload = () => resolve();
+      s.onerror = () => { _worldLoad = null; reject(new Error("map asset unreachable")); };
+      document.head.append(s);
+    });
+  }
+  return _worldLoad;
+}
+
+/* Natural Earth I forward projection (d3-geo's naturalEarth1Raw polynomial).
+   Must match mkworld.mjs exactly — the land path was pre-projected with it. */
+function ne1Raw(l, p) {
+  const p2 = p * p, p4 = p2 * p2;
+  return [
+    l * (0.8707 - 0.131979 * p2 + p4 * (-0.013791 + p4 * (0.003971 * p2 - 0.001529 * p4))),
+    p * (1.007226 + p2 * (0.015085 + p4 * (-0.044475 + 0.028874 * p2 - 0.005916 * p4))),
+  ];
+}
+function projectLL(lat, lon) {
+  const W = window.WORLD1, r = Math.PI / 180;
+  const [x, y] = ne1Raw(lon * r, lat * r);
+  return [W.tx + W.k * x, W.ty - W.k * y];
+}
+
+function renderMap(o) {
+  current.page = "map"; current.params = { o };
+  setTitle(`Map from ${placeName(o)}`);
+  if (!store.bundle) return;
+
+  const dests = (store.destsByOrigin.get(o) || []).slice();
+  mainEl.innerHTML = "";
+  mainEl.append(el(`<div class="section-pad">
+    <p class="crumbs"><a href="/">Search</a></p>
+    <h1 class="page-title">Where can you go from ${esc(placeName(o))}?</h1>
+    <div class="view-toggle" role="group" aria-label="View">
+      <a href="/from/${o}">List</a><span class="vt-on" aria-current="page">Map</span>
+    </div>
+    <p class="page-sub">Every dot is a destination with bookable round trips
+      (${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights, same cabin both ways) — free, no account,
+      data as of ${esc(freshLabel())}. Tap a dot for the route's calendar.</p>
+  </div>`));
+
+  if (!dests.length) {
+    mainEl.append(el(`<div class="empty-state">
+      <div class="big">No destinations right now.</div>
+      <p>No award seats from ${esc(placeName(o))} in the current data.</p></div>`));
+    return;
+  }
+
+  /* Controls: cabin chips (always visible — a map that hides cabins is the
+     top competitor complaint) + a month narrower (the "school holidays" ask;
+     default stays the whole year, not a 2-week window). */
+  let mask = cabinLegend().reduce((m, [bit]) => m | bit, 0);
+  let monthIdx = -1; // -1 = next 12 months
+  const controls = el(`<div class="section-pad map-controls">
+    <div class="chips" role="group" aria-label="Cabins">${cabinLegend().map(([bit, label]) =>
+      `<button type="button" class="chip" aria-pressed="true" data-bit="${bit}">
+        <span class="swatch ${bitClass(bit)}"></span>${esc(label)}</button>`).join("")}
+    </div>
+    <label class="map-month-wrap">When
+      <select class="map-month" aria-label="Travel month">
+        <option value="-1">Any time (next 12 months)</option>
+        ${next12Months().map((mo, i) => `<option value="${i}">${esc(mo.label)}</option>`).join("")}
+      </select>
+    </label>
+    <p class="map-count" role="status"></p>
+  </div>`);
+  mainEl.append(controls);
+
+  const panel = el(`<div class="map-panel">
+    <div class="map-loading"><div class="sk-line" style="height:200px"></div></div>
+  </div>`);
+  mainEl.append(panel, el(`<p class="map-legend">Dot colour is the best cabin
+    available; dot size is how many days have round trips. Drag to pan, scroll or
+    pinch to zoom.</p>`));
+
+  loadWorld().then(() => {
+    if (current.page !== "map" || current.params.o !== o) return; // navigated away
+    drawMap();
+  }).catch(() => {
+    panel.innerHTML = "";
+    panel.append(el(`<div class="empty-state"><div class="big">The map couldn't load.</div>
+      <p><a href="/from/${o}">The list view</a> has every destination.</p></div>`));
+  });
+
+  /* Days-with-round-trips for one destination inside the active month window,
+     plus the best (highest) cabin seen — that cabin colors the dot. */
+  function metric(d) {
+    const rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]);
+    const t0 = Math.max(0, todayIndex());
+    const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
+    const from = mo ? Math.max(mo.start, t0) : t0;
+    const to = mo ? Math.min(mo.end, rt.length) : rt.length;
+    let days = 0, union = 0;
+    for (let i = from; i < to; i++) if (rt[i]) { days++; union |= rt[i]; }
+    let best = 0;
+    for (let bit = 8; bit >= 1; bit >>= 1) if (union & bit) { best = bit; break; }
+    return { days, best };
+  }
+
+  function drawMap() {
+    const W = window.WORLD1;
+    panel.innerHTML = "";
+    const svg = el(`<svg class="map-svg" viewBox="0 0 ${W.w} ${W.h}" role="group"
+        aria-label="World map of destinations from ${esc(placeName(o))}">
+      <path class="map-sea" d="${W.sphere}"></path>
+      <path class="map-land" d="${W.land}"></path>
+      <g class="map-dots"></g>
+    </svg>`);
+    const tip = el(`<div class="tip map-tip" hidden></div>`);
+    const zoom = el(`<div class="map-zoom" role="group" aria-label="Zoom">
+      <button type="button" data-z="in" aria-label="Zoom in">+</button>
+      <button type="button" data-z="out" aria-label="Zoom out">−</button>
+      <button type="button" data-z="reset" aria-label="Reset view">⌂</button>
+    </div>`);
+    panel.append(svg, tip, zoom);
+
+    const dotsG = $(".map-dots", svg);
+    const view = { x: 0, y: 0, w: W.w }; // viewBox subset; height tracks aspect
+    const kOf = () => W.w / view.w;
+    const og = store.bundle.places[o]?.g;
+
+    /* el() parses in the HTML namespace, so circles are built as one string
+       and parsed by the <g> itself (SVG context). */
+    function redraw() {
+      let shown = 0, unplaced = 0;
+      const parts = [];
+      if (og) {
+        const [ox, oy] = projectLL(og[0], og[1]);
+        parts.push(`<circle class="map-origin" cx="${ox}" cy="${oy}" r="${4 / kOf()}"></circle>`);
+      }
+      for (const d of dests) {
+        const g = store.bundle.places[d]?.g;
+        const { days, best } = metric(d);
+        if (!days) continue;
+        if (!g) { unplaced++; continue; }
+        shown++;
+        const [x, y] = projectLL(g[0], g[1]);
+        // Radius grows with the square root of match-days so area ~ days.
+        const r = (2.1 + Math.sqrt(days) * 0.38) / kOf();
+        parts.push(`<circle class="map-dot ${bitClass(best)}" cx="${x}" cy="${y}" r="${r}"
+          tabindex="0" role="link" data-code="${d}" data-days="${days}" data-best="${best}"
+          aria-label="${esc(placeName(d))}: ${days} day${days > 1 ? "s" : ""} with round trips — open calendar"></circle>`);
+      }
+      dotsG.innerHTML = parts.join("");
+      const monthLabel = monthIdx >= 0 ? ` in ${next12Months()[monthIdx].label}` : "";
+      $(".map-count", controls).textContent =
+        `${shown} of ${dests.length} destinations have round trips${monthLabel} in the cabins you picked` +
+        (unplaced ? ` (${unplaced} more can't be placed on the map yet — see the list)` : "") + ".";
+    }
+
+    /* Tooltip follows hover/focus; the dot itself is the link. */
+    function showMapTip(dot) {
+      const d = dot.dataset.code, days = dot.dataset.days, best = Number(dot.dataset.best);
+      const label = (cabinLegend().find(([bit]) => bit === best) || [0, ""])[1];
+      tip.innerHTML = `<div class="t-date">${esc(placeName(d))} <span class="map-tip-code">${d}</span></div>
+        <div class="t-cab"><span class="swatch ${bitClass(best)}"></span>
+          ${days} day${days === "1" ? "" : "s"} with round trips · best: ${esc(label)}</div>`;
+      tip.hidden = false;
+      const pr = panel.getBoundingClientRect(), dr = dot.getBoundingClientRect();
+      const x = Math.min(pr.width - tip.offsetWidth - 8, Math.max(8, dr.left - pr.left + dr.width / 2 - tip.offsetWidth / 2));
+      const above = dr.top - pr.top - tip.offsetHeight - 8;
+      tip.style.left = `${x}px`;
+      tip.style.top = `${above > 4 ? above : dr.bottom - pr.top + 8}px`;
+    }
+    dotsG.addEventListener("pointerover", (e) => { const d = e.target.closest(".map-dot"); if (d) showMapTip(d); });
+    dotsG.addEventListener("pointerout", () => { tip.hidden = true; });
+    dotsG.addEventListener("focusin", (e) => { const d = e.target.closest(".map-dot"); if (d) showMapTip(d); });
+    dotsG.addEventListener("focusout", () => { tip.hidden = true; });
+    dotsG.addEventListener("click", (e) => {
+      const d = e.target.closest(".map-dot");
+      if (d && !panned) navigate(`/trip/${o}-${d.dataset.code}`);
+    });
+    dotsG.addEventListener("keydown", (e) => {
+      const d = e.target.closest(".map-dot");
+      if (d && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); navigate(`/trip/${o}-${d.dataset.code}`); }
+    });
+
+    /* Pan/zoom: wheel + drag + pinch + buttons, clamped to the sphere. */
+    function applyView() {
+      const h = W.h * (view.w / W.w);
+      view.x = Math.max(0, Math.min(W.w - view.w, view.x));
+      view.y = Math.max(0, Math.min(W.h - h, view.y));
+      svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${h}`);
+      redraw();
+    }
+    function zoomAt(factor, px, py) { // px,py in current viewBox coords
+      const w2 = Math.max(70, Math.min(W.w, view.w / factor));
+      const f = w2 / view.w;
+      view.x = px - (px - view.x) * f;
+      view.y = py - (py - view.y) * f;
+      view.w = w2;
+      applyView();
+    }
+    const toBox = (e) => {
+      const r = svg.getBoundingClientRect();
+      return [view.x + ((e.clientX - r.left) / r.width) * view.w,
+              view.y + ((e.clientY - r.top) / r.height) * (W.h * view.w / W.w)];
+    };
+    svg.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      const [px, py] = toBox(e);
+      zoomAt(e.deltaY < 0 ? 1.3 : 1 / 1.3, px, py);
+    }, { passive: false });
+    zoom.addEventListener("click", (e) => {
+      const b = e.target.closest("button");
+      if (!b) return;
+      if (b.dataset.z === "reset") { view.x = 0; view.y = 0; view.w = W.w; applyView(); return; }
+      const h = W.h * (view.w / W.w);
+      zoomAt(b.dataset.z === "in" ? 1.5 : 1 / 1.5, view.x + view.w / 2, view.y + h / 2);
+    });
+    /* Drag to pan; pinch to zoom. `panned` suppresses the click that ends a
+       drag so letting go over a dot doesn't teleport you to its route. */
+    let panned = false;
+    const ptrs = new Map();
+    let pinchD = 0;
+    svg.addEventListener("pointerdown", (e) => {
+      svg.setPointerCapture(e.pointerId);
+      ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+      if (ptrs.size === 2) {
+        const [a, b] = [...ptrs.values()];
+        pinchD = Math.hypot(a[0] - b[0], a[1] - b[1]);
+      }
+      panned = false;
+    });
+    svg.addEventListener("pointermove", (e) => {
+      if (!ptrs.has(e.pointerId)) return;
+      const prev = ptrs.get(e.pointerId);
+      ptrs.set(e.pointerId, [e.clientX, e.clientY]);
+      const r = svg.getBoundingClientRect();
+      if (ptrs.size === 1) {
+        const dx = (e.clientX - prev[0]) / r.width * view.w;
+        const dy = (e.clientY - prev[1]) / r.height * (W.h * view.w / W.w);
+        if (Math.abs(e.clientX - prev[0]) + Math.abs(e.clientY - prev[1]) > 1) panned = true;
+        view.x -= dx; view.y -= dy;
+        applyViewNoRedraw();
+      } else if (ptrs.size === 2) {
+        const [a, b] = [...ptrs.values()];
+        const d2 = Math.hypot(a[0] - b[0], a[1] - b[1]);
+        if (pinchD > 0 && Math.abs(d2 - pinchD) > 2) {
+          panned = true;
+          const cx = (a[0] + b[0]) / 2, cy = (a[1] + b[1]) / 2;
+          const px = view.x + ((cx - r.left) / r.width) * view.w;
+          const py = view.y + ((cy - r.top) / r.height) * (W.h * view.w / W.w);
+          zoomAt(d2 / pinchD, px, py);
+          pinchD = d2;
+        }
+      }
+    });
+    const endPtr = (e) => {
+      ptrs.delete(e.pointerId);
+      if (ptrs.size < 2) pinchD = 0;
+      if (!ptrs.size && panned) redraw(); // resize dots once the gesture ends
+    };
+    svg.addEventListener("pointerup", endPtr);
+    svg.addEventListener("pointercancel", endPtr);
+    /* Cheap pan while the finger is down: move the viewBox but keep dot sizes;
+       redraw (which resizes dots) happens once at gesture end. */
+    function applyViewNoRedraw() {
+      const h = W.h * (view.w / W.w);
+      view.x = Math.max(0, Math.min(W.w - view.w, view.x));
+      view.y = Math.max(0, Math.min(W.h - h, view.y));
+      svg.setAttribute("viewBox", `${view.x} ${view.y} ${view.w} ${h}`);
+    }
+
+    /* Filters re-count and re-color without touching the viewport. */
+    controls.addEventListener("click", (e) => {
+      const chip = e.target.closest(".chip[data-bit]");
+      if (!chip) return;
+      const bit = Number(chip.dataset.bit);
+      const next = mask ^ bit;
+      if (!next) return; // at least one cabin stays on
+      mask = next;
+      chip.setAttribute("aria-pressed", String(!!(mask & bit)));
+      redraw();
+    });
+    $(".map-month", controls).addEventListener("change", (e) => {
+      monthIdx = Number(e.target.value);
+      redraw();
+    });
+
+    applyView();
+  }
 }
 
 /* ---------------- pages: my alerts ---------------- */

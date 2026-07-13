@@ -132,6 +132,7 @@ index = days from 2026-01-01 to 2026-07-12
  "places": {
   "LON": {
    "country": "United Kingdom",
+   "g": [51.507, -0.128],
    "name": "London",
    "search": ["Heathrow", "LHR", "Gatwick", "LGW"]
   }
@@ -148,11 +149,13 @@ index = days from 2026-01-01 to 2026-07-12
 - `airlines`: airline id → `{cabins, name, slug}`. `cabins` maps each bitmask
   value (as a decimal string) to a display label. Render unknown bits as
   "Other".
-- `places`: place code → `{name, country?, search?}` for **every code
+- `places`: place code → `{name, country?, search?, g?}` for **every code
   appearing in `routes`**. `search` (optional) lists extra autocomplete
   aliases — airport names and airport IATA codes for multi-airport metros.
-  A code the processor doesn't know yet appears as `{"name": "<CODE>"}`;
-  render the raw code.
+  `g` (optional) is `[latitude, longitude]` — the city itself for metro
+  codes, else the airport (airport coordinates from OurAirports, public
+  domain). A code the processor doesn't know yet appears as
+  `{"name": "<CODE>"}`; render the raw code and skip it on maps.
 - `routes`: route → entry. In a route entry, **lowercase keys are metadata**:
   - `a`: airline id → nibble string (see day encoding). A route served by
     several airlines has several keys; merge availability client-side with a

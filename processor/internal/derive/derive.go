@@ -22,9 +22,10 @@ import (
 
 // Place is one curated place-table entry.
 type Place struct {
-	Name    string   `json:"name"`
-	Country string   `json:"country"`
-	Search  []string `json:"search"` // autocomplete aliases for multi-airport metros
+	Name    string    `json:"name"`
+	Country string    `json:"country"`
+	Search  []string  `json:"search"` // autocomplete aliases for multi-airport metros
+	G       []float64 `json:"g"`      // [lat, lon]; city itself for metro codes, else the airport
 }
 
 // AirlineInfo is one entry of the append-only airline registry
@@ -228,6 +229,11 @@ func Build(in Inputs) (*Output, error) {
 	for _, code := range slices.Sorted(maps.Keys(codes)) {
 		if p, ok := in.Places[code]; ok {
 			placesJSON[code] = placeJSON(p)
+			if len(p.G) != 2 {
+				// The map view silently skips coordinate-less places, so a
+				// curated entry missing "g" should surface, not hide.
+				in.Log.Warn("place-missing-coords", code)
+			}
 		} else {
 			placesJSON[code] = map[string]any{"name": code}
 			in.Log.Warn("unmapped-place-code", code)
@@ -344,6 +350,9 @@ func placeJSON(p Place) map[string]any {
 	}
 	if len(p.Search) > 0 {
 		m["search"] = p.Search
+	}
+	if len(p.G) == 2 {
+		m["g"] = p.G
 	}
 	return m
 }

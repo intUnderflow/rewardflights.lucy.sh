@@ -1,70 +1,138 @@
 {
   "ABZ": {
     "country": "United Kingdom",
+    "g": [
+      57.202,
+      -2.198
+    ],
     "name": "Aberdeen"
   },
   "ACC": {
     "country": "Ghana",
+    "g": [
+      5.605,
+      -0.167
+    ],
     "name": "Accra"
   },
   "ACE": {
     "country": "Spain",
+    "g": [
+      28.945,
+      -13.605
+    ],
     "name": "Lanzarote"
   },
   "AGA": {
     "country": "Morocco",
+    "g": [
+      30.322,
+      -9.412
+    ],
     "name": "Agadir"
   },
   "AGP": {
     "country": "Spain",
+    "g": [
+      36.675,
+      -4.499
+    ],
     "name": "Málaga"
   },
   "ALC": {
     "country": "Spain",
+    "g": [
+      38.282,
+      -0.558
+    ],
     "name": "Alicante"
   },
   "ALG": {
     "country": "Algeria",
+    "g": [
+      36.694,
+      3.215
+    ],
     "name": "Algiers"
   },
   "AMS": {
     "country": "Netherlands",
+    "g": [
+      52.309,
+      4.764
+    ],
     "name": "Amsterdam"
   },
   "ANU": {
     "country": "Antigua and Barbuda",
+    "g": [
+      17.137,
+      -61.793
+    ],
     "name": "Antigua"
   },
   "ATH": {
     "country": "Greece",
+    "g": [
+      37.936,
+      23.945
+    ],
     "name": "Athens"
   },
   "ATL": {
     "country": "United States",
+    "g": [
+      33.637,
+      -84.428
+    ],
     "name": "Atlanta"
   },
   "AUS": {
     "country": "United States",
+    "g": [
+      30.198,
+      -97.662
+    ],
     "name": "Austin"
   },
   "AYT": {
     "country": "Türkiye",
+    "g": [
+      36.899,
+      30.801
+    ],
     "name": "Antalya"
   },
   "BAH": {
     "country": "Bahrain",
+    "g": [
+      26.267,
+      50.638
+    ],
     "name": "Bahrain"
   },
   "BCN": {
     "country": "Spain",
+    "g": [
+      41.297,
+      2.078
+    ],
     "name": "Barcelona"
   },
   "BDS": {
     "country": "Italy",
+    "g": [
+      40.658,
+      17.947
+    ],
     "name": "Brindisi"
   },
   "BER": {
     "country": "Germany",
+    "g": [
+      52.362,
+      13.502
+    ],
     "name": "Berlin",
     "search": [
       "Brandenburg"
@@ -72,54 +140,106 @@
   },
   "BFS": {
     "country": "United Kingdom",
+    "g": [
+      54.658,
+      -6.216
+    ],
     "name": "Belfast"
   },
   "BGI": {
     "country": "Barbados",
+    "g": [
+      13.075,
+      -59.491
+    ],
     "name": "Barbados"
   },
   "BKK": {
     "country": "Thailand",
+    "g": [
+      13.681,
+      100.747
+    ],
     "name": "Bangkok"
   },
   "BLL": {
     "country": "Denmark",
+    "g": [
+      55.74,
+      9.157
+    ],
     "name": "Billund"
   },
   "BLQ": {
     "country": "Italy",
+    "g": [
+      44.535,
+      11.289
+    ],
     "name": "Bologna"
   },
   "BLR": {
     "country": "India",
+    "g": [
+      13.198,
+      77.706
+    ],
     "name": "Bengaluru"
   },
   "BNA": {
     "country": "United States",
+    "g": [
+      36.124,
+      -86.678
+    ],
     "name": "Nashville"
   },
   "BOD": {
     "country": "France",
+    "g": [
+      44.829,
+      -0.715
+    ],
     "name": "Bordeaux"
   },
   "BOM": {
     "country": "India",
+    "g": [
+      19.089,
+      72.868
+    ],
     "name": "Mumbai"
   },
   "BOS": {
     "country": "United States",
+    "g": [
+      42.362,
+      -71.008
+    ],
     "name": "Boston"
   },
   "BRI": {
     "country": "Italy",
+    "g": [
+      41.139,
+      16.761
+    ],
     "name": "Bari"
   },
   "BUD": {
     "country": "Hungary",
+    "g": [
+      47.43,
+      19.262
+    ],
     "name": "Budapest"
   },
   "BUE": {
     "country": "Argentina",
+    "g": [
+      -34.604,
+      -58.382
+    ],
     "name": "Buenos Aires",
     "search": [
       "Ezeiza",
@@ -130,22 +250,42 @@
   },
   "BWI": {
     "country": "United States",
+    "g": [
+      39.175,
+      -76.668
+    ],
     "name": "Baltimore"
   },
   "CAG": {
     "country": "Italy",
+    "g": [
+      39.251,
+      9.054
+    ],
     "name": "Cagliari"
   },
   "CAI": {
     "country": "Egypt",
+    "g": [
+      30.112,
+      31.397
+    ],
     "name": "Cairo"
   },
   "CFU": {
     "country": "Greece",
+    "g": [
+      39.601,
+      19.912
+    ],
     "name": "Corfu"
   },
   "CHI": {
     "country": "United States",
+    "g": [
+      41.878,
+      -87.63
+    ],
     "name": "Chicago",
     "search": [
       "O'Hare",
@@ -156,98 +296,194 @@
   },
   "CHQ": {
     "country": "Greece",
+    "g": [
+      35.531,
+      24.151
+    ],
     "name": "Chania"
   },
   "CMB": {
     "country": "Sri Lanka",
+    "g": [
+      7.181,
+      79.884
+    ],
     "name": "Colombo"
   },
   "CMF": {
     "country": "France",
+    "g": [
+      45.638,
+      5.88
+    ],
     "name": "Chambéry"
   },
   "CPH": {
     "country": "Denmark",
+    "g": [
+      55.618,
+      12.656
+    ],
     "name": "Copenhagen"
   },
   "CPT": {
     "country": "South Africa",
+    "g": [
+      -33.974,
+      18.604
+    ],
     "name": "Cape Town"
   },
   "CTA": {
     "country": "Italy",
+    "g": [
+      37.467,
+      15.066
+    ],
     "name": "Catania"
   },
   "CUN": {
     "country": "Mexico",
+    "g": [
+      21.041,
+      -86.873
+    ],
     "name": "Cancún"
   },
   "CVG": {
     "country": "United States",
+    "g": [
+      39.049,
+      -84.668
+    ],
     "name": "Cincinnati"
   },
   "DBV": {
     "country": "Croatia",
+    "g": [
+      42.562,
+      18.266
+    ],
     "name": "Dubrovnik"
   },
   "DEL": {
     "country": "India",
+    "g": [
+      28.556,
+      77.095
+    ],
     "name": "Delhi"
   },
   "DEN": {
     "country": "United States",
+    "g": [
+      39.86,
+      -104.674
+    ],
     "name": "Denver"
   },
   "DFW": {
     "country": "United States",
+    "g": [
+      32.897,
+      -97.038
+    ],
     "name": "Dallas–Fort Worth"
   },
   "DLM": {
     "country": "Türkiye",
+    "g": [
+      36.713,
+      28.793
+    ],
     "name": "Dalaman"
   },
   "DOH": {
     "country": "Qatar",
+    "g": [
+      25.273,
+      51.608
+    ],
     "name": "Doha"
   },
   "DUB": {
     "country": "Ireland",
+    "g": [
+      53.429,
+      -6.262
+    ],
     "name": "Dublin"
   },
   "DUS": {
     "country": "Germany",
+    "g": [
+      51.29,
+      6.767
+    ],
     "name": "Düsseldorf"
   },
   "DXB": {
     "country": "United Arab Emirates",
+    "g": [
+      25.25,
+      55.371
+    ],
     "name": "Dubai"
   },
   "EAS": {
     "country": "Spain",
+    "g": [
+      43.356,
+      -1.791
+    ],
     "name": "San Sebastián"
   },
   "EDI": {
     "country": "United Kingdom",
+    "g": [
+      55.95,
+      -3.372
+    ],
     "name": "Edinburgh"
   },
   "EFL": {
     "country": "Greece",
+    "g": [
+      38.12,
+      20.5
+    ],
     "name": "Kefalonia"
   },
   "EGC": {
     "country": "France",
+    "g": [
+      44.825,
+      0.519
+    ],
     "name": "Bergerac"
   },
   "FAO": {
     "country": "Portugal",
+    "g": [
+      37.016,
+      -7.971
+    ],
     "name": "Faro"
   },
   "FLR": {
     "country": "Italy",
+    "g": [
+      43.809,
+      11.203
+    ],
     "name": "Florence"
   },
   "FNC": {
     "country": "Portugal",
+    "g": [
+      32.698,
+      -16.775
+    ],
     "name": "Funchal (Madeira)",
     "search": [
       "Madeira"
@@ -255,62 +491,122 @@
   },
   "FRA": {
     "country": "Germany",
+    "g": [
+      50.027,
+      8.558
+    ],
     "name": "Frankfurt"
   },
   "FSC": {
     "country": "France",
+    "g": [
+      41.502,
+      9.097
+    ],
     "name": "Figari (Corsica)"
   },
   "FUE": {
     "country": "Spain",
+    "g": [
+      28.453,
+      -13.864
+    ],
     "name": "Fuerteventura"
   },
   "GCI": {
     "country": "United Kingdom",
+    "g": [
+      49.435,
+      -2.602
+    ],
     "name": "Guernsey"
   },
   "GCM": {
     "country": "Cayman Islands",
+    "g": [
+      19.293,
+      -81.358
+    ],
     "name": "Grand Cayman"
   },
   "GEO": {
     "country": "Guyana",
+    "g": [
+      6.499,
+      -58.254
+    ],
     "name": "Georgetown"
   },
   "GLA": {
     "country": "United Kingdom",
+    "g": [
+      55.872,
+      -4.433
+    ],
     "name": "Glasgow"
   },
   "GND": {
     "country": "Grenada",
+    "g": [
+      12.004,
+      -61.785
+    ],
     "name": "Grenada"
   },
   "GOT": {
     "country": "Sweden",
+    "g": [
+      57.663,
+      12.28
+    ],
     "name": "Gothenburg"
   },
   "GRZ": {
     "country": "Austria",
+    "g": [
+      46.991,
+      15.44
+    ],
     "name": "Graz"
   },
   "GVA": {
     "country": "Switzerland",
+    "g": [
+      46.238,
+      6.109
+    ],
     "name": "Geneva"
   },
   "HAJ": {
     "country": "Germany",
+    "g": [
+      52.461,
+      9.685
+    ],
     "name": "Hanover"
   },
   "HAM": {
     "country": "Germany",
+    "g": [
+      53.63,
+      9.988
+    ],
     "name": "Hamburg"
   },
   "HER": {
     "country": "Greece",
+    "g": [
+      35.34,
+      25.18
+    ],
     "name": "Heraklion"
   },
   "HOU": {
     "country": "United States",
+    "g": [
+      29.76,
+      -95.37
+    ],
     "name": "Houston",
     "search": [
       "Intercontinental",
@@ -320,22 +616,42 @@
   },
   "HYD": {
     "country": "India",
+    "g": [
+      17.231,
+      78.43
+    ],
     "name": "Hyderabad"
   },
   "IBZ": {
     "country": "Spain",
+    "g": [
+      38.873,
+      1.373
+    ],
     "name": "Ibiza"
   },
   "INN": {
     "country": "Austria",
+    "g": [
+      47.26,
+      11.344
+    ],
     "name": "Innsbruck"
   },
   "INV": {
     "country": "United Kingdom",
+    "g": [
+      57.542,
+      -4.048
+    ],
     "name": "Inverness"
   },
   "IST": {
     "country": "Türkiye",
+    "g": [
+      41.275,
+      28.732
+    ],
     "name": "Istanbul",
     "search": [
       "Sabiha Gokcen",
@@ -344,54 +660,106 @@
   },
   "IVL": {
     "country": "Finland",
+    "g": [
+      68.607,
+      27.405
+    ],
     "name": "Ivalo"
   },
   "JER": {
     "country": "United Kingdom",
+    "g": [
+      49.208,
+      -2.196
+    ],
     "name": "Jersey"
   },
   "JMK": {
     "country": "Greece",
+    "g": [
+      37.435,
+      25.348
+    ],
     "name": "Mykonos"
   },
   "KGS": {
     "country": "Greece",
+    "g": [
+      36.795,
+      27.091
+    ],
     "name": "Kos"
   },
   "KIN": {
     "country": "Jamaica",
+    "g": [
+      17.936,
+      -76.787
+    ],
     "name": "Kingston"
   },
   "KLX": {
     "country": "Greece",
+    "g": [
+      37.068,
+      22.025
+    ],
     "name": "Kalamata"
   },
   "KRK": {
     "country": "Poland",
+    "g": [
+      50.078,
+      19.785
+    ],
     "name": "Kraków"
   },
   "KUL": {
     "country": "Malaysia",
+    "g": [
+      2.746,
+      101.71
+    ],
     "name": "Kuala Lumpur"
   },
   "LAS": {
     "country": "United States",
+    "g": [
+      36.083,
+      -115.152
+    ],
     "name": "Las Vegas"
   },
   "LAX": {
     "country": "United States",
+    "g": [
+      33.943,
+      -118.408
+    ],
     "name": "Los Angeles"
   },
   "LCA": {
     "country": "Cyprus",
+    "g": [
+      34.875,
+      33.625
+    ],
     "name": "Larnaca"
   },
   "LJU": {
     "country": "Slovenia",
+    "g": [
+      46.224,
+      14.458
+    ],
     "name": "Ljubljana"
   },
   "LON": {
     "country": "United Kingdom",
+    "g": [
+      51.507,
+      -0.128
+    ],
     "name": "London",
     "search": [
       "Heathrow",
@@ -408,46 +776,90 @@
   },
   "LPA": {
     "country": "Spain",
+    "g": [
+      27.932,
+      -15.387
+    ],
     "name": "Gran Canaria"
   },
   "LUX": {
     "country": "Luxembourg",
+    "g": [
+      49.627,
+      6.212
+    ],
     "name": "Luxembourg"
   },
   "LYS": {
     "country": "France",
+    "g": [
+      45.726,
+      5.09
+    ],
     "name": "Lyon"
   },
   "MAA": {
     "country": "India",
+    "g": [
+      12.99,
+      80.169
+    ],
     "name": "Chennai"
   },
   "MAD": {
     "country": "Spain",
+    "g": [
+      40.493,
+      -3.572
+    ],
     "name": "Madrid"
   },
   "MAH": {
     "country": "Spain",
+    "g": [
+      39.863,
+      4.219
+    ],
     "name": "Menorca"
   },
   "MAN": {
     "country": "United Kingdom",
+    "g": [
+      53.349,
+      -2.28
+    ],
     "name": "Manchester"
   },
   "MEL": {
     "country": "Australia",
+    "g": [
+      -37.671,
+      144.838
+    ],
     "name": "Melbourne"
   },
   "MEX": {
     "country": "Mexico",
+    "g": [
+      19.436,
+      -99.07
+    ],
     "name": "Mexico City"
   },
   "MIA": {
     "country": "United States",
+    "g": [
+      25.796,
+      -80.29
+    ],
     "name": "Miami"
   },
   "MIL": {
     "country": "Italy",
+    "g": [
+      45.464,
+      9.19
+    ],
     "name": "Milan",
     "search": [
       "Malpensa",
@@ -460,10 +872,18 @@
   },
   "MLA": {
     "country": "Malta",
+    "g": [
+      35.846,
+      14.492
+    ],
     "name": "Malta"
   },
   "MLE": {
     "country": "Maldives",
+    "g": [
+      4.192,
+      73.529
+    ],
     "name": "Malé (Maldives)",
     "search": [
       "Maldives"
@@ -471,38 +891,74 @@
   },
   "MPL": {
     "country": "France",
+    "g": [
+      43.576,
+      3.963
+    ],
     "name": "Montpellier"
   },
   "MRS": {
     "country": "France",
+    "g": [
+      43.438,
+      5.213
+    ],
     "name": "Marseille"
   },
   "MSY": {
     "country": "United States",
+    "g": [
+      29.993,
+      -90.265
+    ],
     "name": "New Orleans"
   },
   "MUC": {
     "country": "Germany",
+    "g": [
+      48.354,
+      11.786
+    ],
     "name": "Munich"
   },
   "NAS": {
     "country": "Bahamas",
+    "g": [
+      25.039,
+      -77.466
+    ],
     "name": "Nassau"
   },
   "NBO": {
     "country": "Kenya",
+    "g": [
+      -1.319,
+      36.928
+    ],
     "name": "Nairobi"
   },
   "NCE": {
     "country": "France",
+    "g": [
+      43.658,
+      7.216
+    ],
     "name": "Nice"
   },
   "NCL": {
     "country": "United Kingdom",
+    "g": [
+      55.038,
+      -1.69
+    ],
     "name": "Newcastle"
   },
   "NYC": {
     "country": "United States",
+    "g": [
+      40.713,
+      -74.006
+    ],
     "name": "New York",
     "search": [
       "JFK",
@@ -514,18 +970,34 @@
   },
   "OLB": {
     "country": "Italy",
+    "g": [
+      40.899,
+      9.518
+    ],
     "name": "Olbia"
   },
   "OPO": {
     "country": "Portugal",
+    "g": [
+      41.248,
+      -8.681
+    ],
     "name": "Porto"
   },
   "ORL": {
     "country": "United States",
+    "g": [
+      28.538,
+      -81.379
+    ],
     "name": "Orlando"
   },
   "OSL": {
     "country": "Norway",
+    "g": [
+      60.194,
+      11.1
+    ],
     "name": "Oslo",
     "search": [
       "Gardermoen"
@@ -533,6 +1005,10 @@
   },
   "PAR": {
     "country": "France",
+    "g": [
+      48.857,
+      2.352
+    ],
     "name": "Paris",
     "search": [
       "Charles de Gaulle",
@@ -543,66 +1019,130 @@
   },
   "PDX": {
     "country": "United States",
+    "g": [
+      45.589,
+      -122.598
+    ],
     "name": "Portland"
   },
   "PEG": {
     "country": "Italy",
+    "g": [
+      43.096,
+      12.513
+    ],
     "name": "Perugia"
   },
   "PFO": {
     "country": "Cyprus",
+    "g": [
+      34.718,
+      32.486
+    ],
     "name": "Paphos"
   },
   "PHL": {
     "country": "United States",
+    "g": [
+      39.872,
+      -75.241
+    ],
     "name": "Philadelphia"
   },
   "PHX": {
     "country": "United States",
+    "g": [
+      33.435,
+      -112.006
+    ],
     "name": "Phoenix"
   },
   "PIT": {
     "country": "United States",
+    "g": [
+      40.492,
+      -80.233
+    ],
     "name": "Pittsburgh"
   },
   "PMI": {
     "country": "Spain",
+    "g": [
+      39.552,
+      2.739
+    ],
     "name": "Palma de Mallorca"
   },
   "PMO": {
     "country": "Italy",
+    "g": [
+      38.176,
+      13.091
+    ],
     "name": "Palermo"
   },
   "POS": {
     "country": "Trinidad and Tobago",
+    "g": [
+      10.595,
+      -61.338
+    ],
     "name": "Port of Spain"
   },
   "PRG": {
     "country": "Czechia",
+    "g": [
+      50.101,
+      14.26
+    ],
     "name": "Prague"
   },
   "PSA": {
     "country": "Italy",
+    "g": [
+      43.684,
+      10.393
+    ],
     "name": "Pisa"
   },
   "PUJ": {
     "country": "Dominican Republic",
+    "g": [
+      18.567,
+      -68.365
+    ],
     "name": "Punta Cana"
   },
   "PVK": {
     "country": "Greece",
+    "g": [
+      38.925,
+      20.765
+    ],
     "name": "Preveza"
   },
   "RAK": {
     "country": "Morocco",
+    "g": [
+      31.605,
+      -8.036
+    ],
     "name": "Marrakesh"
   },
   "RBA": {
     "country": "Morocco",
+    "g": [
+      34.051,
+      -6.752
+    ],
     "name": "Rabat"
   },
   "REK": {
     "country": "Iceland",
+    "g": [
+      64.147,
+      -21.943
+    ],
     "name": "Reykjavík",
     "search": [
       "Keflavik",
@@ -611,10 +1151,18 @@
   },
   "RHO": {
     "country": "Greece",
+    "g": [
+      36.405,
+      28.086
+    ],
     "name": "Rhodes"
   },
   "ROM": {
     "country": "Italy",
+    "g": [
+      41.903,
+      12.496
+    ],
     "name": "Rome",
     "search": [
       "Fiumicino",
@@ -625,58 +1173,114 @@
   },
   "RTM": {
     "country": "Netherlands",
+    "g": [
+      51.957,
+      4.437
+    ],
     "name": "Rotterdam"
   },
   "RUH": {
     "country": "Saudi Arabia",
+    "g": [
+      24.958,
+      46.699
+    ],
     "name": "Riyadh"
   },
   "SAN": {
     "country": "United States",
+    "g": [
+      32.734,
+      -117.19
+    ],
     "name": "San Diego"
   },
   "SEA": {
     "country": "United States",
+    "g": [
+      47.448,
+      -122.31
+    ],
     "name": "Seattle"
   },
   "SFO": {
     "country": "United States",
+    "g": [
+      37.62,
+      -122.375
+    ],
     "name": "San Francisco"
   },
   "SIN": {
     "country": "Singapore",
+    "g": [
+      1.35,
+      103.994
+    ],
     "name": "Singapore"
   },
   "SJO": {
     "country": "Costa Rica",
+    "g": [
+      9.994,
+      -84.209
+    ],
     "name": "San José"
   },
   "SKB": {
     "country": "Saint Kitts and Nevis",
+    "g": [
+      17.311,
+      -62.719
+    ],
     "name": "St Kitts"
   },
   "SKG": {
     "country": "Greece",
+    "g": [
+      40.519,
+      22.97
+    ],
     "name": "Thessaloniki"
   },
   "SLU": {
     "country": "Saint Lucia",
+    "g": [
+      14.02,
+      -60.993
+    ],
     "name": "St Lucia"
   },
   "SPU": {
     "country": "Croatia",
+    "g": [
+      43.539,
+      16.298
+    ],
     "name": "Split"
   },
   "SSH": {
     "country": "Egypt",
+    "g": [
+      27.977,
+      34.395
+    ],
     "name": "Sharm El Sheikh"
   },
   "STL": {
     "country": "United States",
+    "g": [
+      38.749,
+      -90.37
+    ],
     "name": "St Louis"
   },
   "STO": {
     "country": "Sweden",
+    "g": [
+      59.329,
+      18.069
+    ],
     "name": "Stockholm",
     "search": [
       "Arlanda",
@@ -687,22 +1291,42 @@
   },
   "SVQ": {
     "country": "Spain",
+    "g": [
+      37.418,
+      -5.893
+    ],
     "name": "Seville"
   },
   "SYD": {
     "country": "Australia",
+    "g": [
+      -33.946,
+      151.177
+    ],
     "name": "Sydney"
   },
   "SZG": {
     "country": "Austria",
+    "g": [
+      47.793,
+      13.004
+    ],
     "name": "Salzburg"
   },
   "TAB": {
     "country": "Trinidad and Tobago",
+    "g": [
+      11.15,
+      -60.831
+    ],
     "name": "Tobago"
   },
   "TCI": {
     "country": "Spain",
+    "g": [
+      28.292,
+      -16.629
+    ],
     "name": "Tenerife",
     "search": [
       "Tenerife South",
@@ -713,34 +1337,66 @@
   },
   "TIA": {
     "country": "Albania",
+    "g": [
+      41.415,
+      19.721
+    ],
     "name": "Tirana"
   },
   "TIV": {
     "country": "Montenegro",
+    "g": [
+      42.405,
+      18.723
+    ],
     "name": "Tivat"
   },
   "TLN": {
     "country": "France",
+    "g": [
+      43.097,
+      6.146
+    ],
     "name": "Toulon"
   },
   "TLS": {
     "country": "France",
+    "g": [
+      43.629,
+      1.364
+    ],
     "name": "Toulouse"
   },
   "TOS": {
     "country": "Norway",
+    "g": [
+      69.683,
+      18.919
+    ],
     "name": "Tromsø"
   },
   "TPA": {
     "country": "United States",
+    "g": [
+      27.976,
+      -82.533
+    ],
     "name": "Tampa"
   },
   "TRN": {
     "country": "Italy",
+    "g": [
+      45.201,
+      7.65
+    ],
     "name": "Turin"
   },
   "TYO": {
     "country": "Japan",
+    "g": [
+      35.676,
+      139.65
+    ],
     "name": "Tokyo",
     "search": [
       "Haneda",
@@ -751,18 +1407,34 @@
   },
   "VCE": {
     "country": "Italy",
+    "g": [
+      45.505,
+      12.352
+    ],
     "name": "Venice"
   },
   "VIE": {
     "country": "Austria",
+    "g": [
+      48.11,
+      16.57
+    ],
     "name": "Vienna"
   },
   "VRN": {
     "country": "Italy",
+    "g": [
+      45.395,
+      10.887
+    ],
     "name": "Verona"
   },
   "WAS": {
     "country": "United States",
+    "g": [
+      38.907,
+      -77.037
+    ],
     "name": "Washington, D.C.",
     "search": [
       "Dulles",
@@ -773,6 +1445,10 @@
   },
   "YMQ": {
     "country": "Canada",
+    "g": [
+      45.502,
+      -73.567
+    ],
     "name": "Montreal",
     "search": [
       "Montreal-Trudeau",
@@ -781,6 +1457,10 @@
   },
   "YTO": {
     "country": "Canada",
+    "g": [
+      43.653,
+      -79.383
+    ],
     "name": "Toronto",
     "search": [
       "Pearson",
@@ -791,14 +1471,26 @@
   },
   "YVR": {
     "country": "Canada",
+    "g": [
+      49.194,
+      -123.184
+    ],
     "name": "Vancouver"
   },
   "ZAG": {
     "country": "Croatia",
+    "g": [
+      45.743,
+      16.069
+    ],
     "name": "Zagreb"
   },
   "ZRH": {
     "country": "Switzerland",
+    "g": [
+      47.458,
+      8.548
+    ],
     "name": "Zurich"
   }
 }

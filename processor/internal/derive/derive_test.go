@@ -17,8 +17,8 @@ var testRegistry = map[string]AirlineInfo{
 }
 
 var testPlaces = map[string]Place{
-	"ABZ": {Name: "Aberdeen", Country: "United Kingdom"},
-	"LON": {Name: "London", Country: "United Kingdom"},
+	"ABZ": {Name: "Aberdeen", Country: "United Kingdom", G: []float64{57.202, -2.198}},
+	"LON": {Name: "London", Country: "United Kingdom", G: []float64{51.507, -0.128}},
 }
 
 // buildDataset runs Build over a single BA route with the given date->cabins
@@ -147,5 +147,47 @@ func TestEmptyCabinsSkipped(t *testing.T) {
 	// The skipped dates must not extend the horizon either: 03-03 is last.
 	if got := int(bundle["days"].(float64)); got != day(t, "2026-03-03")-e+1 {
 		t.Errorf("days = %d", got)
+	}
+}
+
+// Coordinates: a curated "g" flows into the bundle's place table; a curated
+// entry WITHOUT one warns (the map view would silently skip that place).
+func TestPlaceCoordsEmittedAndMissingCoordsWarn(t *testing.T) {
+	route := &source.Route{Dates: map[string]source.DateEntry{
+		"2026-03-01": {Cabins: []string{"M"}, Path: "src/2026-03-01.json"},
+	}}
+	ds := &source.Dataset{Airlines: map[string]*source.Airline{
+		"british-airways": {Slug: "british-airways", Routes: map[string]*source.Route{"ABZ-LON": route}},
+	}}
+	places := map[string]Place{
+		"ABZ": {Name: "Aberdeen", Country: "United Kingdom", G: []float64{57.202, -2.198}},
+		"LON": {Name: "London", Country: "United Kingdom"}, // no coords -> warn
+	}
+	var buf bytes.Buffer
+	out, err := Build(Inputs{
+		Dataset: ds, Places: places, Airlines: testRegistry,
+		SHA: "sha", SourceTime: int64(day(t, "2026-03-01")) * 86400, Log: warnings.New(&buf),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var bundle map[string]any
+	if err := json.Unmarshal(out.Files["availability.json"], &bundle); err != nil {
+		t.Fatal(err)
+	}
+	pl := bundle["places"].(map[string]any)
+	abz := pl["ABZ"].(map[string]any)
+	g, ok := abz["g"].([]any)
+	if !ok || len(g) != 2 || g[0].(float64) != 57.202 || g[1].(float64) != -2.198 {
+		t.Errorf("ABZ g = %v, want [57.202 -2.198]", abz["g"])
+	}
+	if _, has := pl["LON"].(map[string]any)["g"]; has {
+		t.Error("LON must not carry g when the curated entry has none")
+	}
+	if !strings.Contains(buf.String(), "place-missing-coords LON") {
+		t.Errorf("warnings = %q, want place-missing-coords LON", buf.String())
+	}
+	if strings.Contains(buf.String(), "place-missing-coords ABZ") {
+		t.Error("ABZ has coords and must not warn")
 	}
 }

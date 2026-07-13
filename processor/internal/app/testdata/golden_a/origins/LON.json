@@ -16,6 +16,10 @@
  "places": {
   "LON": {
    "country": "United Kingdom",
+   "g": [
+    51.507,
+    -0.128
+   ],
    "name": "London",
    "search": [
     "Heathrow",
@@ -32,6 +36,10 @@
   },
   "TYO": {
    "country": "Japan",
+   "g": [
+    35.676,
+    139.65
+   ],
    "name": "Tokyo",
    "search": [
     "Haneda",
