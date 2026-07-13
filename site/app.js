@@ -2682,8 +2682,8 @@ function renderMap(o) {
       <a href="/from/${o}">List</a><span class="vt-on" aria-current="page">Map</span>
     </div>
     <p class="page-sub">Every dot is a destination with bookable round trips
-      (${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights, same cabin both ways) — free, no account,
-      data as of ${esc(freshLabel())}. Tap a dot for the route's calendar.</p>
+      (same cabin both ways) — free, no account, data as of ${esc(freshLabel())}.
+      Tap a dot for the route's calendar.</p>
   </div>`));
 
   if (!dests.length) {
@@ -2694,10 +2694,14 @@ function renderMap(o) {
   }
 
   /* Controls: cabin chips (always visible — a map that hides cabins is the
-     top competitor complaint) + a month narrower (the "school holidays" ask;
-     default stays the whole year, not a 2-week window). */
+     top competitor complaint), a month narrower (the "school holidays" ask;
+     default stays the whole year, not a 2-week window), and the same
+     trip-length window as the route pages, seeded from the shared session
+     preference so map → calendar keeps the trip you had in mind. */
   let mask = cabinLegend().reduce((m, [bit]) => m | bit, 0);
   let monthIdx = -1; // -1 = next 12 months
+  let nights = parseNights(new URLSearchParams(location.search).get("nights"))
+    || getNightsPref() || NIGHTS_DEFAULT.slice();
   const controls = el(`<div class="section-pad map-controls">
     <div class="chips" role="group" aria-label="Cabins">${cabinLegend().map(([bit, label]) =>
       `<button type="button" class="chip" aria-pressed="true" data-bit="${bit}">
@@ -2709,9 +2713,55 @@ function renderMap(o) {
         ${next12Months().map((mo, i) => `<option value="${i}">${esc(mo.label)}</option>`).join("")}
       </select>
     </label>
+    <div class="nights-ctl" role="group" aria-label="Trip length in nights">
+      <span class="nc-label">Trip length</span>
+      ${NIGHTS_PRESETS.map(([label, lo, hi]) =>
+        `<button type="button" class="np" data-lo="${lo}" data-hi="${hi}" aria-pressed="false">
+           ${esc(label)} <span class="np-r">${lo}–${hi}</span></button>`).join("")}
+      <span class="np-custom">
+        <input id="np-min" type="number" inputmode="numeric" min="1" max="60" aria-label="Minimum nights">
+        <span aria-hidden="true">–</span>
+        <input id="np-max" type="number" inputmode="numeric" min="1" max="60" aria-label="Maximum nights">
+        <span class="np-unit">nights</span>
+      </span>
+    </div>
     <p class="map-count" role="status"></p>
   </div>`);
   mainEl.append(controls);
+
+  /* Same behavior as the trip page's control: presets + clamped custom
+     inputs, persisted to the session pref and mirrored into the URL so the
+     map stays shareable and dot links inherit the window via nightsQS(). */
+  const minIn = $("#np-min", controls), maxIn = $("#np-max", controls);
+  let onNightsChange = () => {};
+  function syncNights() {
+    for (const b of controls.querySelectorAll(".np")) {
+      b.setAttribute("aria-pressed",
+        Number(b.dataset.lo) === nights[0] && Number(b.dataset.hi) === nights[1] ? "true" : "false");
+    }
+    minIn.value = nights[0]; maxIn.value = nights[1];
+  }
+  function applyNights(lo, hi) {
+    nights = [lo, hi];
+    setNightsPref(lo, hi);
+    const u = new URL(location.href);
+    u.searchParams.set("nights", `${lo}-${hi}`);
+    history.replaceState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
+    syncNights();
+    onNightsChange();
+  }
+  const clampN = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  function nightsFromInputs(which) {
+    let lo = clampN(Math.round(Number(minIn.value)) || nights[0], 1, 60);
+    let hi = clampN(Math.round(Number(maxIn.value)) || nights[1], 1, 60);
+    if (lo > hi) { if (which === "min") hi = lo; else lo = hi; }
+    applyNights(lo, hi);
+  }
+  controls.querySelectorAll(".np").forEach((b) =>
+    b.addEventListener("click", () => applyNights(Number(b.dataset.lo), Number(b.dataset.hi))));
+  minIn.addEventListener("change", () => nightsFromInputs("min"));
+  maxIn.addEventListener("change", () => nightsFromInputs("max"));
+  syncNights();
 
   const panel = el(`<div class="map-panel">
     <div class="map-loading"><div class="sk-line" style="height:200px"></div></div>
@@ -2732,7 +2782,7 @@ function renderMap(o) {
   /* Days-with-round-trips for one destination inside the active month window,
      plus the best (highest) cabin seen — that cabin colors the dot. */
   function metric(d) {
-    const rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]);
+    const rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, nights[0], nights[1]);
     const t0 = Math.max(0, todayIndex());
     const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
     const from = mo ? Math.max(mo.start, t0) : t0;
@@ -2790,8 +2840,10 @@ function renderMap(o) {
       }
       dotsG.innerHTML = parts.join("");
       const monthLabel = monthIdx >= 0 ? ` in ${next12Months()[monthIdx].label}` : "";
+      const nightsLabel = nights[0] === NIGHTS_DEFAULT[0] && nights[1] === NIGHTS_DEFAULT[1]
+        ? "" : ` of ${nights[0]}–${nights[1]} nights`;
       $(".map-count", controls).textContent =
-        `${shown} of ${dests.length} destinations have round trips${monthLabel} in the cabins you picked` +
+        `${shown} of ${dests.length} destinations have round trips${nightsLabel}${monthLabel} in the cabins you picked` +
         (unplaced ? ` (${unplaced} more can't be placed on the map yet — see the list)` : "") + ".";
     }
 
@@ -2815,11 +2867,11 @@ function renderMap(o) {
     dotsG.addEventListener("focusout", () => { tip.hidden = true; });
     dotsG.addEventListener("click", (e) => {
       const d = e.target.closest(".map-dot");
-      if (d && !panned) navigate(`/trip/${o}-${d.dataset.code}`);
+      if (d && !panned) navigate(`/trip/${o}-${d.dataset.code}${nightsQS()}`);
     });
     dotsG.addEventListener("keydown", (e) => {
       const d = e.target.closest(".map-dot");
-      if (d && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); navigate(`/trip/${o}-${d.dataset.code}`); }
+      if (d && (e.key === "Enter" || e.key === " ")) { e.preventDefault(); navigate(`/trip/${o}-${d.dataset.code}${nightsQS()}`); }
     });
 
     /* Pan/zoom: wheel + drag + pinch + buttons, clamped to the sphere. */
@@ -2856,8 +2908,10 @@ function renderMap(o) {
       zoomAt(b.dataset.z === "in" ? 1.5 : 1 / 1.5, view.x + view.w / 2, view.y + h / 2);
     });
     /* Drag to pan; pinch to zoom. `panned` suppresses the click that ends a
-       drag so letting go over a dot doesn't teleport you to its route. */
-    let panned = false;
+       REAL drag so letting go over a dot doesn't teleport you to its route —
+       but ordinary click jitter (a few px of mouse or finger wobble) must
+       still count as a click, so it only trips past a distance budget. */
+    let panned = false, dragDist = 0;
     const ptrs = new Map();
     let pinchD = 0;
     svg.addEventListener("pointerdown", (e) => {
@@ -2867,7 +2921,7 @@ function renderMap(o) {
         const [a, b] = [...ptrs.values()];
         pinchD = Math.hypot(a[0] - b[0], a[1] - b[1]);
       }
-      panned = false;
+      panned = false; dragDist = 0;
     });
     svg.addEventListener("pointermove", (e) => {
       if (!ptrs.has(e.pointerId)) return;
@@ -2877,7 +2931,8 @@ function renderMap(o) {
       if (ptrs.size === 1) {
         const dx = (e.clientX - prev[0]) / r.width * view.w;
         const dy = (e.clientY - prev[1]) / r.height * (W.h * view.w / W.w);
-        if (Math.abs(e.clientX - prev[0]) + Math.abs(e.clientY - prev[1]) > 1) panned = true;
+        dragDist += Math.abs(e.clientX - prev[0]) + Math.abs(e.clientY - prev[1]);
+        if (dragDist > 6) panned = true;
         view.x -= dx; view.y -= dy;
         applyViewNoRedraw();
       } else if (ptrs.size === 2) {
@@ -2924,6 +2979,7 @@ function renderMap(o) {
       monthIdx = Number(e.target.value);
       redraw();
     });
+    onNightsChange = redraw;
 
     applyView();
   }

@@ -429,6 +429,7 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
   padding: 7px 9px; border: 1px solid var(--line-2); border-radius: 8px;
   background: var(--surface); color: var(--ink); font: 400 13px var(--font-data);
 }
+.map-controls .nights-ctl { flex-basis: 100%; }
 .map-count { flex-basis: 100%; margin: 0; font-size: 12.5px; color: var(--ink-2); }
 .map-panel {
   position: relative; margin: 0; background: var(--panel);
