@@ -1067,6 +1067,7 @@ function renderHome() {
       x.setAttribute("aria-pressed", on ? "true" : "false");
     });
     nightsRow.hidden = homeTripMode !== "trip";
+    updateHint(); // the map link carries ?nights= only in round-trip mode
   }));
 
   // Both ends picked → go. Unconditionally: the pair may exist in either
@@ -1082,12 +1083,28 @@ function renderHome() {
     } else navigate(`/route/${key}`);
   }
 
+  /* The from-only path: the map IS the answer to "where can I go?", so it
+     gets the button; the list stays one quiet link away. */
+  function mapHref() {
+    const nq = homeTripMode === "trip"
+      ? (() => { const [lo, hi] = homeNights(); return `?nights=${lo}-${hi}`; })() : "";
+    return `/map/${homeSel.origin}${nq}`;
+  }
   function updateHint() {
     const hint = $("#home-hint");
     if (homeSel.origin && !homeSel.dest) {
       const n = (store.destsByOrigin.get(homeSel.origin) || []).length;
-      hint.innerHTML = `<a href="/from/${homeSel.origin}">See all ${n} destinations from ${esc(placeName(homeSel.origin))} →</a>`;
+      hint.innerHTML = `<a class="btn hint-map" href="${mapHref()}">Where can you go from
+          ${esc(placeName(homeSel.origin))}? — open the map</a>
+        <a class="hint-list" href="/from/${homeSel.origin}">or list all ${n} destinations</a>`;
     } else hint.textContent = "";
+  }
+
+  /* Enter with a From but an empty To answers the question the empty field is
+     asking — it opens the map rather than doing nothing. */
+  function goMapIfFromOnly(e) {
+    if (e.key !== "Enter" || e.defaultPrevented) return;
+    if (homeSel.origin && !homeSel.dest && !destIn.value.trim()) navigate(mapHref());
   }
 
   attachAutocomplete(originIn, {
@@ -1104,6 +1121,10 @@ function renderHome() {
   });
   originIn.addEventListener("input", () => { homeSel.origin = null; updateHint(); });
   destIn.addEventListener("input", () => { homeSel.dest = null; });
+  // After the autocomplete's own keydown (which handles list picks): a plain
+  // Enter with the list closed reaches these.
+  originIn.addEventListener("keydown", goMapIfFromOnly);
+  destIn.addEventListener("keydown", goMapIfFromOnly);
   $("#swap", hero).addEventListener("click", () => {
     [homeSel.origin, homeSel.dest] = [homeSel.dest, homeSel.origin];
     [originIn.value, destIn.value] = [destIn.value, originIn.value];

@@ -181,8 +181,13 @@ main { min-height: 62vh; padding: 0 clamp(16px, 4vw, 40px) 56px; max-width: 1080
 .sg-days { font-family: var(--font-data); font-size: 11px; color: var(--ink-3); margin-left: 8px; }
 .sg-empty { padding: 14px; color: var(--ink-2); font-size: 14px; }
 
-.home-secondary { margin-top: 18px; font-size: 14px; color: var(--ink-2); }
+.home-secondary {
+  margin-top: 18px; font-size: 14px; color: var(--ink-2);
+  display: flex; flex-wrap: wrap; align-items: center; gap: 8px 14px;
+}
 .home-secondary a { font-weight: 700; }
+.home-secondary .hint-map { text-decoration: none; }
+.home-secondary .hint-list { color: var(--ink-2); font-weight: 400; }
 
 /* home trip-type row: [Round trip | One way] + nights presets, spanning the
    search card above From/To. The seg options are buttons here (a state toggle,
