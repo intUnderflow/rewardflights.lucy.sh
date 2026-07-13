@@ -93,6 +93,36 @@ func TestEpoch(t *testing.T) {
 	}
 }
 
+func TestSeatCodeBuckets(t *testing.T) {
+	for n, want := range map[int]int{
+		-5: 0, -1: 0, 0: 0, 1: 0, // no evidence of >=2 seats
+		2: 1, 3: 2, 4: 3, 5: 3, 9: 3, 100: 3,
+	} {
+		if got := seatCode(n); got != want {
+			t.Errorf("seatCode(%d) = %d, want %d", n, got, want)
+		}
+	}
+}
+
+func TestSeatStringPlacementAndLength(t *testing.T) {
+	epochDay := day(t, "2026-01-01")
+	s := SeatString(367, epochDay, map[int]int{
+		day(t, "2026-01-01"): 0x01, // M code 1 at index 0
+		day(t, "2026-03-01"): 0xAB, // both hex chars, uppercase, index 59
+		day(t, "2027-01-02"): 0xC0, // F code 3 at the last index (366)
+		day(t, "2025-12-31"): 0xFF, // before epoch: ignored, not a crash
+		day(t, "2027-01-03"): 0xFF, // past the horizon: ignored
+	})
+	if len(s) != 2*367 {
+		t.Fatalf("length = %d, want %d", len(s), 2*367)
+	}
+	for idx, want := range map[int]string{0: "01", 59: "AB", 366: "C0", 1: "00", 365: "00"} {
+		if got := s[2*idx : 2*idx+2]; got != want {
+			t.Errorf("s[day %d] = %q, want %q", idx, got, want)
+		}
+	}
+}
+
 func TestCabinLetters(t *testing.T) {
 	for bits, want := range map[int]string{
 		0: "", 1: "M", 2: "W", 4: "C", 8: "F",

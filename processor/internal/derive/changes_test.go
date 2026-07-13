@@ -154,6 +154,40 @@ func TestChangesTrimAndPriorOrder(t *testing.T) {
 	}
 }
 
+// The differ must TOLERATE a previous bundle that carries the optional "s"
+// seat-threshold key: "a" bit diffing is unaffected, and seat-threshold
+// transitions are deliberately NOT reported (v1 emits no seat feed entries).
+func TestChangesTolerateSeatsKey(t *testing.T) {
+	old := []byte(`{
+		"epoch": "2026-01-01",
+		"routes": {
+			"AAA-BBB": {"a": {"BA": "11"}, "s": {"BA": "0140"}}
+		}
+	}`)
+
+	// Same "a" bits as before. Even if seat counts changed underneath (the
+	// old "s" said 01-02 had >=2 F seats), no entries may be emitted.
+	newBits := map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {day(t, "2026-01-01"): 1, day(t, "2026-01-02"): 1}},
+	}
+	if entries := buildChanges(old, nil, newBits, day(t, "2026-01-01"), 48); len(entries) != 0 {
+		t.Fatalf("seat-only differences must emit nothing, got %v", entries)
+	}
+
+	// A genuine bit change is still detected with "s" present in the old
+	// bundle (the unknown key must not break decoding).
+	newBits = map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {day(t, "2026-01-01"): 1}},
+	}
+	entries := buildChanges(old, nil, newBits, day(t, "2026-01-01"), 48)
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries, want 1: %v", len(entries), entries)
+	}
+	if got, want := entryString(t, entries[0]), "closed AAA-BBB BA 2026-01-02 M t=48"; got != want {
+		t.Errorf("entry = %q, want %q", got, want)
+	}
+}
+
 func TestChangesNoPreviousBundle(t *testing.T) {
 	priorFile := []byte(`{"entries":[{"marker":7}]}`)
 	newBits := map[string]map[string]map[int]int{

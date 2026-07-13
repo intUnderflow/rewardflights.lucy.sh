@@ -73,8 +73,10 @@ function stackHTML(bits, { size = "cell" } = {}) {
 /* Deep link into BA's Avios redemption search, pre-filled with the route,
    date, and cabin. Uses the metro/city codes we hold (departurePoint=LON,
    not a single airport) so the search covers the whole city — matching the
-   granularity of our data. A return date is optional. */
-function baBookingURL(origin, dest, outIso, bit, returnIso) {
+   granularity of our data. A return date is optional. `pax` becomes
+   NumberOfAdults so the BA search never contradicts an active party-size
+   filter (N adults is the honest v1 of party composition). */
+function baBookingURL(origin, dest, outIso, bit, returnIso, pax = 1) {
   const ddmmyyyy = (iso) => { const [y, m, d] = iso.split("-"); return `${d}/${m}/${y}`; };
   const oneWay = !returnIso;
   const params = [
@@ -95,7 +97,7 @@ function baBookingURL(origin, dest, outIso, bit, returnIso) {
   params.push(
     ["oneWay", oneWay ? "true" : "false"],
     ["RestrictionType", "Restricted"],
-    ["NumberOfAdults", "1"],
+    ["NumberOfAdults", String(pax >= 1 && pax <= 9 ? pax : 1)],
     ["NumberOfYoungAdults", "0"],
     ["NumberOfChildren", "0"],
     ["NumberOfInfants", "0"],
@@ -225,6 +227,26 @@ async function fetchDevice(sub) {
   return { watches: j.watches || [], device: j.device || null };
 }
 
+/* Strip a watch to the WIRE schema before POSTing. Every save path is
+   read-modify-write: it fetches the stored list (whose entries carry
+   server-added fields — id, status, createdAt, lastFiredAt) and re-POSTs it,
+   and the server's strict decoder rejects fields outside the Watch schema
+   ("status" in particular → 400 "invalid JSON body" the moment any other
+   watch exists). One sanitize function, used by saveWatches itself so no
+   save path can forget it. Empty/default optionals are dropped too, keeping
+   the canonical form the content-addressed id is derived from. */
+function wireWatch(w) {
+  const out = { route: w.route, kind: w.kind, cabins: w.cabins };
+  if (w.out) out.out = { ...(w.out.from && { from: w.out.from }), ...(w.out.to && { to: w.out.to }) };
+  if (w.ret) out.ret = { ...(w.ret.from && { from: w.ret.from }), ...(w.ret.to && { to: w.ret.to }) };
+  if (w.nights) out.nights = { min: w.nights.min, max: w.nights.max };
+  if (w.leadDays > 0) out.leadDays = w.leadDays;
+  if ((w.minSeats || 0) >= 2) out.minSeats = w.minSeats;
+  return out;
+}
+
+/* Saves the list and returns the server's echo (watches with ids + status),
+   so callers can e.g. re-baseline a just-edited watch by its new id. */
 async function saveWatches(sub, watches) {
   if (!watches.length) {
     // Nothing left to watch: drop the subscription rather than keep a dangling
@@ -234,16 +256,17 @@ async function saveWatches(sub, watches) {
       body: JSON.stringify({ endpoint: sub.endpoint }),
     });
     await sub.unsubscribe().catch(() => {});
-    return;
+    return [];
   }
   const res = await fetch(`${PUSH_API}/subscribe`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...subPayload(sub), watches }),
+    body: JSON.stringify({ ...subPayload(sub), watches: watches.map(wireWatch) }),
   });
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}));
     throw new Error(detail.error || `couldn't save alerts (${res.status})`);
   }
+  return (await res.json().catch(() => ({}))).watches || [];
 }
 
 /* ---------------- watches: helpers + the live match count ---------------- */
@@ -282,7 +305,17 @@ function matchesNow(w, { list = false } = {}) {
   const oFrom = w.out?.from ? clamp(isoToIdx(w.out.from), t0, last) : floor;
   const oTo = w.out?.to ? clamp(isoToIdx(w.out.to), t0, last) : last;
 
-  const out = routeBits(w.route);
+  // A party watch counts only days with evidence of >= minSeats together —
+  // the same predicate the alert server fires on (its satisfiedBits), so the
+  // "N match right now" line never promises what a push wouldn't deliver.
+  // A leg with no seat data satisfies NOTHING at minSeats >= 2 (all-zero
+  // bits, matching the server); watchProblem explains that dead state before
+  // this function is ever consulted.
+  const need = (w.minSeats || 0) >= 2 ? w.minSeats : 1;
+  const legBits = (key) =>
+    need > 1 ? (routeBitsAtLeast(key, need) || new Uint8Array(store.bundle.days)) : routeBits(key);
+
+  const out = legBits(w.route);
   const perCabin = new Map();
   let pairs = 0, first = null;
 
@@ -300,7 +333,7 @@ function matchesNow(w, { list = false } = {}) {
 
   const rev = reverseRoute(w.route);
   if (!store.bundle.routes[rev]) return empty;      // a round trip needs a way home
-  const ret = routeBits(rev);
+  const ret = legBits(rev);
   const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
   // No return range given → it's implied by the outbound window + nights.
   const rFrom = w.ret?.from ? clamp(isoToIdx(w.ret.from), t0, last) : t0;
@@ -362,6 +395,15 @@ function watchProblem(w) {
   if (w.kind === "rt" && !store.bundle?.routes?.[reverseRoute(w.route)]) {
     return "There's no return route in the data, so a round trip can't be found.";
   }
+  // A seat-count watch on a route with no seat data is silently dead forever
+  // — the exact failure mode this function exists to prevent. (Matches the
+  // server: unknown counts never fire a minSeats >= 2 watch.) The bell keeps
+  // its party row visible for such a watch so the threshold can be lowered.
+  if ((w.minSeats || 0) >= 2 &&
+      (!store.seatRoutes.has(w.route) ||
+        (w.kind === "rt" && !store.seatRoutes.has(reverseRoute(w.route))))) {
+    return `This route has no seat-count data yet, so an alert for ${w.minSeats}${w.minSeats === 4 ? "+" : ""} seats together can never fire.`;
+  }
   if (w.out?.to && isoToIdx(w.out.to) < t0) return "These dates have passed.";
   if (w.kind === "rt" && w.out && w.ret) {
     const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
@@ -402,6 +444,10 @@ function watchSummary(w) {
     if (w.ret) bits.push(`back ${fmtRange(w.ret.from, w.ret.to)}`);
     if (w.nights) bits.push(`${w.nights.min}–${w.nights.max} nights`);
   }
+  // The party constraint is part of what the watch IS — same noun ("N+
+  // seats") as the bell control and the push copy, so the three surfaces
+  // agree.
+  if ((w.minSeats || 0) >= 2) bits.push(`${w.minSeats}+ seats`);
   return bits.join(" · ");
 }
 
@@ -490,6 +536,8 @@ const store = {
   destsByOrigin: new Map(),
   monthCache: new Map(),
   rtCache: new Map(),
+  hasAnySeatData: false, // any route in the adopted bundle carries the optional "s" seats layer
+  seatRoutes: new Set(), // route keys with at least one validated "s" string
 };
 
 const ROUTE_RE = /^[A-Z]{3}-[A-Z]{3}$/;
@@ -516,11 +564,33 @@ function adoptBundle(bundle, fromSnapshot) {
   store.destsByOrigin = new Map();
   store.monthCache = new Map();
   store.rtCache = new Map();
+  // Seats layer ("s"): optional, additive, per route+airline. Validate it at
+  // the same trust boundary as routes/places and recompute the presence flags
+  // on EVERY adoption — a localStorage snapshot and the network bundle can
+  // disagree about coverage within one session.
+  store.hasAnySeatData = false;
+  store.seatRoutes = new Set();
+  const seatLen = 2 * (bundle.days || 0);
   for (const key of Object.keys(bundle.routes)) {
     const [o, d] = key.split("-");
     store.origins.add(o);
     if (!store.destsByOrigin.has(o)) store.destsByOrigin.set(o, []);
     store.destsByOrigin.get(o).push(d);
+    const r = bundle.routes[key];
+    if (r.s && typeof r.s === "object" && !Array.isArray(r.s)) {
+      for (const [al, str] of Object.entries(r.s)) {
+        // Exactly 2 hex chars per day, and only for an airline whose "a"
+        // string exists — "a" is the sole presence authority.
+        if (typeof str !== "string" || str.length !== seatLen ||
+            !/^[0-9A-Fa-f]*$/.test(str) || typeof r.a?.[al] !== "string") {
+          delete r.s[al];
+        }
+      }
+      if (Object.keys(r.s).length) {
+        store.seatRoutes.add(key);
+        store.hasAnySeatData = true;
+      } else delete r.s;
+    } else if ("s" in r) delete r.s;
   }
 }
 
@@ -549,6 +619,76 @@ function routeBits(routeKey) {
   return merged;
 }
 
+/* Same Uint8Array shape as routeBits, but a bit is set only when there's
+   evidence of >= n seats in that cabin on one flight — decoded from the
+   optional per-route seats layer ("s": 2 hex chars per day, a 2-bit monotone
+   threshold code per cabin: 0 = no sign of >=2 seats, 1 = >=2, 2 = >=3,
+   3 = >=4; a party of n fits iff code >= n-1). Airlines merge per-cabin with
+   MAX, never SUM — a party rides one airline's one flight; since the
+   threshold test is monotone, MAX-then-compare equals OR of per-airline
+   passes, which is what's computed here.
+   n <= 1 returns exactly routeBits (the seats layer never changes
+   single-passenger semantics). Returns null when the route (or its seats
+   layer) is absent, so callers can render an honest presence fallback
+   instead of silently filtering to zero. */
+function routeBitsAtLeast(routeKey, n) {
+  if (!n || n <= 1) return routeBits(routeKey);
+  const route = store.bundle.routes[routeKey];
+  if (!route || !store.seatRoutes.has(routeKey)) return null;
+  const days = store.bundle.days;
+  const need = n - 1; // party of n fits iff code >= n-1
+  const merged = new Uint8Array(days);
+  for (const [airlineId, str] of Object.entries(route.s)) {
+    // The seats layer rides the same day window as "a"; airlines whose "a"
+    // we don't decode (width !== 1) contribute no presence, so their seat
+    // codes must not light anything either.
+    const width = store.bundle.airlines?.[airlineId]?.width ?? 1;
+    if (width !== 1) continue;
+    const nDays = Math.min(str.length >> 1, days);
+    for (let i = 0; i < nDays; i++) {
+      const byte = parseInt(str.slice(2 * i, 2 * i + 2), 16) || 0;
+      if (!byte) continue;
+      let v = 0;
+      if ((byte & 3) >= need) v |= 1;        // Economy  M: bits 0-1
+      if (((byte >> 2) & 3) >= need) v |= 2; // Premium  W: bits 2-3
+      if (((byte >> 4) & 3) >= need) v |= 4; // Business C: bits 4-5
+      if (((byte >> 6) & 3) >= need) v |= 8; // First    F: bits 6-7
+      merged[i] |= v;
+    }
+  }
+  // "a" is the sole presence authority: never light a day/cabin the presence
+  // layer doesn't show, whatever a (malformed) seats string claims.
+  const pres = routeBits(routeKey);
+  for (let i = 0; i < days; i++) merged[i] &= pres[i];
+  return merged;
+}
+
+/* Per-cabin threshold codes for one day of a route (MAX across airlines):
+   {bit: 0..3}, or null when the route carries no seats layer. Code 0 means
+   "no sign of >=2 seats" (unknown OR known-1) — never "0 seats". */
+function seatCodes(routeKey, idx) {
+  const route = store.bundle.routes[routeKey];
+  if (!route || !store.seatRoutes.has(routeKey)) return null;
+  const codes = { 1: 0, 2: 0, 4: 0, 8: 0 };
+  for (const [airlineId, str] of Object.entries(route.s)) {
+    const width = store.bundle.airlines?.[airlineId]?.width ?? 1;
+    if (width !== 1) continue;
+    if (2 * idx + 2 > str.length || idx < 0) continue;
+    const byte = parseInt(str.slice(2 * idx, 2 * idx + 2), 16) || 0;
+    codes[1] = Math.max(codes[1], byte & 3);
+    codes[2] = Math.max(codes[2], (byte >> 2) & 3);
+    codes[4] = Math.max(codes[4], (byte >> 4) & 3);
+    codes[8] = Math.max(codes[8], (byte >> 6) & 3);
+  }
+  return codes;
+}
+
+/* Seat coverage is per route, not per bundle: true when BOTH legs of a pair
+   can answer "does a party of N fit?". */
+function pairSeatsKnown(outKey, retKey) {
+  return store.seatRoutes.has(outKey) && store.seatRoutes.has(retKey);
+}
+
 function dayDate(i) { return new Date(store.epochMs + i * DAY_MS); }
 function dayIndexOf(iso) {
   const [y, m, d] = iso.split("-").map(Number);
@@ -575,7 +715,10 @@ function cabinLegend() {
 }
 
 /* Per-month availability-day counts for a route or an origin (12 months
-   from the current month). Cached. */
+   from the current month). Cached. Deliberately party-agnostic (presence
+   bits, any party size) — surfaces that show these while a pax>1 filter is
+   active must say so in their aria/title rather than pass the counts off as
+   party counts. */
 function monthCounts(kind, key) {
   const ck = `${kind}|${key}`;
   if (store.monthCache.has(ck)) return store.monthCache.get(ck);
@@ -623,8 +766,12 @@ function next12Months() {
   return out;
 }
 
-function routeTotals(routeKey) {
-  const bits = routeBits(routeKey);
+/* pax > 1 counts only days with evidence of >= pax seats; a route without
+   the seats layer falls back to presence (callers gate the honest note). */
+function routeTotals(routeKey, pax = 1) {
+  const bits = pax > 1
+    ? (routeBitsAtLeast(routeKey, pax) ?? routeBits(routeKey))
+    : routeBits(routeKey);
   if (!bits) return { total: 0, perCabin: new Map(), union: 0 };
   const t0 = Math.max(0, todayIndex());
   let total = 0, union = 0;
@@ -648,12 +795,20 @@ function routeTotals(routeKey) {
    same-cabin-both-ways by construction. minNights is never allowed below 1:
    a zero-night same-day turnaround is not a round trip. Missing reverse
    route → all zeros. O(days × window), cached per (route, mask, window). */
-function roundTripBits(outKey, retKey, mask, minNights, maxNights) {
+function roundTripBits(outKey, retKey, mask, minNights, maxNights, pax = 1) {
   const t0 = Math.max(0, todayIndex());
-  const ck = `${outKey}|${retKey}|${mask}|${minNights}|${maxNights}|${t0}`;
+  // pax MUST be in the key: rtCache only resets on adoptBundle, so omitting
+  // it would serve party-of-1 arrays to party-of-4 views (and vice versa).
+  const ck = `${outKey}|${retKey}|${mask}|${minNights}|${maxNights}|${pax}|${t0}`;
   if (store.rtCache.has(ck)) return store.rtCache.get(ck);
-  const out = routeBits(outKey);
-  const ret = store.bundle.routes[retKey] ? routeBits(retKey) : null;
+  // pax > 1 thresholds BOTH legs; a leg without the seats layer falls back to
+  // presence bits (callers show the honest per-route note — never an
+  // silently-empty view).
+  const legBits = (k) => pax > 1
+    ? (routeBitsAtLeast(k, pax) ?? routeBits(k))
+    : routeBits(k);
+  const out = legBits(outKey);
+  const ret = store.bundle.routes[retKey] ? legBits(retKey) : null;
   const round = new Uint8Array(out ? out.length : store.bundle.days);
   if (out && ret) {
     const min = Math.max(1, minNights);
@@ -952,8 +1107,10 @@ function attachAutocomplete(input, { getRestrict, sparkFor, onPick }) {
         : "";
       // Options are non-focusable (tabindex -1): focus stays on the input and
       // selection is managed via aria-activedescendant, per the combobox pattern.
+      // Sparklines are deliberately party-agnostic (monthCounts); say so
+      // when a party-size filter is active elsewhere so they don't overpromise.
       const label = counts
-        ? `${p.name}, ${p.country}. ${total} days with seats in the next year.`
+        ? `${p.name}, ${p.country}. ${total} days with seats in the next year${activePax() > 1 ? " (any party size)" : ""}.`
         : `${p.name}, ${p.country}`;
       const row = el(`<div class="sg-row" role="option" tabindex="-1" id="${input.id}-opt-${i}"
           aria-label="${esc(label)}">
@@ -1088,26 +1245,31 @@ function renderHome() {
   function maybeGo() {
     if (!homeSel.origin || !homeSel.dest) { updateHint(); return; }
     const key = `${homeSel.origin}-${homeSel.dest}`;
+    const px = activePax();
+    const paxPart = px > 1 ? `pax=${px}` : "";
     if (homeTripMode === "trip") {
       const [lo, hi] = homeNights();
-      navigate(`/trip/${key}?nights=${lo}-${hi}`);
-    } else navigate(`/route/${key}`);
+      navigate(`/trip/${key}?nights=${lo}-${hi}${paxPart ? `&${paxPart}` : ""}`);
+    } else navigate(`/route/${key}${paxPart ? `?${paxPart}` : ""}`);
   }
 
   /* The from-only path: the map IS the answer to "where can I go?", so it
      gets the button; the list stays one quiet link away. */
   function mapHref() {
-    const nq = homeTripMode === "trip"
-      ? (() => { const [lo, hi] = homeNights(); return `?nights=${lo}-${hi}`; })() : "";
-    return `/map/${homeSel.origin}${nq}`;
+    const parts = [];
+    if (homeTripMode === "trip") { const [lo, hi] = homeNights(); parts.push(`nights=${lo}-${hi}`); }
+    const px = activePax();
+    if (px > 1) parts.push(`pax=${px}`);
+    return `/map/${homeSel.origin}${parts.length ? `?${parts.join("&")}` : ""}`;
   }
   function updateHint() {
     const hint = $("#home-hint");
     if (homeSel.origin && !homeSel.dest) {
       const n = (store.destsByOrigin.get(homeSel.origin) || []).length;
+      const px = activePax();
       hint.innerHTML = `<a class="btn hint-map" href="${mapHref()}">Where can you go from
           ${esc(placeName(homeSel.origin))}? — open the map</a>
-        <a class="hint-list" href="/from/${homeSel.origin}">or list all ${n} destinations</a>`;
+        <a class="hint-list" href="/from/${homeSel.origin}${px > 1 ? `?pax=${px}` : ""}">or list all ${n} destinations</a>`;
     } else hint.textContent = "";
   }
 
@@ -1365,12 +1527,78 @@ function setNightsPref(lo, hi) {
   try { sessionStorage.setItem("rf:nights", `${lo}-${hi}`); } catch {}
 }
 
+/* ---------------- party size (shared, sticky per session) ---------------- */
+
+/* "?pax=N": a minimum party size, 2..4 only ("4+" means at least 4 — the top
+   threshold the seats layer encodes). Absent means 1, which is exactly
+   today's behaviour everywhere. Invalid input degrades silently. */
+function parsePax(s) {
+  return /^[2-4]$/.test(s || "") ? Number(s) : null;
+}
+function getPaxPref() {
+  try { return parsePax(sessionStorage.getItem("rf:pax")); } catch { return null; }
+}
+function setPaxPref(n) {
+  try { sessionStorage.setItem("rf:pax", String(n)); } catch {}
+}
+
+/* The party size in force: URL → session pref → 1. Forced to 1 while the
+   adopted bundle carries no seat data anywhere (the control isn't rendered
+   then); a URL-borne ?pax stays in the URL but inert — coverage may arrive
+   with the next bundle poll and route() re-renders. */
+function activePax(params = new URLSearchParams(location.search)) {
+  if (!store.hasAnySeatData) return 1;
+  return parsePax(params.get("pax")) ?? getPaxPref() ?? 1;
+}
+
+/* Mirror a pax change into the URL the same way nights does: replaceState
+   (filter tweaks are not history entries), param deleted at the default. */
+function mirrorPaxURL(n) {
+  const u = new URL(location.href);
+  if (n > 1) u.searchParams.set("pax", String(n));
+  else u.searchParams.delete("pax");
+  const q = u.searchParams.toString();
+  history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+}
+
+/* Compact party-size chip row (1 · 2 · 3 · 4+). Rendered ONLY when the
+   adopted bundle carries seat data somewhere — a control that can never
+   change anything reads as broken. Same pressed-chip pattern as the
+   nights presets. */
+function paxControl(pax, onChange) {
+  // Chips carry their own class (.pxp, styled like .np): the nights presets'
+  // sync/press logic — and tests — select .np document- or toolbar-wide, and
+  // a pressed party chip must never read as a pressed nights preset.
+  const wrap = el(`<div class="pax-ctl" role="group" aria-label="Passengers travelling together">
+    <span class="nc-label">Passengers</span>
+    ${[1, 2, 3, 4].map((n) => `<button type="button" class="pxp" data-pax="${n}"
+      aria-pressed="${n === pax}">${n === 4 ? "4+" : n}</button>`).join("")}
+  </div>`);
+  wrap.querySelectorAll(".pxp").forEach((b) => b.addEventListener("click", () => {
+    const n = Number(b.dataset.pax);
+    wrap.querySelectorAll(".pxp").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    onChange(n);
+  }));
+  return wrap;
+}
+
+/* The honest per-route fallback line for pax >= 2 on a route whose data has
+   no seat counts yet: presence rendering stays, this note says so. Copy rule:
+   "no sign of N seats", never "0 seats" — absence means unknown. */
+const SEAT_NOTE = "Seat counts aren't in this route's data yet — showing any-party availability.";
+
 /* The current trip-length window as a query string for swap/cross links —
    the window is direction-agnostic, so it survives an origin/dest swap
-   (picked dates do not: they belong to the old outbound direction). */
+   (picked dates do not: they belong to the old outbound direction).
+   Also carries the party size when one is active, so the filter never
+   silently resets on a navigation. */
 function nightsQS() {
   const w = parseNights(new URLSearchParams(location.search).get("nights")) || getNightsPref();
-  return w ? `?nights=${w[0]}-${w[1]}` : "";
+  const parts = [];
+  if (w) parts.push(`nights=${w[0]}-${w[1]}`);
+  const px = activePax();
+  if (px > 1) parts.push(`pax=${px}`);
+  return parts.length ? `?${parts.join("&")}` : "";
 }
 
 /* Valid not-in-the-past day index for a URL-borne ISO date, or -1 (invalid
@@ -1474,6 +1702,17 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     let lead = mine?.leadDays || 0;   // "any time, but N days' notice" (rolling)
     let outFrom = mine?.out?.from || "", outTo = mine?.out?.to || "";
     let retFrom = mine?.ret?.from || "", retTo = mine?.ret?.to || "";
+    // Party size. The row renders only when this ROUTE can answer "does a
+    // party of N fit?" (both legs for a round trip) — a control that can
+    // never fire is a broken promise — or when an existing watch already
+    // carries a threshold (possibly saved when coverage existed): hiding it
+    // then would lock the user out of lowering a dead watch. A fresh watch
+    // inherits the page's pax (principle 1: inherit, don't ask).
+    const routeHasSeats = kind === "rt"
+      ? pairSeatsKnown(routeKey, reverseRoute(routeKey))
+      : store.seatRoutes.has(routeKey);
+    const partyRowShown = routeHasSeats || (mine?.minSeats || 0) >= 2;
+    let party = mine ? (mine.minSeats || 1) : (routeHasSeats ? activePax() : 1);
 
     pop.innerHTML = "";
     const closeBtn = el(`<button type="button" class="bell-x" aria-label="Close">×</button>`);
@@ -1500,6 +1739,22 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       $(".bell-cabs", cabs).append(row);
     }
     pop.append(cabs);
+
+    /* --- travelling as (party size) --- */
+    if (partyRowShown) {
+      const partySec = el(`<div class="bell-sec bell-party"><h3>Travelling as</h3>
+        <div class="bell-flex" role="group" aria-label="Passengers travelling together">
+          ${[1, 2, 3, 4].map((n) => `<button type="button" class="np" data-party="${n}"
+            aria-pressed="${n === party}">${n === 4 ? "4+" : n}</button>`).join("")}
+        </div>
+      </div>`);
+      partySec.querySelectorAll(".np").forEach((b) => b.addEventListener("click", () => {
+        party = Number(b.dataset.party);
+        partySec.querySelectorAll(".np").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        recount();
+      }));
+      pop.append(partySec);
+    }
 
     /* --- when can you travel? --- */
     const when = el(`<div class="bell-sec"><h3>When can you travel?</h3>
@@ -1634,6 +1889,9 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       if (!cabins.length) return null;
       const w = { route: routeKey, kind, cabins };
       if (kind === "rt" && nights) w.nights = { min: nights[0], max: nights[1] };
+      // Wire canonical form: minSeats present only when >= 2 (0/absent is the
+      // one spelling of "one passenger", which keeps content ids stable).
+      if (party >= 2) w.minSeats = party;
 
       if (mode === "any") {
         if (lead > 0) w.leadDays = lead;   // else fully unbounded ("any time")
@@ -1680,10 +1938,15 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       save.disabled = false;
       const { pairs } = matchesNow(w);
       const what = kind === "rt" ? "round trip" : "date";
+      // Party framing on the count line: "3 round trips match right now for
+      // 3 passengers" — the count IS thresholded (matchesNow mirrors the
+      // server), so say what it counts.
+      const forParty = (w.minSeats || 0) >= 2
+        ? ` for ${w.minSeats === 4 ? "4 or more" : w.minSeats} passengers` : "";
       countLine.className = pairs ? "bell-count ok" : "bell-count none";
       countLine.textContent = pairs
-        ? `${pairs} ${what}${pairs > 1 ? "s" : ""} match right now`
-        : `Nothing matches right now — we'll tell you the moment something opens.`;
+        ? `${pairs} ${what}${pairs > 1 ? "s" : ""} match right now${forParty}`
+        : `Nothing matches right now${forParty} — we'll tell you the moment something opens.`;
     }
 
     async function commit(w, btnEl) {
@@ -1696,7 +1959,20 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         const list = (await fetchWatches(sub).catch(() => []))
           .filter((x) => !(x.route === routeKey && x.kind === kind));
         if (w) list.push(w);
-        await saveWatches(sub, list);
+        const saved = await saveWatches(sub, list);
+        // Editing the party size changes the watch's match set under a NEW
+        // content id: re-baseline rf:seen for it (and drop the orphaned old
+        // entry) so the next "new since you last looked" diff runs against
+        // the edited threshold instead of reporting phantom news.
+        if (w && mine && (mine.minSeats || 0) !== (w.minSeats || 0)) {
+          const savedW = saved.find((x) => x.route === routeKey && x.kind === kind);
+          if (savedW?.id) {
+            const seen = loadSeen();
+            if (mine.id) delete seen[mine.id];
+            seen[savedW.id] = { pairs: matchesNow(savedW, { list: true }).list, t: Math.floor(Date.now() / 1000) };
+            saveSeen(seen);
+          }
+        }
         setLabel(!!w);
         refreshAlertCount();
         note.textContent = w
@@ -1795,17 +2071,45 @@ function renderRoute(o, d) {
     return;
   }
 
-  const bits = routeBits(key);
-  const totals = routeTotals(key);
+  // Party size: URL → session pref → 1, mirrored back like nights on /trip/.
+  const params = new URLSearchParams(location.search);
+  let pax = activePax(params);
+  const hasSeats = store.seatRoutes.has(key);
+  // Effective threshold: seats-layer routes filter at the party size; a route
+  // without the layer keeps exact presence rendering (plus the honest note).
+  const effPax = () => (pax > 1 && hasSeats ? pax : 1);
+
+  const bits = routeBits(key); // presence — stays authoritative for dim/empty
   const container = el(`<div></div>`);
   const toolbar = el(`<div class="route-toolbar"></div>`);
+  const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
   const body = el(`<div></div>`);
-  mainEl.append(toolbar, container, body);
+  mainEl.append(toolbar, paxNote, container, body);
 
-  let mask = 0, firstDraw = true;
-  toolbar.append(cabinChips(totals.perCabin, (m) => { mask = m; drawCalendars(); }));
+  let mask = 0, firstDraw = true, chipsEl = null;
+  function rebuildChips() {
+    const ep = effPax();
+    const fresh = cabinChips(routeTotals(key, ep).perCabin, (m) => { mask = m; drawCalendars(); },
+      ep > 1 ? (count, label) => (count
+        ? `${count} days with ${label} seats for ${pax} travelling together`
+        : `No sign of ${pax} ${label} seats together on this route right now`) : null);
+    if (chipsEl) chipsEl.replaceWith(fresh); else toolbar.prepend(fresh);
+    chipsEl = fresh;
+  }
+  function syncPaxNote() { paxNote.hidden = !(pax > 1 && !hasSeats); }
+  rebuildChips(); // synchronously sets mask + first drawCalendars()
+  syncPaxNote();
   if (routeHasNew(key)) {
     toolbar.append(el(`<span class="new-legend"><span class="new-dot" aria-hidden="true"></span>opened in the last 48h</span>`));
+  }
+  if (store.hasAnySeatData) {
+    toolbar.append(paxControl(pax, (n) => {
+      pax = n;
+      setPaxPref(n);
+      mirrorPaxURL(n);
+      syncPaxNote();
+      rebuildChips(); // chips' onChange redraws the calendars
+    }));
   }
   toolbar.append(alertBell(key, "ow", mask));
 
@@ -1817,6 +2121,11 @@ function renderRoute(o, d) {
     container.innerHTML = ""; body.innerHTML = "";
     const months = next12Months();
     const t0 = todayIndex();
+    // Year-strip bars, month counts and lit cells must all read the SAME
+    // array, or the strip would visibly disagree with the grid.
+    const ep = effPax();
+    const tb = ep > 1 ? (routeBitsAtLeast(key, ep) || bits) : bits;
+    const paxCtx = ep > 1 ? { pax: ep, userPax: pax, tbits: tb } : (pax > 1 ? { pax: 1, userPax: pax, tbits: bits } : null);
 
     // Year strip (in-page scroll shortcuts, not tabs → role=group)
     const strip = el(`<div class="year-strip" role="group" aria-label="Jump to month"></div>`);
@@ -1824,7 +2133,7 @@ function renderRoute(o, d) {
       const c = countIn(mo);
       const now = new Date();
       const isCur = mo.y === now.getFullYear() && mo.m === now.getMonth();
-      const btn = el(`<button type="button" class="ys-month${isCur ? " current" : ""}" aria-label="${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with seats">
+      const btn = el(`<button type="button" class="ys-month${isCur ? " current" : ""}" aria-label="${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with seats${ep > 1 ? ` for ${pax} travelling together` : ""}">
         <span class="ys-label">${mo.label}</span>
         <span class="ys-bars" aria-hidden="true"></span>
         <span class="ys-count">${c || "·"}</span>
@@ -1834,8 +2143,8 @@ function renderRoute(o, d) {
       for (const [bit] of cabinLegend()) {
         if (!(bit & mask)) continue;
         let n = 0;
-        for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, bits.length); i++)
-          if (bits[i] & bit) n++;
+        for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, tb.length); i++)
+          if (tb[i] & bit) n++;
         if (!n) continue;
         const bar = document.createElement("i");
         bar.className = bitClass(bit);
@@ -1855,14 +2164,14 @@ function renderRoute(o, d) {
     // Month grids
     const grid = el(`<div class="months"></div>`);
     for (const mo of months) {
-      grid.append(monthCal(key, bits, mo, mask, t0));
+      grid.append(monthCal(key, bits, mo, mask, t0, paxCtx));
     }
     body.append(grid);
 
     function countIn(mo) {
       let n = 0;
-      for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, bits.length); i++)
-        if (bits[i] & mask) n++;
+      for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, tb.length); i++)
+        if (tb[i] & mask) n++;
       return n;
     }
   }
@@ -1870,11 +2179,18 @@ function renderRoute(o, d) {
 
 function daysInMonth(mo) { return mo.end - mo.start; }
 
-function monthCal(routeKey, bits, mo, mask, t0) {
+/* paxCtx (optional): {pax, userPax, tbits} — tbits is the thresholded array
+   (same shape as bits) when a party size >= 2 is active on a route with seat
+   data. `bits` stays the PRESENCE array: a day with seats but fewer than the
+   party must render dim (with honest copy), never as empty. */
+function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
   const first = utcDate(mo.y, mo.m, 1);
+  const tbits = paxCtx ? paxCtx.tbits : bits;
+  const pax = paxCtx ? paxCtx.pax : 1;
 
   // Months with nothing to show collapse to a compact card — a full grid of
-  // empty cells is noise when the answer is simply "no".
+  // empty cells is noise when the answer is simply "no". The collapse check
+  // is presence-based on purpose: under-threshold days render as dim cells.
   let any = false, anyShown = false;
   for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, bits.length); i++) {
     if (bits[i]) { any = true; if (bits[i] & mask) { anyShown = true; break; } }
@@ -1900,7 +2216,8 @@ function monthCal(routeKey, bits, mo, mask, t0) {
   for (let dnum = 1; dnum <= nDays; dnum++) {
     const idx = mo.start + dnum - 1;
     const v = (idx >= 0 && idx < bits.length) ? bits[idx] : 0;
-    const shown = v & mask;
+    const tv = (idx >= 0 && idx < tbits.length) ? tbits[idx] : 0;
+    const shown = tv & mask;
     const isPast = idx < t0;
     if (!v || isPast) {
       grid.append(el(`<span class="day${isPast ? " past" : ""}"><span class="num">${dnum}</span><span class="stack"></span></span>`));
@@ -1909,17 +2226,26 @@ function monthCal(routeKey, bits, mo, mask, t0) {
     monthDays += shown ? 1 : 0;
     const iso = isoOf(dayDate(idx));
     const fresh = isNew(routeKey, iso);
+    // A day open in your cabins but without evidence of enough seats for the
+    // party dims (never empties), and says why.
+    const lowSeats = pax > 1 && !shown && (v & mask);
+    const aria = lowSeats
+      ? `${esc(fmtDate.format(dayDate(idx)))}: ${esc(cabNames(v))} open — no sign of ${pax} seats together${fresh ? ", newly opened" : ""}`
+      : `${esc(fmtDate.format(dayDate(idx)))}: ${esc(cabNames(v))} available${shown && pax > 1 ? ` for ${pax} travelling together` : ""}${fresh ? ", newly opened" : ""}`;
     // Lit day: lanes show the cabins passing the filter. Dim day (space only
-    // in filtered-out cabins): lanes show what's there, grayed by CSS.
+    // in filtered-out cabins, or not enough seats for the party): lanes show
+    // what's there, grayed by CSS.
     const cell = el(`<button type="button" class="day has${shown ? "" : " dim"}${fresh ? " new" : ""}"
-        aria-label="${esc(fmtDate.format(dayDate(idx)))}: ${esc(cabNames(v))} available${fresh ? ", newly opened" : ""}">
+        aria-label="${aria}">
       <span class="num">${dnum}</span>
       ${stackHTML(shown || v)}
     </button>`);
-    cell.addEventListener("click", () => openDayPanel(routeKey, idx));
-    cell.addEventListener("mouseenter", (e) => showTip(e.currentTarget, idx, bits[idx]));
+    const tipNote = lowSeats ? `no sign of ${pax} seats together` : null;
+    const userPax = paxCtx ? paxCtx.userPax : 1;
+    cell.addEventListener("click", () => openDayPanel(routeKey, idx, userPax));
+    cell.addEventListener("mouseenter", (e) => showTip(e.currentTarget, idx, bits[idx], tipNote));
     cell.addEventListener("mouseleave", hideTip);
-    cell.addEventListener("focus", (e) => showTip(e.currentTarget, idx, bits[idx]));
+    cell.addEventListener("focus", (e) => showTip(e.currentTarget, idx, bits[idx], tipNote));
     cell.addEventListener("blur", hideTip);
     grid.append(cell);
   }
@@ -1993,6 +2319,13 @@ function renderTrip(o, d) {
   // URL params win; sessionStorage prefs fill in; invalid input degrades.
   const params = new URLSearchParams(location.search);
   let nights = parseNights(params.get("nights")) || getNightsPref() || NIGHTS_DEFAULT.slice();
+  // Party size rides the same seed order (?pax= → rf:pax → 1) and the same
+  // replaceState mirroring as nights.
+  let pax = activePax(params);
+  // A round trip can only be seat-filtered when BOTH legs carry the seats
+  // layer; otherwise everything renders at any-party presence + the note.
+  const pairKnown = pairSeatsKnown(key, revKey);
+  const ep = () => (pax > 1 && pairKnown ? pax : 1);
 
   const outBits = routeBits(key);
   const t0 = todayIndex();
@@ -2000,16 +2333,17 @@ function renderTrip(o, d) {
   const allMask = legend.reduce((m, [bit]) => m | bit, 0);
 
   const toolbar = el(`<div class="route-toolbar"></div>`);
+  const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
   const container = el(`<div></div>`);
   const body = el(`<div></div>`);
-  mainEl.append(toolbar, container, body);
+  mainEl.append(toolbar, paxNote, container, body);
 
   let mask = 0, firstDraw = true, chipsEl = null;
 
   /* Chip counts are ROUND-TRIPPABLE outbound days (recounted from the
      engine), not raw one-way availability. */
   function perCabinRT() {
-    const rt = roundTripBits(key, revKey, allMask, nights[0], nights[1]);
+    const rt = roundTripBits(key, revKey, allMask, nights[0], nights[1], ep());
     const per = new Map();
     for (let i = Math.max(0, t0); i < rt.length; i++) {
       const v = rt[i];
@@ -2020,13 +2354,15 @@ function renderTrip(o, d) {
   }
 
   function rebuildChips() {
+    const forN = ep() > 1 ? ` for ${pax} travelling together` : "";
     const fresh = cabinChips(perCabinRT(), (m) => { mask = m; drawCalendars(); },
       (count, label) => count
-        ? `${count} outbound days with a same-cabin ${label} return`
-        : `No ${label} round trips within ${nights[0]}–${nights[1]} nights`);
+        ? `${count} outbound days with a same-cabin ${label} return${forN}`
+        : `No ${label} round trips${forN} within ${nights[0]}–${nights[1]} nights`);
     if (chipsEl) chipsEl.replaceWith(fresh); else toolbar.prepend(fresh);
     chipsEl = fresh;
   }
+  function syncPaxNote() { paxNote.hidden = !(pax > 1 && !pairKnown); }
 
   function buildNightsControl() {
     const wrap = el(`<div class="nights-ctl" role="group" aria-label="Trip length in nights">
@@ -2074,7 +2410,17 @@ function renderTrip(o, d) {
   }
 
   toolbar.append(buildNightsControl());
+  if (store.hasAnySeatData) {
+    toolbar.append(paxControl(pax, (n) => {
+      pax = n;
+      setPaxPref(n);
+      mirrorPaxURL(n);
+      syncPaxNote();
+      rebuildChips(); // recounts chips; chips' onChange redraws the calendars
+    }));
+  }
   rebuildChips(); // synchronously sets mask + first drawCalendars()
+  syncPaxNote();
   // The prize: "tell me when a Business round trip opens on this pair". The
   // bell inherits the trip length and the day they've clicked, so most people
   // never touch a date field.
@@ -2087,11 +2433,17 @@ function renderTrip(o, d) {
     const animate = firstDraw;
     firstDraw = false;
     container.innerHTML = ""; body.innerHTML = "";
-    const rb = roundTripBits(key, revKey, mask, nights[0], nights[1]);
+    const n = ep();
+    const rb = roundTripBits(key, revKey, mask, nights[0], nights[1], n);
     // All-cabin recount alongside the masked one, so dim cells can honestly
     // distinguish "no same-cabin return in the window" from "a round trip
     // exists — your cabin filter is hiding it".
-    const rbAll = mask === allMask ? rb : roundTripBits(key, revKey, allMask, nights[0], nights[1]);
+    const rbAll = mask === allMask ? rb : roundTripBits(key, revKey, allMask, nights[0], nights[1], n);
+    // Third honesty axis at pax >= 2: an any-party recount so a dim cell can
+    // say "a round trip exists for a smaller party" distinctly from "hidden
+    // by your cabin filter" and "no return in window". Each recount runs at
+    // ONE consistent threshold — mixing produces lying labels.
+    const rbAny = n > 1 ? roundTripBits(key, revKey, allMask, nights[0], nights[1], 1) : null;
     const months = next12Months();
 
     // Year strip: recounted from roundBits, like every number on this page.
@@ -2100,7 +2452,7 @@ function renderTrip(o, d) {
       const c = countIn(mo);
       const now = new Date();
       const isCur = mo.y === now.getFullYear() && mo.m === now.getMonth();
-      const btn = el(`<button type="button" class="ys-month${isCur ? " current" : ""}" aria-label="${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with round trips">
+      const btn = el(`<button type="button" class="ys-month${isCur ? " current" : ""}" aria-label="${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with round trips${n > 1 ? ` for ${pax} travelling together` : ""}">
         <span class="ys-label">${mo.label}</span>
         <span class="ys-bars" aria-hidden="true"></span>
         <span class="ys-count">${c || "·"}</span>
@@ -2128,7 +2480,7 @@ function renderTrip(o, d) {
     container.append(strip);
 
     const grid = el(`<div class="months"></div>`);
-    for (const mo of months) grid.append(monthCalTrip(mo, rb, rbAll));
+    for (const mo of months) grid.append(monthCalTrip(mo, rb, rbAll, rbAny, n));
     body.append(grid);
 
     function countIn(mo) {
@@ -2143,8 +2495,13 @@ function renderTrip(o, d) {
      complete the trip in), DIM = outbound space but no same-cabin return in
      the window (still clickable — the panel explains and offers one-ways),
      empty = no outbound space at all. A dim day whose round trip exists only
-     in filtered-out cabins says so — never "no return" when one is there. */
-  function monthCalTrip(mo, rb, rbAll) {
+     in filtered-out cabins says so — never "no return" when one is there.
+     At a party size >= 2 (n > 1) a third dim cause exists: a round trip is
+     open for a smaller party but there's no sign of n seats together —
+     rbAny (the any-party recount) tells them apart. The month-compact check
+     stays presence-based so a month never collapses to "no outbound seats"
+     when the truth is "not enough seats". */
+  function monthCalTrip(mo, rb, rbAll, rbAny, n) {
     const first = utcDate(mo.y, mo.m, 1);
     let anyOut = false;
     for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, outBits.length); i++) {
@@ -2180,18 +2537,26 @@ function renderTrip(o, d) {
       if (v) monthDays++;
       const dateLabel = esc(fmtDate.format(dayDate(idx)));
       const hiddenBits = v ? 0 : ((idx >= 0 && idx < rbAll.length) ? rbAll[idx] : 0);
+      // Only consulted when the day fails at the party threshold outright:
+      // does a round trip exist here for ANY party size?
+      const smallerParty = !v && !hiddenBits && n > 1 && rbAny
+        ? ((idx >= 0 && idx < rbAny.length) ? rbAny[idx] : 0) : 0;
       const aria = v
-        ? `${dateLabel}: round trip available in ${esc(cabNames(v))}`
+        ? `${dateLabel}: round trip available in ${esc(cabNames(v))}${n > 1 ? ` for ${pax} travelling together` : ""}`
         : hiddenBits
           ? `${dateLabel}: round trip available in ${esc(cabNames(hiddenBits))} — hidden by your cabin filter`
-          : `${dateLabel}: outbound only — no return within ${nights[0]}–${nights[1]} nights`;
+          : smallerParty
+            ? `${dateLabel}: round trip open in ${esc(cabNames(smallerParty))} for a smaller party — no sign of ${pax} seats together`
+            : `${dateLabel}: outbound only — no return within ${nights[0]}–${nights[1]} nights`;
       const cell = el(`<button type="button" class="day has${v ? "" : " dim"}" aria-label="${aria}">
         <span class="num">${dnum}</span>
         ${stackHTML(v || vOut)}
       </button>`);
       const tipNote = v ? null : hiddenBits
         ? `round trip open in ${cabNames(hiddenBits)} — hidden by your cabin filter`
-        : "outbound only — no same-cabin return in window";
+        : smallerParty
+          ? `round trip open for a smaller party — no sign of ${pax} seats together`
+          : "outbound only — no same-cabin return in window";
       cell.addEventListener("click", () => pickOutbound(idx));
       cell.addEventListener("mouseenter", (e) => showTip(e.currentTarget, idx, v, tipNote));
       cell.addEventListener("mouseleave", hideTip);
@@ -2210,15 +2575,18 @@ function renderTrip(o, d) {
     u.searchParams.set("out", iso);
     u.searchParams.delete("ret");
     history.pushState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
-    openPairPanel(o, d, idx, nights, mask);
+    openPairPanel(o, d, idx, nights, mask, null, pax);
   }
 
   // A pinned outbound in the URL (?out=…) restores the pair panel; an
   // invalid or past date, or a day with no outbound space, degrades silently.
+  // The gate is presence-based on purpose: a shared pax=4 link onto a day
+  // that only seats 2 still opens the panel, which explains — it never
+  // silently drops the pick.
   const outIdx = tripDayIndex(params.get("out") || "");
   if (outIdx >= 0 && outBits[outIdx]) {
     const retP = params.get("ret") || "";
-    openPairPanel(o, d, outIdx, nights, mask, tripDayIndex(retP) >= 0 ? retP : null);
+    openPairPanel(o, d, outIdx, nights, mask, tripDayIndex(retP) >= 0 ? retP : null, pax);
   }
 }
 
@@ -2253,13 +2621,24 @@ let panelReturnFocus = null;
    mangle the freshly-pushed URL. */
 let panelCloseHook = null;
 
-function openDayPanel(routeKey, idx) {
+function openDayPanel(routeKey, idx, pax = 1) {
   const [o, d] = routeKey.split("-");
   const iso = isoOf(dayDate(idx));
   const bits = routeBits(routeKey);
   panelReturnFocus = document.activeElement;
   panelCloseHook = null;
 
+  // At a party size >= 2, annotate each cabin row with whether the seats
+  // layer shows the party fitting on one flight (threshold codes, no extra
+  // fetching); a route without the layer gets one honest caveat line.
+  const codes = pax > 1 ? seatCodes(routeKey, idx) : null;
+  const paxMark = (bit) => {
+    if (pax <= 1) return "";
+    if (!codes) return "";
+    return codes[bit] >= pax - 1
+      ? `<span class="dp-cab-pax fits">seats for ${pax}</span>`
+      : `<span class="dp-cab-pax">no sign of ${pax} seats together</span>`;
+  };
   const legend = cabinLegend().filter(([bit]) => bits[idx] & bit);
   panelEl.setAttribute("role", "dialog");
   panelEl.setAttribute("aria-modal", "true");
@@ -2275,11 +2654,12 @@ function openDayPanel(routeKey, idx) {
       ${stackHTML(bits[idx], { size: "row" })}
     </div>
     <p class="dp-lead">Award space seen in this snapshot — search British Airways to book:</p>
+    ${pax > 1 && !codes ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
     <div class="dp-cabs">${legend.map(([bit, label]) => `
       <a class="dp-cab" data-bit="${bit}" target="_blank" rel="noopener noreferrer"
-         href="${baBookingURL(o, d, iso, bit, null)}">
+         href="${baBookingURL(o, d, iso, bit, null, pax)}">
         <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
-        <span class="dp-cab-label">${esc(label)}</span>
+        <span class="dp-cab-label">${esc(label)}${paxMark(bit)}</span>
         <span class="dp-cab-go">Search one way ↗</span>
       </a>`).join("")}
     </div>
@@ -2300,12 +2680,19 @@ function openDayPanel(routeKey, idx) {
    sticky summary offers one CTA per cabin open on BOTH legs — BA applies one
    CabinCode to the whole booking, so a link is never offered for a cabin
    missing on either leg (no empty-BA-result deep links, ever). */
-function openPairPanel(o, d, idx, nights, mask, retIso = null) {
+function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
   const key = `${o}-${d}`, revKey = `${d}-${o}`;
   const outBitsAll = routeBits(key);
   const vOut = outBitsAll[idx];
   const [lo, hi] = nights;
   const outIso = isoOf(dayDate(idx));
+  // Party-size annotation inputs (threshold codes from the bundle, no extra
+  // fetching): null when either leg lacks the seats layer — then rows keep
+  // today's presence rendering plus one honest caveat line.
+  const outTh = pax > 1 ? routeBitsAtLeast(key, pax) : null;
+  const revTh = pax > 1 ? routeBitsAtLeast(revKey, pax) : null;
+  const paxKnown = !!(outTh && revTh);
+  const vOutTh = paxKnown ? outTh[idx] : 0;
   panelReturnFocus = document.activeElement;
   panelEl.setAttribute("role", "dialog");
   panelEl.setAttribute("aria-modal", "true");
@@ -2330,6 +2717,9 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null) {
         rows.push({
           idx: r, iso: isoOf(dayDate(r)), bits: revBits[r], n: r - idx,
           shares: (revBits[r] & vOut & mask) ? 1 : 0,
+          // Cabins with evidence of >= pax seats on BOTH legs (0 when the
+          // seats layer is absent — unknown, not "none").
+          fit: paxKnown ? (revTh[r] & vOutTh) : 0,
         });
       }
     }
@@ -2365,10 +2755,11 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null) {
       </div>
       <p class="dp-lead">${lead}</p>
       ${fixHint}
+      ${pax > 1 && !paxKnown ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
       <p class="dp-lead">Search the outbound one way:</p>
       <div class="dp-cabs">${legend.map(([bit, label]) => `
         <a class="dp-cab" target="_blank" rel="noopener noreferrer"
-           href="${baBookingURL(o, d, outIso, bit, null)}">
+           href="${baBookingURL(o, d, outIso, bit, null, pax)}">
           <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
           <span class="dp-cab-label">${esc(label)}</span>
           <span class="dp-cab-go">Search one way ↗</span>
@@ -2412,6 +2803,7 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null) {
       ${stackHTML(vOut, { size: "row" })}
     </div>
     <p class="pp-ret-label" id="pp-ret-label">Return (${d} → ${o})</p>
+    ${pax > 1 && !paxKnown ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
     <div class="pp-rows" role="radiogroup" aria-labelledby="pp-ret-label"></div>
     <div class="pp-summary${retIso ? "" : " pp-unrevealed"}">
       <p class="pp-sum-line" id="pp-sum-line"></p>
@@ -2425,12 +2817,24 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null) {
 
   const rowsWrap = $(".pp-rows", panelEl);
   for (const r of rows) {
+    // Party-size honesty on each return row: which cabins show the party
+    // fitting on both legs. Under-threshold rows stay listed and bookable —
+    // annotated, never hidden.
+    const fitAria = pax > 1 && paxKnown
+      ? (r.fit & r.bits & vOut)
+        ? `, seats for ${pax} together in ${esc(cabNames(r.fit & r.bits & vOut))}`
+        : `, no sign of ${pax} seats together`
+      : "";
+    const fitHTML = pax > 1 && paxKnown
+      ? `<span class="pp-row-pax${(r.fit & r.bits & vOut) ? " fits" : ""}">${
+          (r.fit & r.bits & vOut) ? `fits ${pax}` : `not for ${pax}`}</span>`
+      : "";
     rowsWrap.append(el(`<button type="button" class="pp-row" role="radio" aria-checked="false"
         tabindex="-1" data-iso="${r.iso}"
-        aria-label="Return ${esc(fmtRet.format(dayDate(r.idx)))}, ${r.n} night${r.n === 1 ? "" : "s"}, ${esc(cabNames(r.bits))} open">
+        aria-label="Return ${esc(fmtRet.format(dayDate(r.idx)))}, ${r.n} night${r.n === 1 ? "" : "s"}, ${esc(cabNames(r.bits))} open${fitAria}">
       <span class="pp-radio" aria-hidden="true"></span>
       <span class="pp-row-date">${esc(fmtRet.format(dayDate(r.idx)))}</span>
-      <span class="pp-row-n">${r.n} night${r.n === 1 ? "" : "s"}</span>
+      <span class="pp-row-n">${r.n} night${r.n === 1 ? "" : "s"}${fitHTML}</span>
       ${stackHTML(r.bits, { size: "row" })}
     </button>`));
   }
@@ -2449,10 +2853,16 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null) {
     if (shared) {
       for (const [bit, label] of cabinLegend()) {
         if (!(shared & bit)) continue;
+        // Annotate (never hide) party fit per cabin: the codes are thresholds
+        // ("no sign of"), not proofs of absence, so the link stays offered.
+        const fitNote = pax > 1 && paxKnown
+          ? `<span class="pp-cta-pax${(r.fit & bit) ? " fits" : ""}">${
+              (r.fit & bit) ? `fits ${pax}` : `no sign of ${pax} seats`}</span>`
+          : "";
         ctas.append(el(`<a class="pp-cta" target="_blank" rel="noopener noreferrer"
-            href="${baBookingURL(o, d, outIso, bit, r.iso)}">
+            href="${baBookingURL(o, d, outIso, bit, r.iso, pax)}">
           <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
-          Search ${esc(label)} round trip
+          Search ${esc(label)} round trip${fitNote}
           <span class="pp-cta-go" aria-hidden="true">↗</span></a>`));
       }
     } else {
@@ -2460,8 +2870,8 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null) {
     }
     $("#pp-oneways", panelEl).innerHTML =
       `${shared ? "or " : ""}book each leg one-way:
-       <a href="${baBookingURL(o, d, outIso, 0, null)}" target="_blank" rel="noopener noreferrer">${o}→${d} ${esc(fmtRet.format(dayDate(idx)))} ↗</a> ·
-       <a href="${baBookingURL(d, o, r.iso, 0, null)}" target="_blank" rel="noopener noreferrer">${d}→${o} ${esc(fmtRet.format(dayDate(r.idx)))} ↗</a>`;
+       <a href="${baBookingURL(o, d, outIso, 0, null, pax)}" target="_blank" rel="noopener noreferrer">${o}→${d} ${esc(fmtRet.format(dayDate(idx)))} ↗</a> ·
+       <a href="${baBookingURL(d, o, r.iso, 0, null, pax)}" target="_blank" rel="noopener noreferrer">${d}→${o} ${esc(fmtRet.format(dayDate(r.idx)))} ↗</a>`;
   }
 
   function reveal() { // mobile step 3: selecting a return uncovers the booking summary
@@ -2610,14 +3020,19 @@ function renderFrom(o) {
 
   mainEl.innerHTML = "";
   const dests = (store.destsByOrigin.get(o) || []).slice();
+  // The list respects an active party size (URL → pref → 1) so its counts
+  // agree with the map and the calendars behind the cards. Routes without
+  // seat data keep any-party counts, with the honest note below.
+  const pax = activePax();
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
     <div class="view-toggle" role="group" aria-label="View">
-      <span class="vt-on" aria-current="page">List</span><a href="/map/${o}">Map</a>
+      <span class="vt-on" aria-current="page">List</span><a href="/map/${o}${pax > 1 ? `?pax=${pax}` : ""}">Map</a>
     </div>
     <p class="page-sub">${dests.length} destinations with award seats in the next year.
-      Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights).</p>
+      Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).</p>
+    ${pax > 1 ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
   </div>`));
 
   if (!dests.length) {
@@ -2635,7 +3050,11 @@ function renderFrom(o) {
   const months = next12Months();
   const cards = dests.map((d) => {
     const key = `${o}-${d}`;
-    const rt = roundTripBits(key, `${d}-${o}`, allMask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]);
+    // Per-route honesty: a pair without seat data on both legs counts at
+    // any-party (never silently vanishing at pax >= 2) and gets a badge.
+    const known = pax <= 1 || pairSeatsKnown(key, `${d}-${o}`);
+    const cardPax = known ? pax : 1;
+    const rt = roundTripBits(key, `${d}-${o}`, allMask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1], cardPax);
     let total = 0, union = 0;
     for (let i = t0; i < rt.length; i++) if (rt[i]) { total++; union |= rt[i]; }
     const counts = months.map((mo) => {
@@ -2643,7 +3062,11 @@ function renderFrom(o) {
       for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, rt.length); i++) if (rt[i]) n++;
       return n;
     });
-    return { d, key, total, union, counts, out: routeTotals(key) };
+    const unverified = pax > 1 && !known;
+    // Outbound totals follow the SAME coverage rule as the round-trip
+    // numbers: a card badged "shown for any party" must not mix in
+    // pax-thresholded outbound swatches or sort rank.
+    return { d, key, total, union, counts, unverified, out: routeTotals(key, cardPax) };
   }).sort((a, b) => b.total - a.total || b.out.total - a.out.total);
 
   const grid = el(`<div class="dest-grid"></div>`);
@@ -2652,15 +3075,17 @@ function renderFrom(o) {
     const ow = c.total === 0; // outbound space only — nothing round-trippable
     const cabs = cabinLegend().filter(([bit]) => (ow ? c.out.union : c.union) & bit)
       .map(([bit, label]) => `<span class="swatch ${bitClass(bit)}" title="${esc(label)}"></span>`).join("");
-    grid.append(el(`<a class="dest-card${ow ? " dc-ow" : ""}" href="/trip/${c.key}">
+    grid.append(el(`<a class="dest-card${ow ? " dc-ow" : ""}" href="/trip/${c.key}${pax > 1 ? `?pax=${pax}` : ""}">
       <span class="dc-head"><span class="dc-code">${c.d}</span>
         <span class="dc-name">${esc(placeName(c.d))}</span>
         <span class="dc-country">${esc(placeCountry(c.d))}</span></span>
       <span class="dc-spark" aria-hidden="true">${c.counts.map((n) =>
         `<i style="height:${Math.max(2, Math.round((n / max) * 30))}px"></i>`).join("")}</span>
       <span class="dc-meta">${ow
-        ? `<span class="dc-badge">outbound only — no return space seen</span>`
-        : `<span>${c.total} days with round trips</span>`}<span class="dc-cabs">${cabs}</span></span>
+        ? `<span class="dc-badge">outbound only — no return space seen${pax > 1 && !c.unverified ? ` for ${pax}` : ""}</span>`
+        : `<span>${c.total} days with round trips${pax > 1 && !c.unverified ? ` for ${pax}` : ""}</span>`}
+        ${c.unverified ? `<span class="dc-badge">seat counts pending — shown for any party</span>` : ""}
+        <span class="dc-cabs">${cabs}</span></span>
     </a>`));
   }
   mainEl.append(grid);
@@ -2740,6 +3165,10 @@ function renderMap(o) {
   let monthIdx = -1; // -1 = next 12 months
   let nights = parseNights(new URLSearchParams(location.search).get("nights"))
     || getNightsPref() || NIGHTS_DEFAULT.slice();
+  // Party size: same seed order and, like cabins, a shared map link's pax
+  // governs the pages behind its dots via the session pref.
+  let pax = activePax();
+  if (store.hasAnySeatData) setPaxPref(pax);
   const controls = el(`<div class="section-pad map-controls">
     <div class="chips" role="group" aria-label="Cabins">${cabinLegend().map(([bit, label]) =>
       `<button type="button" class="chip" aria-pressed="${!!(mask & bit)}" data-bit="${bit}">
@@ -2765,6 +3194,17 @@ function renderMap(o) {
     </div>
     <p class="map-count" role="status"></p>
   </div>`);
+  // The pax control renders only when the bundle carries seat data anywhere
+  // (a control that never changes the map reads as broken).
+  let onPaxChange = () => {};
+  if (store.hasAnySeatData) {
+    $(".map-count", controls).before(paxControl(pax, (n) => {
+      pax = n;
+      setPaxPref(n);
+      mirrorPaxURL(n);
+      onPaxChange();
+    }));
+  }
   mainEl.append(controls);
 
   /* Same behavior as the trip page's control: presets + clamped custom
@@ -2773,7 +3213,8 @@ function renderMap(o) {
   const minIn = $("#np-min", controls), maxIn = $("#np-max", controls);
   let onNightsChange = () => {};
   function syncNights() {
-    for (const b of controls.querySelectorAll(".np")) {
+    // [data-lo]: defensive — only nights presets, never other chip rows.
+    for (const b of controls.querySelectorAll(".np[data-lo]")) {
       b.setAttribute("aria-pressed",
         Number(b.dataset.lo) === nights[0] && Number(b.dataset.hi) === nights[1] ? "true" : "false");
     }
@@ -2795,7 +3236,7 @@ function renderMap(o) {
     if (lo > hi) { if (which === "min") hi = lo; else lo = hi; }
     applyNights(lo, hi);
   }
-  controls.querySelectorAll(".np").forEach((b) =>
+  controls.querySelectorAll(".np[data-lo]").forEach((b) =>
     b.addEventListener("click", () => applyNights(Number(b.dataset.lo), Number(b.dataset.hi))));
   minIn.addEventListener("change", () => nightsFromInputs("min"));
   maxIn.addEventListener("change", () => nightsFromInputs("max"));
@@ -2818,9 +3259,13 @@ function renderMap(o) {
   });
 
   /* Days-with-round-trips for one destination inside the active month window,
-     plus the best (highest) cabin seen — that cabin colors the dot. */
+     plus the best (highest) cabin seen — that cabin colors the dot. At a
+     party size >= 2, a pair without seat data on both legs stays on the map
+     at any-party counts with `unverified` set (excluding it would make the
+     map lie by omission; including it unmarked, by assertion). */
   function metric(d) {
-    const rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, nights[0], nights[1]);
+    const known = pax <= 1 || pairSeatsKnown(`${o}-${d}`, `${d}-${o}`);
+    const rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, nights[0], nights[1], known ? pax : 1);
     const t0 = Math.max(0, todayIndex());
     const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
     const from = mo ? Math.max(mo.start, t0) : t0;
@@ -2829,7 +3274,7 @@ function renderMap(o) {
     for (let i = from; i < to; i++) if (rt[i]) { days++; union |= rt[i]; }
     let best = 0;
     for (let bit = 8; bit >= 1; bit >>= 1) if (union & bit) { best = bit; break; }
-    return { days, best };
+    return { days, best, unverified: pax > 1 && !known };
   }
 
   function drawMap() {
@@ -2863,25 +3308,30 @@ function renderMap(o) {
         const [ox, oy] = projectLL(og[0], og[1]);
         parts.push(`<circle class="map-origin" cx="${ox}" cy="${oy}" r="${4 / kOf()}"></circle>`);
       }
+      let unverifiedShown = 0;
       for (const d of dests) {
         const g = store.bundle.places[d]?.g;
-        const { days, best } = metric(d);
+        const { days, best, unverified } = metric(d);
         if (!days) continue;
         if (!g) { unplaced++; continue; }
         shown++;
+        if (unverified) unverifiedShown++;
         const [x, y] = projectLL(g[0], g[1]);
         // Radius grows with the square root of match-days so area ~ days.
         const r = (2.1 + Math.sqrt(days) * 0.38) / kOf();
-        parts.push(`<circle class="map-dot ${bitClass(best)}" cx="${x}" cy="${y}" r="${r}"
-          tabindex="0" role="link" data-code="${d}" data-days="${days}" data-best="${best}"
-          aria-label="${esc(placeName(d))}: ${days} day${days > 1 ? "s" : ""} with round trips — open calendar"></circle>`);
+        parts.push(`<circle class="map-dot ${bitClass(best)}${unverified ? " map-dot-unv" : ""}" cx="${x}" cy="${y}" r="${r}"
+          tabindex="0" role="link" data-code="${d}" data-days="${days}" data-best="${best}"${unverified ? ` data-unv="1"` : ""}
+          aria-label="${esc(placeName(d))}: ${days} day${days > 1 ? "s" : ""} with round trips${
+            pax > 1 ? (unverified ? " — seat counts pending, shown for any party" : ` for ${pax} travelling together`) : ""} — open calendar"></circle>`);
       }
       dotsG.innerHTML = parts.join("");
       const monthLabel = monthIdx >= 0 ? ` in ${next12Months()[monthIdx].label}` : "";
       const nightsLabel = nights[0] === NIGHTS_DEFAULT[0] && nights[1] === NIGHTS_DEFAULT[1]
         ? "" : ` of ${nights[0]}–${nights[1]} nights`;
+      const paxLabel = pax > 1 ? ` for ${pax} travelling together` : "";
       $(".map-count", controls).textContent =
-        `${shown} of ${dests.length} destinations have round trips${nightsLabel}${monthLabel} in the cabins you picked` +
+        `${shown} of ${dests.length} destinations have round trips${paxLabel}${nightsLabel}${monthLabel} in the cabins you picked` +
+        (unverifiedShown ? ` (${unverifiedShown} shown for any party — seat counts pending)` : "") +
         (unplaced ? ` (${unplaced} more can't be placed on the map yet — see the list)` : "") + ".";
     }
 
@@ -2891,7 +3341,8 @@ function renderMap(o) {
       const label = (cabinLegend().find(([bit]) => bit === best) || [0, ""])[1];
       tip.innerHTML = `<div class="t-date">${esc(placeName(d))} <span class="map-tip-code">${d}</span></div>
         <div class="t-cab"><span class="swatch ${bitClass(best)}"></span>
-          ${days} day${days === "1" ? "" : "s"} with round trips · best: ${esc(label)}</div>`;
+          ${days} day${days === "1" ? "" : "s"} with round trips${pax > 1 && !dot.dataset.unv ? ` for ${pax}` : ""} · best: ${esc(label)}</div>
+        ${dot.dataset.unv ? `<div class="t-note">seat counts not yet available — shown for any party</div>` : ""}`;
       tip.hidden = false;
       const pr = panel.getBoundingClientRect(), dr = dot.getBoundingClientRect();
       const x = Math.min(pr.width - tip.offsetWidth - 8, Math.max(8, dr.left - pr.left + dr.width / 2 - tip.offsetWidth / 2));
@@ -3048,6 +3499,7 @@ function renderMap(o) {
       redraw();
     });
     onNightsChange = redraw;
+    onPaxChange = redraw;
 
     applyView();
   }
@@ -3256,6 +3708,9 @@ function alertsFooterHTML() {
         when "something changed" on the route.</li>
       <li><b>No spam.</b> Award space flickers; we hold a cooldown per route and cabin, and batch
         changes, so a churny route can't flood you.</li>
+      <li><b>Party-size alerts never guess.</b> A "2+ seats" watch fires only when the data shows
+        that many seats together, in one cabin, on one flight, on both legs. Where we can't see
+        seat counts for a route we say so and wait for real numbers — we don't alert on hope.</li>
       <li><b>Nothing about you is stored.</b> No account, no email — just an anonymous
         notification handle from your browser, which you can revoke here at any time.</li>
     </ul>

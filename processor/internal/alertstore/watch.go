@@ -19,6 +19,7 @@ const (
 	MaxRangeDays     = 180 // span of a bounded date range
 	MaxFutureDays    = 800 // absurdity guard on range starts
 	MaxLeadDays      = 365 // "I need up to a year's notice" — cap on lead time
+	MaxMinSeats      = 4   // top party-size threshold the seats layer encodes ("4+")
 	MinNights        = 1
 	MaxNights        = 60
 	DefaultNightsMin = 1  // matches NIGHTS_DEFAULT in app.js
@@ -72,7 +73,14 @@ type Watch struct {
 	// instead of going stale (which is why it's safe where a fixed rolling
 	// window would not be). 0 = no lead requirement. Mutually exclusive with an
 	// explicit outbound range.
-	LeadDays    int   `json:"leadDays,omitempty"`
+	LeadDays int `json:"leadDays,omitempty"`
+	// MinSeats: "we travel as a party of N" — the watch fires only when there
+	// is evidence of at least N award seats together, in the same cabin, on
+	// ONE flight, on BOTH legs. 0 (the only stored spelling of "no
+	// constraint") means today's presence-bit behaviour; valid constrained
+	// values are 2..MaxMinSeats. 1 is rejected at Normalize so the zero value
+	// stays the single canonical spelling and content ids stay stable.
+	MinSeats    int   `json:"minSeats,omitempty"`
 	CreatedAt   int64 `json:"createdAt,omitempty"`
 	LastFiredAt int64 `json:"lastFiredAt,omitempty"`
 }
@@ -127,6 +135,17 @@ func Normalize(w Watch) (Watch, error) {
 	}
 	if w.LeadDays < 0 || w.LeadDays > MaxLeadDays {
 		return Watch{}, fmt.Errorf("lead time must be between 0 and %d days", MaxLeadDays)
+	}
+	switch {
+	case w.MinSeats < 0:
+		return Watch{}, errors.New("minSeats cannot be negative")
+	case w.MinSeats == 1:
+		// The zero value is the only spelling of "one passenger": accepting an
+		// explicit 1 would mint a second id for the same watch content.
+		return Watch{}, errors.New("minSeats 1 is the default; omit it for a single passenger")
+	case w.MinSeats > MaxMinSeats:
+		return Watch{}, fmt.Errorf("minSeats must be between 2 and %d (%d means \"%d or more\")",
+			MaxMinSeats, MaxMinSeats, MaxMinSeats)
 	}
 	if w.LeadDays > 0 && w.Out != nil {
 		// "Any time with N days' notice" and "specific outbound dates" are two
@@ -213,6 +232,14 @@ func watchID(w Watch) string {
 	if w.LeadDays > 0 {
 		fmt.Fprintf(&b, "L%d", w.LeadDays)
 	}
+	// Conditional fold, separator INCLUDED (the LeadDays "L%d" precedent):
+	// a MinSeats-less watch hashes byte-identically to the pre-feature
+	// formula, so every stored id — and everything keyed off it (carryHistory,
+	// MarkFired, pending items, the client's rf:seen baselines) — survives the
+	// deploy. Pinned by TestMinSeatsIDStability.
+	if w.MinSeats >= 2 {
+		fmt.Fprintf(&b, "|S%d", w.MinSeats)
+	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:8]
 }
@@ -252,6 +279,11 @@ func (w Watch) BoundedOut() bool { return w.Out != nil && w.Out.To != "" }
 // a stale client (§2.2).
 func (w Watch) TopicRepresentable() bool {
 	if w.Out != nil || w.Ret != nil {
+		return false
+	}
+	if w.MinSeats >= 2 {
+		// A stale client cannot express a party constraint, so it must not be
+		// able to see — or, via UpsertTopics' replace, destroy — such a watch.
 		return false
 	}
 	if w.Nights == nil {

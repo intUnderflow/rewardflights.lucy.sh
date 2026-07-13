@@ -21,13 +21,30 @@ var testPlaces = map[string]Place{
 	"LON": {Name: "London", Country: "United Kingdom", G: []float64{51.507, -0.128}},
 }
 
+// testDate is one fixture date for buildDatasetEntries: cabinsAvailable
+// letters plus optional per-flight detail.
+type testDate struct {
+	cabins  []string
+	flights []source.Flight
+}
+
 // buildDataset runs Build over a single BA route with the given date->cabins
 // map and returns the output, the parsed bundle, and the warning lines.
 func buildDataset(t *testing.T, dates map[string][]string, sourceTime int64) (*Output, map[string]any, []string) {
 	t.Helper()
-	route := &source.Route{Dates: map[string]source.DateEntry{}}
+	full := map[string]testDate{}
 	for date, cabins := range dates {
-		route.Dates[date] = source.DateEntry{Cabins: cabins, Path: "src/" + date + ".json"}
+		full[date] = testDate{cabins: cabins}
+	}
+	return buildDatasetEntries(t, full, sourceTime)
+}
+
+// buildDatasetEntries is buildDataset with full per-date control (flights).
+func buildDatasetEntries(t *testing.T, dates map[string]testDate, sourceTime int64) (*Output, map[string]any, []string) {
+	t.Helper()
+	route := &source.Route{Dates: map[string]source.DateEntry{}}
+	for date, td := range dates {
+		route.Dates[date] = source.DateEntry{Cabins: td.cabins, Flights: td.flights, Path: "src/" + date + ".json"}
 	}
 	ds := &source.Dataset{Airlines: map[string]*source.Airline{
 		"british-airways": {Slug: "british-airways", Routes: map[string]*source.Route{"ABZ-LON": route}},
@@ -55,6 +72,27 @@ func bundleString(t *testing.T, bundle map[string]any, route string) string {
 	t.Helper()
 	entry := bundle["routes"].(map[string]any)[route].(map[string]any)
 	return entry["a"].(map[string]any)["BA"].(string)
+}
+
+// seatBundleString returns the route's BA "s" seat-threshold string and
+// whether the "s" key is present at all.
+func seatBundleString(t *testing.T, bundle map[string]any, route string) (string, bool) {
+	t.Helper()
+	entry := bundle["routes"].(map[string]any)[route].(map[string]any)
+	s, ok := entry["s"].(map[string]any)
+	if !ok {
+		return "", false
+	}
+	return s["BA"].(string), true
+}
+
+// seatPair extracts the 2-hex-char byte for day index idx of an "s" string.
+func seatPair(t *testing.T, s string, idx int) string {
+	t.Helper()
+	if 2*idx+2 > len(s) {
+		t.Fatalf("seat string too short (%d) for day index %d", len(s), idx)
+	}
+	return s[2*idx : 2*idx+2]
 }
 
 func TestFutureDateCap(t *testing.T) {
@@ -189,5 +227,177 @@ func TestPlaceCoordsEmittedAndMissingCoordsWarn(t *testing.T) {
 	}
 	if strings.Contains(buf.String(), "place-missing-coords ABZ") {
 		t.Error("ABZ has coords and must not warn")
+	}
+}
+
+// Threshold-code buckets at every boundary: 1 seat is NOT evidence of >=2
+// (code 0), 2 -> 1, 3 -> 2, 4 -> 3, and anything above caps at 3.
+func TestSeatBucketBoundaries(t *testing.T) {
+	sourceTime := int64(day(t, "2026-02-02")) * 86400
+	dates := map[string]testDate{}
+	seatDays := map[string]int{
+		"2026-03-01": 1, "2026-03-02": 2, "2026-03-03": 3,
+		"2026-03-04": 4, "2026-03-05": 9,
+	}
+	for date, n := range seatDays {
+		dates[date] = testDate{cabins: []string{"F"}, flights: []source.Flight{{Seats: map[string]int{"F": n}}}}
+	}
+	_, bundle, warns := buildDatasetEntries(t, dates, sourceTime)
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+	s, ok := seatBundleString(t, bundle, "ABZ-LON")
+	if !ok {
+		t.Fatal("route with flight detail must carry an \"s\" key")
+	}
+	days := int(bundle["days"].(float64))
+	if len(s) != 2*days {
+		t.Fatalf("seat string length = %d, want 2*days = %d", len(s), 2*days)
+	}
+	e := day(t, "2026-01-01")
+	// F codes live in bits 6-7: code<<6 -> bytes 00, 40, 80, C0, C0.
+	want := map[string]string{
+		"2026-03-01": "00", "2026-03-02": "40", "2026-03-03": "80",
+		"2026-03-04": "C0", "2026-03-05": "C0",
+	}
+	for date, pair := range want {
+		if got := seatPair(t, s, day(t, date)-e); got != pair {
+			t.Errorf("%s (%d seats): seat byte = %q, want %q", date, seatDays[date], got, pair)
+		}
+	}
+	// The presence layer is untouched: every fixture day still shows F.
+	a := bundleString(t, bundle, "ABZ-LON")
+	for date := range seatDays {
+		if a[day(t, date)-e] != '8' {
+			t.Errorf("%s: nibble = %q, want '8'", date, a[day(t, date)-e])
+		}
+	}
+}
+
+// A day's per-cabin value is the MAX across its flights — a party must fit
+// on ONE flight — never the sum.
+func TestSeatMaxAcrossFlightsNotSum(t *testing.T) {
+	sourceTime := int64(day(t, "2026-02-02")) * 86400
+	_, bundle, warns := buildDatasetEntries(t, map[string]testDate{
+		"2026-03-01": {cabins: []string{"C"}, flights: []source.Flight{
+			{Seats: map[string]int{"C": 2}},
+			{Seats: map[string]int{"C": 2}},
+			{Seats: map[string]int{"C": 1}},
+		}},
+	}, sourceTime)
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+	s, ok := seatBundleString(t, bundle, "ABZ-LON")
+	if !ok {
+		t.Fatal("missing \"s\" key")
+	}
+	// MAX = 2 -> code 1 in bits 4-5 -> 0x10. A summed implementation would
+	// see 5 seats and emit 0x30.
+	if got := seatPair(t, s, day(t, "2026-03-01")-day(t, "2026-01-01")); got != "10" {
+		t.Errorf("seat byte = %q, want \"10\" (MAX across flights, not SUM)", got)
+	}
+}
+
+// Routes without any flight detail must not carry an "s" key at all — with
+// 0% flights coverage the bundle is byte-identical to the pre-seats format.
+func TestSeatKeyAbsentWithoutFlights(t *testing.T) {
+	sourceTime := int64(day(t, "2026-02-02")) * 86400
+	_, bundle, warns := buildDataset(t, map[string][]string{
+		"2026-03-01": {"M", "F"},
+		"2026-03-02": {"C"},
+	}, sourceTime)
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+	if _, ok := seatBundleString(t, bundle, "ABZ-LON"); ok {
+		t.Error("route without flight detail must not carry an \"s\" key")
+	}
+}
+
+// One flight-carrying day is enough to emit "s"; days without flight detail
+// (and every other day in the window) encode as "00" = counts unknown.
+func TestSeatPartialCoverage(t *testing.T) {
+	sourceTime := int64(day(t, "2026-02-02")) * 86400
+	_, bundle, warns := buildDatasetEntries(t, map[string]testDate{
+		"2026-03-01": {cabins: []string{"M"}, flights: []source.Flight{{Seats: map[string]int{"M": 4}}}},
+		"2026-03-02": {cabins: []string{"M"}},
+	}, sourceTime)
+	if len(warns) != 0 {
+		t.Fatalf("unexpected warnings: %v", warns)
+	}
+	s, ok := seatBundleString(t, bundle, "ABZ-LON")
+	if !ok {
+		t.Fatal("missing \"s\" key")
+	}
+	e := day(t, "2026-01-01")
+	if got := seatPair(t, s, day(t, "2026-03-01")-e); got != "03" {
+		t.Errorf("flight day byte = %q, want \"03\" (M code 3)", got)
+	}
+	if got := seatPair(t, s, day(t, "2026-03-02")-e); got != "00" {
+		t.Errorf("cabins-only day byte = %q, want \"00\" (counts unknown)", got)
+	}
+	for i := 0; i < len(s); i += 2 {
+		if d := e + i/2; d != day(t, "2026-03-01") && s[i:i+2] != "00" {
+			t.Fatalf("day %s byte = %q, want \"00\"", dayDate(d), s[i:i+2])
+		}
+	}
+}
+
+// Contradictory source data: seats claimed for a cabin that isn't in
+// cabinsAvailable resolve to the "a" bit (code 0) with a warning; an
+// available cabin whose flights show no seats warns once per file; negative
+// counts warn and are ignored everywhere.
+func TestSeatContradictionWarnings(t *testing.T) {
+	sourceTime := int64(day(t, "2026-02-02")) * 86400
+	out, bundle, warns := buildDatasetEntries(t, map[string]testDate{
+		// M:3 contradicts cabinsAvailable=[F]: M code stays 0, F encodes.
+		"2026-03-01": {cabins: []string{"F"}, flights: []source.Flight{{Seats: map[string]int{"M": 3, "F": 2}}}},
+		// C is available but no flight shows a C seat: counts unknown, warn.
+		"2026-03-02": {cabins: []string{"M", "C"}, flights: []source.Flight{{Seats: map[string]int{"M": 2}}}},
+		// Negative count: warned, dropped from flights/, never bucketed.
+		"2026-03-03": {cabins: []string{"W"}, flights: []source.Flight{{Seats: map[string]int{"W": -2}}}},
+	}, sourceTime)
+	want := []string{
+		"WARN seats-cabin-not-available M src/2026-03-01.json",
+		"WARN available-cabin-zero-seats C src/2026-03-02.json",
+		"WARN negative-seats W src/2026-03-03.json",
+		"WARN available-cabin-zero-seats W src/2026-03-03.json",
+	}
+	if len(warns) != len(want) {
+		t.Fatalf("warnings = %v, want %v", warns, want)
+	}
+	for i := range want {
+		if warns[i] != want[i] {
+			t.Errorf("warning[%d] = %q, want %q", i, warns[i], want[i])
+		}
+	}
+
+	s, ok := seatBundleString(t, bundle, "ABZ-LON")
+	if !ok {
+		t.Fatal("missing \"s\" key")
+	}
+	e := day(t, "2026-01-01")
+	for date, pair := range map[string]string{
+		"2026-03-01": "40", // F code 1 only; contradicted M stays 0
+		"2026-03-02": "01", // M code 1; available-but-unseen C stays 0
+		"2026-03-03": "00", // negative ignored: counts unknown
+	} {
+		if got := seatPair(t, s, day(t, date)-e); got != pair {
+			t.Errorf("%s: seat byte = %q, want %q", date, got, pair)
+		}
+	}
+
+	// The negative count must not leak into the flights/ detail file either.
+	var detail struct {
+		Days map[string]map[string][]struct {
+			Seats map[string]int `json:"seats"`
+		} `json:"days"`
+	}
+	if err := json.Unmarshal(out.Files["flights/ABZ/LON/2026-03.json"], &detail); err != nil {
+		t.Fatal(err)
+	}
+	if got := detail.Days["03"]["BA"][0].Seats; len(got) != 0 {
+		t.Errorf("negative seat count leaked into flights detail: %v", got)
 	}
 }

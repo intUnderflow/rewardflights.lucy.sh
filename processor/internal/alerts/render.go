@@ -62,15 +62,23 @@ func render(items []item, overflow int, subKey string, now int64, today int) Pub
 	return pub
 }
 
-// dedupe removes news that two overlapping watches both found.
+// dedupe removes news that two overlapping watches both found. When the same
+// pair satisfied both a single-passenger and a party watch, the kept item
+// carries the LOWEST threshold: "seats open" is true for everyone, "3+ seats"
+// would over-claim scope for the 1-pax watch's audience.
 func dedupe(items []item) []item {
-	seen := map[string]bool{}
+	idx := map[string]int{}
 	out := items[:0:0]
 	for _, it := range items {
-		if k := it.dedupeKey(); !seen[k] {
-			seen[k] = true
-			out = append(out, it)
+		k := it.dedupeKey()
+		if j, ok := idx[k]; ok {
+			if it.MinSeats < out[j].MinSeats {
+				out[j].MinSeats = it.MinSeats
+			}
+			continue
 		}
+		idx[k] = len(out)
+		out = append(out, it)
 	}
 	return out
 }
@@ -146,10 +154,33 @@ func groupTitle(g group) string {
 	if len(cabins) == 1 {
 		subject = cabinNames[cabins[0]]
 	}
+	// Party news gets its qualifier in the title — the push IS the promise,
+	// so "we found 3 seats together" must be said out loud. Only when every
+	// item in the group is party news (dedupe already keeps the lowest
+	// threshold per pair, so a mixed group stays unqualified and true for
+	// everyone).
+	if n := groupMinSeats(g); n >= 2 {
+		if g.kind == alertstore.KindRT {
+			return fmt.Sprintf("%s (%d+ seats) round trips open: %s", subject, n, routeLabel(g))
+		}
+		return fmt.Sprintf("%s (%d+ seats) open: %s", subject, n, routeLabel(g))
+	}
 	if g.kind == alertstore.KindRT {
 		return fmt.Sprintf("%s round trips open: %s", subject, routeLabel(g))
 	}
 	return fmt.Sprintf("%s seats open: %s", subject, routeLabel(g))
+}
+
+// groupMinSeats is the smallest MinSeats across a group's items: >= 2 only
+// when every item is party news.
+func groupMinSeats(g group) int {
+	n := g.items[0].MinSeats
+	for _, it := range g.items {
+		if it.MinSeats < n {
+			n = it.MinSeats
+		}
+	}
+	return n
 }
 
 // groupBody renders the dates. Round trips list PAIRS (the unit of news);

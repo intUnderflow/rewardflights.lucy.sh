@@ -91,7 +91,7 @@ func TestGoldenEndToEnd(t *testing.T) {
 
 	want := Result{
 		Routes: 4, RouteDates: 5, Origins: 3, Places: 4, Warnings: 9,
-		Written: 9, Deleted: 0, Unchanged: 0, BundleGz: res.BundleGz,
+		Written: 10, Deleted: 0, Unchanged: 0, BundleGz: res.BundleGz,
 	}
 	if *res != want {
 		t.Errorf("result = %+v, want %+v", *res, want)
@@ -184,8 +184,8 @@ func TestStaleDeletionAndChanges(t *testing.T) {
 	if res.Routes != 2 || res.RouteDates != 3 || res.Origins != 2 || res.Places != 2 {
 		t.Errorf("result = %+v", *res)
 	}
-	if res.Deleted != 2 { // origins/NYC.json + flights/LON/TYO/2027-01.json
-		t.Errorf("deleted = %d, want 2", res.Deleted)
+	if res.Deleted != 3 { // origins/NYC.json + flights/LON/TYO/{2026-12,2027-01}.json
+		t.Errorf("deleted = %d, want 3", res.Deleted)
 	}
 
 	got := treeFiles(t, out)

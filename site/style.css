@@ -588,6 +588,21 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .np-custom { display: inline-flex; align-items: center; gap: 5px; color: var(--ink-3); font-family: var(--font-data); font-size: 11.5px; }
 .np-custom input { width: 52px; padding: 5px 7px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--surface); color: var(--ink); font: 400 13px var(--font-data); }
 
+/* party-size control (1 · 2 · 3 · 4+) — rendered only when the bundle
+   carries seat-count data. Chips look like .np but carry their own class so
+   nights-preset logic (and tests) that select .np never match them. */
+.pax-ctl { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.pxp { display: inline-flex; align-items: center; justify-content: center; min-width: 36px; border: 1px solid var(--line-2); border-radius: 999px; padding: 5px 11px; background: var(--panel); cursor: pointer; font-size: 12.5px; font-weight: 700; color: var(--ink-2); }
+.pxp:hover { border-color: var(--ink-3); }
+.pxp[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--surface); }
+/* honest fallback line: seat counts unknown for this route at pax >= 2 */
+.pax-note { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); margin: 8px 0 0; }
+/* day/pair panel per-cabin party annotations */
+.dp-cab-pax, .pp-row-pax, .pp-cta-pax { display: inline-block; margin-left: 8px; font-family: var(--font-data); font-size: 10.5px; color: var(--ink-3); }
+.dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }
+/* map: pair lacks seat data at pax >= 2 — shown at any-party, cued hollow-ish */
+.map-dot-unv { fill-opacity: .45; stroke-dasharray: 2 1.4; }
+
 /* year strip — 12 months at a glance */
 .year-strip { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; margin: 18px 0 34px; }
 .ys-month {

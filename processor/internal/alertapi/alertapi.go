@@ -144,11 +144,35 @@ type HorizonFunc func() (today, endDay int, routes map[string]bool)
 // {"watches": []} means "turn everything off", which is not the same as a
 // legacy client that omits the key entirely.
 type subscribeRequest struct {
-	Endpoint string              `json:"endpoint"`
-	P256dh   string              `json:"p256dh"`
-	Auth     string              `json:"auth"`
-	Watches  *[]alertstore.Watch `json:"watches"`
-	Topics   *[]string           `json:"topics"`
+	Endpoint string     `json:"endpoint"`
+	P256dh   string     `json:"p256dh"`
+	Auth     string     `json:"auth"`
+	Watches  *[]watchIn `json:"watches"`
+	Topics   *[]string  `json:"topics"`
+}
+
+// watchIn is a Watch plus the read-only fields this server itself adds to
+// its GET /watches (and POST /subscribe) responses but that are NOT part of
+// the Watch schema. The client's documented flow is read-modify-write — it
+// fetches the list, edits it, and POSTs the whole thing back — so a payload
+// containing the server's own echoes is a legitimate request, and rejecting
+// it (as the bare DisallowUnknownFields decoder did) broke every save made
+// while another watch existed. The tolerance is a deliberate whitelist of
+// exactly what we emit: anything else (a typo'd field, a future client's
+// field this build doesn't know) still fails loudly instead of silently
+// dropping a constraint the user thinks they saved.
+type watchIn struct {
+	alertstore.Watch
+	Status string `json:"status,omitempty"` // read-time echo; recomputed, never stored
+}
+
+// watches unwraps the wire type, discarding the read-only echoes.
+func watches(in []watchIn) []alertstore.Watch {
+	out := make([]alertstore.Watch, len(in))
+	for i, w := range in {
+		out[i] = w.Watch
+	}
+	return out
 }
 
 // watchOut is a stored watch plus its read-time status.
@@ -183,13 +207,14 @@ func (s *Server) handleSubscribe(w http.ResponseWriter, r *http.Request) {
 	if req.Topics != nil {
 		saved, err = s.cfg.Store.UpsertTopics(sub, *req.Topics)
 	} else {
-		for _, watch := range *req.Watches {
+		incoming := watches(*req.Watches)
+		for _, watch := range incoming {
 			if err := s.validateDates(watch); err != nil {
 				badRequest(w, err.Error())
 				return
 			}
 		}
-		sub.Watches = *req.Watches
+		sub.Watches = incoming
 		saved, err = s.cfg.Store.Upsert(sub)
 	}
 	switch {

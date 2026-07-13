@@ -64,6 +64,31 @@ Availability for route+airline = **nibble-per-day uppercase-hex string**:
 - Defensive filter: dates earlier than the source commit date are dropped
   with a single aggregated WARN (protects against source pruning failures).
 
+### Seat thresholds — optional `s` route-entry key (additive, schema stays 1)
+
+Where the source's optional `flights[]` arrays carry per-cabin seat counts,
+a route entry gains `"s"`: airline id → **2 uppercase hex chars (one byte)
+per day**, same epoch/window as `a` (length exactly `2 × days`; day d =
+`parseInt(s.slice(2d, 2d+2), 16)`). 2 bits per cabin: M=bits 0–1, W=2–3,
+C=4–5, F=6–7. Monotone threshold code per cabin:
+`0` = no sign of ≥2 seats (count unknown OR only 1 seen — deliberately
+collapsed; copy must say "no sign of N seats", never "0 seats"), `1` = ≥2,
+`2` = ≥3, `3` = ≥4. A party of N fits iff code ≥ N−1; N=1 uses `a` only.
+
+- Per-cabin value = **MAX of seats across that day's flights** of the airline
+  (a party must fit on ONE flight — never SUM); merge airlines client-side
+  with per-cabin MAX, never OR/SUM.
+- `a` is the presence authority: a cabin's code is nonzero only when its bit
+  is set in `a`; contradictions resolve to the `a` bit with a WARN.
+- Emitted per route+airline ONLY when at least one day has flight detail, so
+  0% flights coverage produces byte-identical output (the dormant phase).
+  Absent key = counts unknown → surfaces fall back to `a` presence with an
+  honest note, never a silently empty view.
+- Unrelated to the reserved per-airline `width` mechanism (cabin-legend
+  growth of `a` only); never widen `a` — decoders skip width ≠ 1 airlines.
+- changes/recent.json does NOT report seat-threshold transitions (v1); the
+  previous bundle's `s` keys are tolerated and ignored by the differ.
+
 ### Files
 
 ```
@@ -103,6 +128,8 @@ README.md, FORMAT.md
   live under `"a"`). `"a"` maps airline id → nibble string. `"fm"` lists
   route-months that have flight-detail files — clients never probe/404
   (raw.githubusercontent caches 404s for 5 min). `"fm"` omitted when empty.
+  `"s"` (optional) maps airline id → seat-threshold string (see above);
+  omitted when the route+airline has no flight detail.
 - Airline ids come from an APPEND-ONLY registry in processor assets
   (slug → {id, name, cabins}); once assigned an id is frozen forever;
   a later colliding airline gets its slug as id. (Judge-flagged: retroactive

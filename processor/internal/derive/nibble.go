@@ -84,6 +84,44 @@ func NibbleString(days, epochDay int, bitsByDay map[int]int) string {
 	return string(buf)
 }
 
+// seatCode maps a per-cabin seat count (the MAX across one day's flights of
+// one airline) to its 2-bit monotone threshold code: 0 = no evidence of >=2
+// seats (count unknown, only 1 seen, or nothing usable — deliberately
+// collapsed), 1 = >=2, 2 = >=3, 3 = >=4. A party of N fits iff code >= N-1.
+func seatCode(n int) int {
+	switch {
+	case n >= 4:
+		return 3
+	case n == 3:
+		return 2
+	case n == 2:
+		return 1
+	default:
+		return 0
+	}
+}
+
+// SeatString renders one route+airline seat-threshold string: 2 uppercase hex
+// characters (one byte) per day starting at epochDay, from a day -> packed
+// byte map. The byte holds one 2-bit seatCode per cabin in MWCF order
+// (M = bits 0-1, W = bits 2-3, C = bits 4-5, F = bits 6-7), so the string is
+// exactly twice as long as the sibling NibbleString and day d lives at
+// s[2d:2d+2]. "00" means no evidence of >=2 seats in any cabin that day.
+func SeatString(days, epochDay int, byteByDay map[int]int) string {
+	buf := make([]byte, 2*days)
+	for i := range buf {
+		buf[i] = '0'
+	}
+	for day, b := range byteByDay {
+		i := day - epochDay
+		if i >= 0 && i < days {
+			buf[2*i] = hexDigits[(b>>4)&0xF]
+			buf[2*i+1] = hexDigits[b&0xF]
+		}
+	}
+	return string(buf)
+}
+
 // cabinLetters renders a bitmask as cabin letters in canonical MWCF order,
 // e.g. 5 -> "MC".
 func cabinLetters(bits int) string {

@@ -14,6 +14,64 @@ type bundleState struct {
 	epochDay int               // absolute day of the bundle epoch
 	endDay   int               // one past the last encoded day (the horizon)
 	merged   map[string][]byte // route -> cabin bits per day since epoch
+	// seats: route -> one packed byte per day since epoch, decoded from the
+	// optional "s" layer (2 hex chars per day; 2-bit monotone threshold code
+	// per cabin, M=bits 0-1, W=2-3, C=4-5, F=6-7; 0 = no evidence of >=2
+	// seats, 1 = >=2, 2 = >=3, 3 = >=4). Codes are MAX-merged across airlines
+	// (a party rides ONE flight, never a sum) and masked by the day's merged
+	// presence bits — "a" is the sole presence authority. A route ABSENT from
+	// this map has no seat data at all: "unknown", which is distinct from a
+	// present route whose codes are 0.
+	seats map[string][]byte
+}
+
+// seatNeed converts a watch's MinSeats to the threshold code it requires:
+// a party of N fits iff code >= N-1.
+func seatNeed(minSeats int) byte { return byte(minSeats - 1) }
+
+// seatCode extracts one cabin's 2-bit threshold code from a packed seat byte.
+// cabinIdx is the M W C F rank (0..3).
+func seatCode(packed byte, cabinIdx int) byte {
+	return (packed >> (2 * cabinIdx)) & 3
+}
+
+// seatByteAt returns the packed seat byte for an absolute day on a route, or
+// 0 (no evidence) when the route has no seats layer or the day is outside it.
+func (b *bundleState) seatByteAt(route string, day int) byte {
+	s, ok := b.seats[route]
+	if !ok {
+		return 0
+	}
+	i := day - b.epochDay
+	if i < 0 || i >= len(s) {
+		return 0
+	}
+	return s[i]
+}
+
+// satisfiedBits returns the cabins (as a presence-style bitmask) that hold a
+// day's cabin bit AND meet the seat threshold for a party of minSeats. For
+// minSeats <= 1 it is exactly the presence bits — the seats layer never
+// touches single-passenger semantics.
+func (b *bundleState) satisfiedBits(route string, day int, minSeats int) byte {
+	var pres byte
+	if bits, ok := b.merged[route]; ok {
+		if i := day - b.epochDay; i >= 0 && i < len(bits) {
+			pres = bits[i]
+		}
+	}
+	if minSeats <= 1 {
+		return pres
+	}
+	packed := b.seatByteAt(route, day)
+	need := seatNeed(minSeats)
+	var out byte
+	for i, c := range cabinOrder {
+		if pres&c.bit != 0 && seatCode(packed, i) >= need {
+			out |= c.bit
+		}
+	}
+	return out
 }
 
 // parseBundle extracts a bundleState from availability.json bytes. Cabin
@@ -28,6 +86,7 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		} `json:"airlines"`
 		Routes map[string]struct {
 			A map[string]string `json:"a"`
+			S map[string]string `json:"s"`
 		} `json:"routes"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
@@ -38,6 +97,7 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		return nil, fmt.Errorf("bundle epoch: %w", err)
 	}
 	merged := map[string][]byte{}
+	seats := map[string][]byte{}
 	maxLen := 0
 	for route, entry := range b.Routes {
 		var bits []byte
@@ -60,8 +120,59 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		if len(bits) > maxLen {
 			maxLen = len(bits)
 		}
+
+		// Optional seats layer, mirroring the site's decoder: only airlines
+		// whose "a" contributes presence may contribute codes; 2 hex chars per
+		// day; MAX-merge per cabin across airlines (equivalently, since the
+		// threshold test is monotone, a per-cabin max of codes); finally mask
+		// by the merged presence bits so a (malformed) seat string can never
+		// claim a cabin the presence layer doesn't show.
+		var packed []byte
+		for id, s := range entry.S {
+			if a, ok := b.Airlines[id]; ok && a.Width != 0 && a.Width != 1 {
+				continue
+			}
+			if _, ok := entry.A[id]; !ok {
+				continue // "a" is the sole presence authority
+			}
+			days := len(s) / 2
+			if days > len(packed) {
+				grown := make([]byte, days)
+				copy(grown, packed)
+				packed = grown
+			}
+			for i := 0; i < days; i++ {
+				hi, lo := hexBits(s[2*i]), hexBits(s[2*i+1])
+				if hi < 0 || lo < 0 {
+					continue // not hex: contribute nothing for this day
+				}
+				v := byte(hi<<4 | lo)
+				if v == 0 {
+					continue
+				}
+				for c := 0; c < 4; c++ {
+					if code := seatCode(v, c); code > seatCode(packed[i], c) {
+						packed[i] = (packed[i] &^ (3 << (2 * c))) | (code << (2 * c))
+					}
+				}
+			}
+		}
+		if packed != nil {
+			for i := range packed {
+				var pres byte
+				if i < len(bits) {
+					pres = bits[i]
+				}
+				for c, cab := range cabinOrder {
+					if pres&cab.bit == 0 {
+						packed[i] &^= 3 << (2 * c)
+					}
+				}
+			}
+			seats[route] = packed
+		}
 	}
-	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen, merged: merged}, nil
+	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen, merged: merged, seats: seats}, nil
 }
 
 // cabinOrder is the canonical M W C F ordering, used everywhere cabins are

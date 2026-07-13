@@ -92,6 +92,52 @@ index = days from 2026-01-01 to 2026-07-12
 **and** Business have award availability; Premium Economy and First do not.
 `'F'` = all four cabins; `'0'` = nothing that day.
 
+## Seat thresholds — the seats string (optional `s` key)
+
+Where the source provides per-flight seat counts, a route entry additionally
+carries `s`: airline id → a string of **two uppercase hex characters (one
+byte) per day**, over the same `epoch`/`days` window as `a`, so its length is
+exactly `2 × days`. Day `d` is the byte `parseInt(s.slice(2*d, 2*d + 2), 16)`,
+which packs one 2-bit threshold code per cabin:
+
+| Bits | Cabin |
+|---|---|
+| 0–1 | Economy `M` |
+| 2–3 | Premium Economy `W` |
+| 4–5 | Business `C` |
+| 6–7 | First `F` |
+
+| Code | Meaning |
+|---|---|
+| 0 | no sign of ≥2 seats — count unknown **or** only 1 seat seen (deliberately collapsed; never means "0 seats") |
+| 1 | ≥2 award seats on a single flight |
+| 2 | ≥3 award seats on a single flight |
+| 3 | ≥4 award seats on a single flight |
+
+Semantics:
+
+- The value is the **maximum across that day's flights** of the airline — a
+  party must fit on **one** flight, so counts are never summed across flights.
+  Merge airlines client-side with a per-cabin **MAX** (never OR or SUM): a
+  party rides one airline's one flight.
+- A party of N fits in a cabin iff the cabin's code ≥ N−1 (N=2 → code ≥ 1,
+  N=3 → code ≥ 2, N=4 → code ≥ 3). N=1 needs only `a` — the seats layer never
+  changes single-passenger semantics.
+- `a` is the sole presence authority: a cabin's code is nonzero **only if**
+  that cabin's bit is set in `a` for the same day. Contradictory source data
+  resolves to the `a` bit (code forced to 0) with a processor warning.
+- The key is present for a route+airline **only when at least one of its days
+  carries flight detail**. An absent key means seat counts are unknown for
+  the whole route+airline — fall back to `a` presence and say so; never treat
+  absence (or code 0) as "0 seats".
+- `schema` stays `1`: the key is additive, and clients that don't know it
+  ignore it. It is unrelated to the reserved per-airline `width` mechanism,
+  which concerns cabin-legend growth of `a` only and is untouched.
+
+Worked example: `"s"` char pair `"40"` = byte `0x40` → First code
+`(0x40 >> 6) & 3 = 1` (≥2 First seats on one flight); Economy, Premium
+Economy and Business codes 0 (no sign of ≥2 seats).
+
 ## `manifest.json`
 
 ```json
@@ -164,6 +210,9 @@ index = days from 2026-01-01 to 2026-07-12
     that have a `flights/<ORIG>/<DEST>/<YYYY-MM>.json` detail file. Only fetch
     detail for listed months — never probe (raw.githubusercontent.com caches
     404s). A listed month that still 404s is "detail pending", not an error.
+  - `s` (optional, omitted when the route has no flight detail): airline id →
+    seat-threshold string, 2 hex chars per day (see the seat-thresholds
+    section). Absent = seat counts unknown; fall back to `a`.
 - `origins/<ORIGIN>.json` is byte-compatible in shape: `routes` is filtered to
   routes starting at that origin, and `places` to the codes those routes
   reference. Everything else (airlines, epoch, days, source) is identical.
@@ -248,6 +297,11 @@ new one and prepends what changed. Entry fields:
 - `t`: the source timestamp of the generation that observed the change.
 
 Dates that merely rolled into the past are **not** reported as closed.
+
+Seat-threshold (`s`) transitions are **not** reported in this feed: entries
+reflect `a` cabin-bit changes only, so a day going from 2 to 4 seats (bit
+unchanged) emits nothing. A future format revision may add a seat-transition
+entry kind; consumers must ignore unknown `k` values.
 
 ## Size budgets
 

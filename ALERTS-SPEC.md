@@ -73,10 +73,11 @@ A subscription is `{endpoint, p256dh, auth, watches: [Watch]}`. A Watch is one t
 | `out` | **no** | unbounded → `[today, +∞)` | "any time" |
 | `ret` | **no** (rt only) | derived: `[out.from + nights.min, out.to + nights.max]`, unbounded if `out` is | "wherever the nights window lands me" |
 | `nights` | **no** (rt only) | `{min: 1, max: 30}` | matches `NIGHTS_DEFAULT` in app.js and `Window=30` today |
+| `minSeats` | **no** | `0` (≡ 1 passenger) | "we travel as a party of N": fire only on evidence of ≥ N seats together, same cabin, ONE flight, BOTH legs. Valid stored values: `0` or `2..4` (`4` means "4+", the top code the seats layer encodes). An explicit `1` → 400 — the zero value is the only spelling of "no constraint", so ids stay content-stable |
 
 `ret`/`nights` on an `ow` watch → 400. `out.to` unbounded is expressed by omitting the key entirely (not by a sentinel date).
 
-**`id` is `sha256(route|kind|cabins|out|ret|nights)[:8]` (hex).** Content-derived, so re-saving the same watch is idempotent, duplicates collapse for free, and the client can compute it for optimistic UI. Editing a watch changes its id — fine, because `Upsert` replaces the whole list anyway; `createdAt`/`lastFiredAt` are carried over for ids that already exist. *Runner-up: client-supplied random ids — allows meaningless duplicates and needs a separate dedupe pass.*
+**`id` is `sha256(route|kind|cabins|out|ret|nights[|L<leadDays>][|S<minSeats>])[:8]` (hex).** Content-derived, so re-saving the same watch is idempotent, duplicates collapse for free, and the client can compute it for optimistic UI. `leadDays` and `minSeats` fold in **conditionally** (only when `> 0` / `≥ 2`, separator included in the fold) so a watch without them hashes byte-identically to the original formula — every pre-feature stored id, and everything keyed off ids (`carryHistory`, `MarkFired`, pending items, the client's `rf:seen:v1` baselines), survives each field's introduction. Pinned by `TestMinSeatsIDStability`. Editing a watch (including its party size) changes its id — fine, because `Upsert` replaces the whole list anyway; `createdAt`/`lastFiredAt` are carried over for ids that already exist. *Runner-up: client-supplied random ids — allows meaningless duplicates and needs a separate dedupe pass.*
 
 **Why structured objects, not extended topic strings** (`rf_LON-TYO_rt_CF_o20261001-20261020_n7-14` would have kept the store schema unchanged): the grammar becomes unvalidatable, unextendable, and the on-disk store stops being readable by a human at 3am. *Runner-up in one line: extended topic strings — trivially compatible, permanently unpleasant.*
 
@@ -116,7 +117,7 @@ The SPA is cached; a stale `app.js` will keep calling `POST /subscribe {topics:[
 
 **Rule:**
 
-* `GET /topics` returns the legacy projection: one topic per cabin, **only for watches that are topic-representable** (unbounded `out` and `ret`, `nights == {1,30}`). Constrained watches are invisible to it.
+* `GET /topics` returns the legacy projection: one topic per cabin, **only for watches that are topic-representable** (unbounded `out` and `ret`, `nights == {1,30}`, `minSeats < 2`). Constrained watches — including party watches, which a stale client cannot express — are invisible to it.
 * `POST /subscribe` with `topics` (legacy write) **replaces only the topic-representable watches**; constrained watches are preserved untouched.
 * `POST /subscribe` with `watches` (v2 write) **replaces the entire list**.
 * Both keys present → `400`.
@@ -279,6 +280,14 @@ The trap row is precisely the design a "cooldown on gains" implementation gets w
 
 Two map lookups per candidate pair-cabin. No per-subscriber cooldown state exists.
 
+**Party thresholds get their own ledger plane.** A seat count sagging `3 → 1 → 3` never touches the presence bit, so the bit ledger cannot see the blink and a `minSeats ≥ 2` watch would re-alert on count churn. Threshold transitions therefore ledger under `ROUTE|c|S<N>|YYYY-MM-DD` (one plane per encoded threshold, maintained from the per-threshold gain/loss planes); bit keys keep the exact legacy 3-segment spelling so persisted state carries across the deploy, and every key still ends in the date, which is what `prune`'s date parsing reads (`TestThresholdLedgerPrunes`).
+
+**Seats-layer detection semantics** (the `"s"` route key — 2 hex chars/day, 2-bit monotone code per cabin: 0 = no evidence of ≥2 seats [unknown OR known-1, deliberately collapsed], 1 = ≥2, 2 = ≥3, 3 = ≥4; MAX-merged across airlines, masked by `"a"`, which stays the sole presence authority):
+
+* `minSeats ≤ 1` reads exactly the pre-seats bytes — byte-identical behaviour whether or not the bundle carries `"s"` (`TestSeatChurnInvisibleToOnePax`).
+* `minSeats ≥ 2` gain = the per-cabin predicate "code ≥ minSeats − 1 AND presence bit set" **newly satisfied** this cycle; the partner leg must satisfy the same predicate. Threshold transitions are diffed only when BOTH cycles carry the seats layer for the route: the layer's FIRST appearance baselines silently (`TestSeatsLayerOnboardingBaselines`, mirroring EC-11) so a network-wide flight-detail backfill cannot flood gainDays past the EC-13 breaker — which would advance the ledger while publishing nothing, permanently silencing genuine same-cycle 1-pax openings. Party watches fire from the next transition after onboarding. EC-13's gain-day count includes threshold-plane days.
+* A leg with no `"s"` (or code below the need) satisfies **nothing** at `minSeats ≥ 2`: unknown never fires — a push is a promise (`TestUnknownCountsNeverFireParty`). The read-time `no-seat-data` honesty therefore lives in the client (bell + `/alerts` row), which sees the same bundle.
+
 ### 3.5 Complexity at real numbers
 
 Measured inputs: 345 routes × 518 days; ~182 change events/hour network-wide; `Cycle` only runs on a new *source commit* (every ~2s–3min).
@@ -358,6 +367,12 @@ Body:   3 new dates: Sun 12 Oct, Tue 14 Oct, Thu 16 Oct
 URL:    /route/LON-TYO
 ```
 
+**Party watch (`minSeats ≥ 2`)** — the threshold enters the title only when *every* item in the group is party news (render's dedupe keeps the lowest threshold per pair, so mixed news stays unqualified and true for everyone):
+```
+Title:  Business (3+ seats) round trips open: LON ⇄ TYO     (rt)
+Title:  Business (2+ seats) open: LON → TYO                  (ow)
+```
+
 **Digest (several watches in one batch)**
 ```
 Title:  Award space on 3 of your routes
@@ -402,9 +417,12 @@ GET  /healthz        + "watches": <total watch count>
 | `to − from ≤ 180 days` for a **bounded** range | (a) abuse bound; (b) load-bearing for the horizon rule in §8. "I'm flexible" is the unbounded default, not a 2-year range |
 | `from ≤ today + 800` | absurdity guard |
 | `1 ≤ nights.min ≤ nights.max ≤ 60` | matches the UI clamp |
+| `minSeats ∈ {0, 2, 3, 4}` (reject negatives, an explicit `1`, and `> 4`) | `0` is the only spelling of "one passenger" (id stability); `4` is the top threshold the seats layer encodes ("4+") |
 | **feasibility**: reject if `ret.to < out.from + nights.min` **or** `ret.from > out.to + nights.max` | the watch could never fire. Catch it at save, not with eternal silence |
 | `len(watches) ≤ 20` | |
 | body ≤ 32 KB | |
+
+**Wire tolerance for the server's own echoes:** the client's save flow is read-modify-write — `GET /watches`, edit, `POST /subscribe` the whole list — so a POSTed watch may legitimately carry the read-only fields the server itself emits (`status`; `id`/`createdAt`/`lastFiredAt` are Watch-schema fields already). The decoder keeps `DisallowUnknownFields` but whitelists exactly those echoes (tolerated and discarded, never stored or trusted); any other unknown field still 400s, so a misnamed `minSeats` fails loudly instead of silently dropping the user's constraint. The site independently strips watches to the wire schema before POSTing (one sanitize function on every save path), so new-site → old-server also works.
 
 Rate limits, CORS allowlist, endpoint allowlist, and the endpoint-as-capability model are all unchanged.
 
@@ -551,7 +569,7 @@ Full-screen sheet (same component, same order), sticky footer:
 * **A custom range-drag calendar inside the popover.** Flex chips + native date inputs cover it; a second calendar widget is a permanent maintenance tax.
 * **A "your alert expired" push.** Unsolicited push about *nothing being available* is spam. The `/alerts` row says it.
 * **A "your dates are already bookable" push at subscribe time.** §8 EC-12.
-* **Per-watch quiet hours, snooze, email/SMS fallback, seat-count or points thresholds** (the last two aren't in the data).
+* **Per-watch quiet hours, snooze, email/SMS fallback, points thresholds** (the last isn't in the data). *Seat-count thresholds were on this list while counts weren't in the data; the optional `"s"` bundle layer changed that — `minSeats` is now specced in §1.1/§3.4 and ships dormant-but-honest (a party watch on a route without seat data is savable, shown as never-fires by the client, and armed the moment data arrives).*
 
 ---
 
@@ -571,7 +589,9 @@ Full-screen sheet (same component, same order), sticky footer:
 | EC-10 | **Source timestamp goes backwards** (a rollback in the source repo) | `b.t < prev.t` → re-baseline, no alerts, WARN. Prevents negative cooldown arithmetic. |
 | EC-11 | **New route appears / route disappears** | Absent from `prev.merged` → no gains computed for it this cycle (it becomes the baseline). Disappearing routes generate no losses (their watches simply never fire; `status:"unknown-route"`). |
 | EC-12 | **Space is already bookable when the watch is saved** | **We do not push.** Alerts are for *new* space; a push on save would be indistinguishable from a real opening and would train people to ignore them. Instead the bell's live count and the `/alerts` "4 match right now →" line make the existing space visible at exactly the moment they'd wonder. This is only defensible *because* §7.2/§7.4 exist — ship them together. |
-| EC-13 | **Bulk source rewrite** (backfill, re-scrape, repo rebuild) | Circuit breaker: `> 2000` gain-days in one cycle → advance the ledger, publish **nothing**, WARN. Never page 1000 people because a scraper was restarted. |
+| EC-13 | **Bulk source rewrite** (backfill, re-scrape, repo rebuild) | Circuit breaker: `> 2000` gain-days in one cycle → advance the ledger, publish **nothing**, WARN. Never page 1000 people because a scraper was restarted. Gain-days include threshold-plane days, so the first cycle where the scraper emits seat data dataset-wide trips the same breaker instead of paging every party watch at once. |
+| EC-14 | **`minSeats ≥ 2` watch on a route with no seats layer** | Never fires (unknown counts satisfy nothing — a push is a promise). The watch is savable and survives; the client's bell + `/alerts` row explain the dormancy ("no seat-count data for this route yet") instead of dead silence. It arms automatically when `"s"` arrives for the route; the arrival cycle itself baselines silently (see §3.4), and the watch fires from the next threshold crossing. |
+| EC-15 | **Seat count sags below the threshold and returns** (`3 → 1 → 3`) | Invisible to the presence bit. The threshold-qualified ledger plane (`ROUTE|c|S<N>|date`) records the close/reopen, so within the cooldown it is a flap (suppressed) and after it a genuine re-deepening (alerts). The 1-pax plane is untouched either way. |
 
 ---
 
@@ -602,6 +622,12 @@ The cases that separate a right implementation from a plausible-looking wrong on
 16. `StateStaysBounded` — replay 1000 churny cycles; assert `len(openedAt)+len(closedAt) < 5000` and that no key's date is in the past. *This is the test that would have caught the current `LastOn` growth.*
 17. `RestartNoDuplicates` — save state mid-flight, reload, re-`Baseline` on the same bundle → no publications; a pair published before the restart is not republished.
 18. `PublishFailureRetains` — publish returns an error → items stay pending, ledger still advances (today's contract).
+
+**Party size (`minSeats`, §3.4 seats semantics):**
+
+17. `SeatThresholdCrossingFires` — a count rising `1 → 2` on an already-open day (no bit change) fires a 2-pax watch and NOT a 1-pax watch; title carries `(2+ seats)`.
+18. `UnknownCountsNeverFireParty` / `SeatChurnInvisibleToOnePax` — a bit gain with no `"s"` fires only the 1-pax watch; count churn under constant bits fires nobody at 1-pax.
+    `PartnerLegMustHoldSeats` — the party must fit on BOTH legs; the return catching up later fires via loop (b). `SeatsAppearingIsAGain` — the layer arriving already-deep arms and fires. `SeatFlapSuppressed` — `2 → 1 → 2` within the cooldown is one alert. `ThresholdLedgerPrunes` — 4-segment keys prune by date. `MixedPartyAndOnePaxNewsUnqualified` — dedupe keeps the lowest threshold. `MinSeatsIDStability` — a MinSeats-less watch hashes to the pinned pre-feature id. `RepostedWatchesAccepted` — the server's own `GET /watches` echo round-trips through `POST /subscribe`; a genuinely unknown field still 400s.
 
 **Multi-subscriber:**
 

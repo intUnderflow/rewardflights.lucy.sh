@@ -99,6 +99,11 @@ func Build(in Inputs) (*Output, error) {
 
 	// route -> airline id -> day number -> cabin bits
 	routeBits := map[string]map[string]map[int]int{}
+	// route -> airline id -> day number -> packed per-cabin seat-threshold
+	// byte (see SeatString). A route+airline appears here only when at least
+	// one of its days carries flight detail — that presence gates the "s"
+	// key, so a dataset without flights[] emits byte-identical output.
+	routeSeats := map[string]map[string]map[int]int{}
 	// route -> "YYYY-MM-DD" -> airline id -> flight objects
 	flightDays := map[string]map[string]map[string][]map[string]any{}
 	airlinesJSON := map[string]any{}
@@ -176,6 +181,51 @@ func Build(in Inputs) (*Output, error) {
 						byDate[date] = map[string][]map[string]any{}
 					}
 					byDate[date][reg.ID] = append(byDate[date][reg.ID], flights...)
+
+					// Seat-threshold byte for the day. Per cabin the count is
+					// the MAX across the day's flights (a party must fit on
+					// ONE flight — never a sum); negative counts are ignored
+					// (flightJSON already warned) and unknown cabin codes are
+					// skipped (ditto). "a" is the sole presence authority: a
+					// cabin's code may be nonzero only when its bit is set in
+					// the day's bitmask, and contradictions resolve to the
+					// bit with a warning.
+					seatByte := 0
+					noEvidence := make([]byte, 0, 4)
+					for i, c := range cabinOrder {
+						maxN := 0
+						for _, f := range entry.Flights {
+							if n := f.Seats[string(c.letter)]; n > maxN {
+								maxN = n
+							}
+						}
+						if bits&c.bit == 0 {
+							if maxN > 0 {
+								in.Log.Warn("seats-cabin-not-available", string(c.letter), entry.Path)
+							}
+							continue
+						}
+						if maxN == 0 {
+							noEvidence = append(noEvidence, c.letter)
+							continue
+						}
+						seatByte |= seatCode(maxN) << (2 * i)
+					}
+					if len(noEvidence) > 0 {
+						// The opposite contradiction: cabinsAvailable claims
+						// the cabin but no flight shows a single seat in it.
+						// The code stays 0 (count unknown, NOT "0 seats").
+						in.Log.Warn("available-cabin-zero-seats", string(noEvidence), entry.Path)
+					}
+					bySeatAirline, ok := routeSeats[route]
+					if !ok {
+						bySeatAirline = map[string]map[int]int{}
+						routeSeats[route] = bySeatAirline
+					}
+					if bySeatAirline[reg.ID] == nil {
+						bySeatAirline[reg.ID] = map[int]int{}
+					}
+					bySeatAirline[reg.ID][day] = seatByte
 				}
 			}
 		}
@@ -205,7 +255,10 @@ func Build(in Inputs) (*Output, error) {
 		flightMonths[route] = slices.Sorted(maps.Keys(months))
 	}
 
-	// Route entries: {"a": {id: nibbles}, "fm": [months]?}.
+	// Route entries: {"a": {id: nibbles}, "fm": [months]?, "s": {id: seats}?}.
+	// The optional "s" key must be added HERE, before the origin-shard loop:
+	// shards reuse these entry maps by reference, so mutating one later would
+	// corrupt the bundle.
 	routesJSON := map[string]any{}
 	for route, byAirline := range routeBits {
 		strings := map[string]any{}
@@ -215,6 +268,13 @@ func Build(in Inputs) (*Output, error) {
 		entry := map[string]any{"a": strings}
 		if months := flightMonths[route]; len(months) > 0 {
 			entry["fm"] = months
+		}
+		if bySeatAirline := routeSeats[route]; len(bySeatAirline) > 0 {
+			seats := map[string]any{}
+			for id, byDay := range bySeatAirline {
+				seats[id] = SeatString(days, epochDay, byDay)
+			}
+			entry["s"] = seats
 		}
 		routesJSON[route] = entry
 	}
@@ -358,7 +418,8 @@ func placeJSON(p Place) map[string]any {
 }
 
 // flightJSON maps one source flight object to the derived schema. Cabins
-// with zero seats are omitted; unknown cabin codes are warned and skipped.
+// with zero seats are omitted; unknown cabin codes and negative seat counts
+// are warned and skipped.
 func flightJSON(f source.Flight, srcPath string, log *warnings.Log) map[string]any {
 	seats := map[string]any{}
 	for _, cabin := range slices.Sorted(maps.Keys(f.Seats)) {
@@ -366,7 +427,13 @@ func flightJSON(f source.Flight, srcPath string, log *warnings.Log) map[string]a
 			log.Warn("unknown-cabin", cabin, srcPath)
 			continue
 		}
-		if f.Seats[cabin] != 0 {
+		if f.Seats[cabin] < 0 {
+			// A negative count would otherwise poison both this file and
+			// the bundle's "s" seat-threshold layer.
+			log.Warn("negative-seats", cabin, srcPath)
+			continue
+		}
+		if f.Seats[cabin] > 0 {
 			seats[cabin] = f.Seats[cabin]
 		}
 	}

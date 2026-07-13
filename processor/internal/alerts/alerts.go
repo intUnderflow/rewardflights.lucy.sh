@@ -129,6 +129,13 @@ type item struct {
 	Ret   string `json:"e,omitempty"`
 	NMin  int    `json:"nmin,omitempty"`
 	NMax  int    `json:"nmax,omitempty"`
+	// MinSeats is the party threshold of the watch that found this news
+	// (0/absent = single-passenger semantics). It flavours the copy ("2+
+	// seats") but deliberately does NOT join dedupeKey: the same pair found by
+	// a 1-pax and a 3-pax watch is one piece of news, and render keeps the
+	// LOWEST threshold so the copy never over-promises. omitempty keeps an
+	// old pending batch loading under the current state schema.
+	MinSeats int `json:"ms,omitempty"`
 }
 
 // dedupeKey identifies the NEWS, independent of which watch found it: two
@@ -331,7 +338,19 @@ func (w *Watcher) refreshIndex() {
 type gain struct {
 	day  int
 	bits byte
+	// tbits[k] holds the cabins whose "a party of k+2 fits" predicate became
+	// newly satisfied this cycle (satisfied = presence bit set AND seat
+	// threshold code >= k+1, per bundleState.satisfiedBits). Newly satisfied
+	// includes "previously unknown, now known-enough": the previous bundle
+	// carrying no seats layer for the route counts as unsatisfied, so seat
+	// data appearing already-deep IS a gain — bounded by the EC-13 circuit
+	// breaker, which counts these days too. The MinSeats <= 1 path reads only
+	// bits and stays byte-identical to the pre-seats engine.
+	tbits [3]byte
 }
+
+// hasT reports whether any threshold transition is recorded.
+func (g gain) hasT() bool { return g.tbits != [3]byte{} }
 
 // diffBundles computes per-route cabin gains and losses between two bundles.
 //
@@ -350,20 +369,48 @@ func diffBundles(prev, b *bundleState, today int) (gains, losses map[string][]ga
 		if !known {
 			continue // EC-11: a brand-new route baselines, it does not alert
 		}
+		// Threshold transitions are only meaningful when BOTH endpoints are
+		// known. Requiring the layer on both sides (a) keeps 0%-coverage
+		// bundles on the exact pre-seats code path, and (b) makes the seats
+		// layer's FIRST appearance for a route a silent baseline, mirroring
+		// EC-11: the scraper backfilling flight detail across the whole
+		// network in one publish must not flood gainDays past the EC-13
+		// breaker — which would advance the ledger while publishing nothing,
+		// permanently silencing genuine same-cycle 1-pax openings. Party
+		// alerts start from the NEXT transition after onboarding. The same
+		// rule in reverse means a scraper regression that drops the layer
+		// produces no phantom "loss" events (unknown never means gone).
+		_, seatsNew := b.seats[route]
+		_, seatsOld := prev.seats[route]
+		diffSeats := seatsNew && seatsOld
 		for d := lo; d < b.endDay; d++ {
 			var o byte
 			if d < prev.endDay {
 				o = oldBits[d-prev.epochDay]
 			}
 			n := newBits[d-b.epochDay]
-			if g := n &^ o; g != 0 {
-				gains[route] = append(gains[route], gain{day: d, bits: g})
+			g := gain{day: d, bits: n &^ o}
+			var lost gain
+			lost.day = d
+			if d < lossHi {
+				lost.bits = o &^ n
+			}
+			if diffSeats {
+				for k := 0; k < 3; k++ {
+					oldSat := prev.satisfiedBits(route, d, k+2)
+					newSat := b.satisfiedBits(route, d, k+2)
+					g.tbits[k] = newSat &^ oldSat
+					if d < lossHi {
+						lost.tbits[k] = oldSat &^ newSat
+					}
+				}
+			}
+			if g.bits != 0 || g.hasT() {
+				gains[route] = append(gains[route], g)
 				gainDays++
 			}
-			if d < lossHi {
-				if l := o &^ n; l != 0 {
-					losses[route] = append(losses[route], gain{day: d, bits: l})
-				}
+			if lost.bits != 0 || lost.hasT() {
+				losses[route] = append(losses[route], lost)
 			}
 		}
 		if len(gains[route]) == 0 {
@@ -390,6 +437,18 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 	mask := watch.Mask()
 	outRange := watch.OutDays(today, b.endDay)
 
+	// A party watch (MinSeats >= 2) consumes the threshold plane for its N:
+	// a presence-bit gain alone is not news to a party of three, and a leg
+	// whose seat counts are unknown NEVER fires (a push is a promise). The
+	// MinSeats <= 1 path below reads exactly the pre-seats bytes.
+	minSeats := watch.MinSeats
+	gainedBits := func(g gain) byte {
+		if minSeats >= 2 {
+			return g.tbits[minSeats-2] & mask
+		}
+		return g.bits & mask
+	}
+
 	if watch.Kind == alertstore.KindOW {
 		if dirty != watch.Route {
 			return nil
@@ -399,11 +458,11 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 			if !w.frontierOK(g.day, watch) || g.day < outRange.From || g.day > outRange.To {
 				continue
 			}
-			for _, cabin := range cabinsOf(g.bits & mask) {
-				if !w.isFlap(watch.Route, g.day, "", 0, cabin, now) {
+			for _, cabin := range cabinsOf(gainedBits(g)) {
+				if !w.isFlap(watch.Route, g.day, "", 0, cabin, minSeats, now) {
 					items = append(items, item{
 						Watch: watch.ID, Route: watch.Route, Kind: watch.Kind,
-						Cabin: cabin, Out: dayDate(g.day),
+						Cabin: cabin, Out: dayDate(g.day), MinSeats: minSeats,
 					})
 				}
 			}
@@ -423,13 +482,29 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 	seen := map[string]bool{}
 	var items []item
 
+	// Partner-leg cabins: for a party watch the partner must ALSO satisfy the
+	// seat threshold in the same cabin (unknown counts satisfy nothing); the
+	// single-passenger path reads the raw presence byte, exactly as before.
+	partnerRet := func(r int) byte {
+		if minSeats >= 2 {
+			return b.satisfiedBits(rev, r, minSeats)
+		}
+		return ret[r-b.epochDay]
+	}
+	partnerOut := func(d int) byte {
+		if minSeats >= 2 {
+			return b.satisfiedBits(watch.Route, d, minSeats)
+		}
+		return out[d-b.epochDay]
+	}
+
 	add := func(d, r int, cabin string) {
-		if w.isFlap(watch.Route, d, rev, r, cabin, now) {
+		if w.isFlap(watch.Route, d, rev, r, cabin, minSeats, now) {
 			return
 		}
 		it := item{
 			Watch: watch.ID, Route: watch.Route, Kind: watch.Kind, Cabin: cabin,
-			Out: dayDate(d), Ret: dayDate(r), NMin: nmin, NMax: nmax,
+			Out: dayDate(d), Ret: dayDate(r), NMin: nmin, NMax: nmax, MinSeats: minSeats,
 		}
 		// A pair whose BOTH legs gained is found by loop (a) and loop (b).
 		if k := it.dedupeKey(); !seen[k] {
@@ -446,14 +521,14 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 			if !w.frontierOK(d, watch) || d < outRange.From || d > outRange.To {
 				continue
 			}
-			gained := g.bits & mask
+			gained := gainedBits(g)
 			if gained == 0 {
 				continue
 			}
 			from := max(d+nmin, retRange.From)
 			to := min(d+nmax, retRange.To, b.epochDay+len(ret)-1)
 			for r := from; r <= to; r++ {
-				for _, cabin := range cabinsOf(gained & ret[r-b.epochDay]) {
+				for _, cabin := range cabinsOf(gained & partnerRet(r)) {
 					add(d, r, cabin)
 				}
 			}
@@ -476,14 +551,14 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 			if !w.frontierOK(r, watch) || r < retRange.From || r > retRange.To {
 				continue
 			}
-			gained := g.bits & mask
+			gained := gainedBits(g)
 			if gained == 0 {
 				continue
 			}
 			from := max(r-nmax, outRange.From)
 			to := min(r-nmin, outRange.To, b.epochDay+len(out)-1)
 			for d := from; d <= to; d++ {
-				for _, cabin := range cabinsOf(gained & out[d-b.epochDay]) {
+				for _, cabin := range cabinsOf(gained & partnerOut(d)) {
 					add(d, r, cabin)
 				}
 			}
@@ -517,19 +592,43 @@ func cabinsOf(bits byte) []string {
 
 // --- the global transition ledger (§3.4) --------------------------------
 
-func ledgerKey(route string, day int, cabin string) string {
+// ledgerKey names one (route, cabin, day) run. Party thresholds get their own
+// plane — ROUTE|cabin|S<N>|date for N >= 2 — because a seat count sagging
+// 3 -> 1 -> 3 never touches the presence bit: without the extra dimension a
+// party watch would re-alert on count churn the bit ledger cannot see. Bit
+// keys keep the exact legacy 3-segment spelling, so persisted state carries
+// over, and every key still ENDS in the date, which is what prune's
+// ledgerDatePast parses.
+func ledgerKey(route string, day int, cabin string, minSeats int) string {
+	if minSeats >= 2 {
+		return fmt.Sprintf("%s|%s|S%d|%s", route, cabin, minSeats, dayDate(day))
+	}
 	return route + "|" + cabin + "|" + dayDate(day)
+}
+
+// eachLedgerCabin visits every (cabin, minSeats) plane recorded in a
+// transition: the presence bits as minSeats 0, and each threshold plane k as
+// minSeats k+2.
+func eachLedgerCabin(g gain, fn func(cabin string, minSeats int)) {
+	for _, cabin := range cabinsOf(g.bits) {
+		fn(cabin, 0)
+	}
+	for k := 0; k < 3; k++ {
+		for _, cabin := range cabinsOf(g.tbits[k]) {
+			fn(cabin, k+2)
+		}
+	}
 }
 
 func (w *Watcher) applyLosses(losses map[string][]gain, now int64) {
 	for _, route := range slices.Sorted(maps.Keys(losses)) {
 		for _, l := range losses[route] {
-			for _, cabin := range cabinsOf(l.bits) {
-				k := ledgerKey(route, l.day, cabin)
+			eachLedgerCabin(l, func(cabin string, minSeats int) {
+				k := ledgerKey(route, l.day, cabin, minSeats)
 				w.state.ClosedAt[k] = now
 				delete(w.state.OpenedAt, k)
 				w.dirty = true
-			}
+			})
 		}
 	}
 }
@@ -537,10 +636,10 @@ func (w *Watcher) applyLosses(losses map[string][]gain, now int64) {
 func (w *Watcher) applyGains(gains map[string][]gain, now int64) {
 	for _, route := range slices.Sorted(maps.Keys(gains)) {
 		for _, g := range gains[route] {
-			for _, cabin := range cabinsOf(g.bits) {
-				w.state.OpenedAt[ledgerKey(route, g.day, cabin)] = now
+			eachLedgerCabin(g, func(cabin string, minSeats int) {
+				w.state.OpenedAt[ledgerKey(route, g.day, cabin, minSeats)] = now
 				w.dirty = true
-			}
+			})
 		}
 	}
 }
@@ -552,11 +651,11 @@ func (w *Watcher) applyGains(gains map[string][]gain, now int64) {
 // gets catastrophically wrong — is the partner check. If a leg closed at t1
 // but its partner only OPENED after t1, then no joint run ended at t1: the
 // pair has never been announced, and suppressing it would silence it forever.
-func (w *Watcher) isFlap(outRoute string, d int, retRoute string, r int, cabin string, now int64) bool {
-	l1 := ledgerKey(outRoute, d, cabin)
+func (w *Watcher) isFlap(outRoute string, d int, retRoute string, r int, cabin string, minSeats int, now int64) bool {
+	l1 := ledgerKey(outRoute, d, cabin, minSeats)
 	l2 := ""
 	if retRoute != "" {
-		l2 = ledgerKey(retRoute, r, cabin)
+		l2 = ledgerKey(retRoute, r, cabin, minSeats)
 	}
 
 	var end int64
