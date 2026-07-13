@@ -2865,9 +2865,15 @@ function renderMap(o) {
     dotsG.addEventListener("pointerout", () => { tip.hidden = true; });
     dotsG.addEventListener("focusin", (e) => { const d = e.target.closest(".map-dot"); if (d) showMapTip(d); });
     dotsG.addEventListener("focusout", () => { tip.hidden = true; });
-    dotsG.addEventListener("click", (e) => {
-      const d = e.target.closest(".map-dot");
-      if (d && !panned) navigate(`/trip/${o}-${d.dataset.code}${nightsQS()}`);
+    /* A click that wobbles across two overlapping dots presses on one and
+       releases on the other, so the browser fires the click on their common
+       ancestor (the group) — the dot the press started on is the intent. */
+    let downDot = null;
+    svg.addEventListener("pointerdown", (e) => { downDot = e.target.closest(".map-dot"); });
+    svg.addEventListener("click", (e) => {
+      if (panned) return;
+      const d = e.target.closest(".map-dot") || downDot;
+      if (d) navigate(`/trip/${o}-${d.dataset.code}${nightsQS()}`);
     });
     dotsG.addEventListener("keydown", (e) => {
       const d = e.target.closest(".map-dot");
@@ -2914,8 +2920,12 @@ function renderMap(o) {
     let panned = false, dragDist = 0;
     const ptrs = new Map();
     let pinchD = 0;
+    /* Capturing on pointerdown would retarget the eventual click to the svg
+       (pointer capture redirects the click event to the capturing element),
+       which silently killed dot clicks. So the pointer is captured only once
+       a drag has actually begun — a plain click never captures at all. */
+    const captureAll = () => { for (const id of ptrs.keys()) { try { svg.setPointerCapture(id); } catch {} } };
     svg.addEventListener("pointerdown", (e) => {
-      svg.setPointerCapture(e.pointerId);
       ptrs.set(e.pointerId, [e.clientX, e.clientY]);
       if (ptrs.size === 2) {
         const [a, b] = [...ptrs.values()];
@@ -2929,17 +2939,18 @@ function renderMap(o) {
       ptrs.set(e.pointerId, [e.clientX, e.clientY]);
       const r = svg.getBoundingClientRect();
       if (ptrs.size === 1) {
+        dragDist += Math.abs(e.clientX - prev[0]) + Math.abs(e.clientY - prev[1]);
+        if (!panned && dragDist > 6) { panned = true; captureAll(); }
+        if (!panned) return; // a click's jitter must not wobble the view
         const dx = (e.clientX - prev[0]) / r.width * view.w;
         const dy = (e.clientY - prev[1]) / r.height * (W.h * view.w / W.w);
-        dragDist += Math.abs(e.clientX - prev[0]) + Math.abs(e.clientY - prev[1]);
-        if (dragDist > 6) panned = true;
         view.x -= dx; view.y -= dy;
         applyViewNoRedraw();
       } else if (ptrs.size === 2) {
         const [a, b] = [...ptrs.values()];
         const d2 = Math.hypot(a[0] - b[0], a[1] - b[1]);
         if (pinchD > 0 && Math.abs(d2 - pinchD) > 2) {
-          panned = true;
+          if (!panned) { panned = true; captureAll(); }
           const cx = (a[0] + b[0]) / 2, cy = (a[1] + b[1]) / 2;
           const px = view.x + ((cx - r.left) / r.width) * view.w;
           const py = view.y + ((cy - r.top) / r.height) * (W.h * view.w / W.w);
@@ -2953,8 +2964,21 @@ function renderMap(o) {
       if (ptrs.size < 2) pinchD = 0;
       if (!ptrs.size && panned) redraw(); // resize dots once the gesture ends
     };
-    svg.addEventListener("pointerup", endPtr);
-    svg.addEventListener("pointercancel", endPtr);
+    /* Listening at the window (not the svg) catches every release: bubbled
+       on-svg ones, captured mid-drag ones, and — the case that matters —
+       releases outside the svg from an uncaptured not-yet-a-drag press,
+       whose stale entry would make the next one-finger drag look like a
+       pinch. Removes itself once this map instance is gone. */
+    const winEnd = (e) => {
+      if (!svg.isConnected) {
+        window.removeEventListener("pointerup", winEnd);
+        window.removeEventListener("pointercancel", winEnd);
+        return;
+      }
+      endPtr(e);
+    };
+    window.addEventListener("pointerup", winEnd);
+    window.addEventListener("pointercancel", winEnd);
     /* Cheap pan while the finger is down: move the viewBox but keep dot sizes;
        redraw (which resizes dots) happens once at gesture end. */
     function applyViewNoRedraw() {
