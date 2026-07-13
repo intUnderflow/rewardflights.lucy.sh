@@ -1400,15 +1400,19 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     document.addEventListener("keydown", onKey);
     document.addEventListener("click", onOutside, true);
 
+    const closeHTML = `<button type="button" class="bell-x" aria-label="Close" data-close>×</button>`;
+    const wireClose = () => { const x = $("[data-close]", pop); if (x) x.addEventListener("click", () => { close(); btn.focus(); }); };
     if (!pushSupported()) {
-      pop.innerHTML = isIOS() && !isStandalone()
+      pop.innerHTML = closeHTML + (isIOS() && !isStandalone()
         ? `<p class="bell-note"><b>Add Reward Flights to your Home Screen</b> to get alerts on iPhone —
            tap Share, then “Add to Home Screen”, and open it from there.</p>`
-        : `<p class="bell-note">This browser doesn't support push notifications.</p>`;
+        : `<p class="bell-note">This browser doesn't support push notifications.</p>`);
+      wireClose();
       return;
     }
     if (Notification.permission === "denied") {
-      pop.innerHTML = `<p class="bell-note">${permissionHelpHTML("denied")}</p>`;
+      pop.innerHTML = closeHTML + `<p class="bell-note">${permissionHelpHTML("denied")}</p>`;
+      wireClose();
       return;
     }
 
@@ -1438,8 +1442,13 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     let retFrom = mine?.ret?.from || "", retTo = mine?.ret?.to || "";
 
     pop.innerHTML = "";
-    pop.append(el(`<p class="bell-title">${mine ? "Alerting you when a" : "Alert me when a"}
-      ${kind === "rt" ? "round trip" : "one-way seat"} opens on ${o} ${arrow} ${d}</p>`));
+    const closeBtn = el(`<button type="button" class="bell-x" aria-label="Close">×</button>`);
+    closeBtn.addEventListener("click", () => { close(); btn.focus(); });
+    pop.append(
+      closeBtn,
+      el(`<p class="bell-title">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</p>`),
+      el(`<p class="bell-sub">${mine ? "Alerting you" : "Alert me"} when a
+        ${kind === "rt" ? "round trip" : "one-way seat"} opens</p>`));
 
     /* --- cabins --- */
     const cabs = el(`<div class="bell-sec"><h3>Cabins</h3>
@@ -1471,14 +1480,15 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     const whenBody = $(".bell-when-body", when);
 
     const countLine = el(`<p class="bell-count" role="status"></p>`);
+    const actions = el(`<div class="bell-actions"></div>`);
     const save = el(`<button type="button" class="btn bell-save">${mine ? "Update alerts" : "Save alerts"}</button>`);
-    pop.append(countLine, save);
-
+    actions.append(save);
     if (mine) {
-      const off = el(`<button type="button" class="bell-offbtn">Turn off alerts for this route</button>`);
+      const off = el(`<button type="button" class="bell-offbtn">Turn off</button>`);
       off.addEventListener("click", () => commit(null, off));
-      pop.append(off);
+      actions.append(off);
     }
+    pop.append(countLine, actions);
     const note = el(`<p class="bell-note" role="status"></p>`);
     pop.append(note);
 
@@ -1499,9 +1509,9 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         // A realistic middle ground between "any time" and pinned dates: any
         // time, but with enough lead time to actually arrange the trip. It's a
         // rolling floor — "at least N days from whenever an alert fires".
-        const opts = [[0, "No minimum"], [3, "3 days"], [7, "1 week"], [14, "2 weeks"], [30, "1 month"]];
+        const opts = [[0, "None"], [3, "3 days"], [7, "1 week"], [14, "2 weeks"], [30, "1 month"]];
         const notice = el(`<div class="bell-notice">
-          <p class="bell-hint">How much notice do you need to arrange a trip?</p>
+          <p class="bell-when-label">Minimum notice to arrange the trip</p>
           <div class="bell-flex" role="group" aria-label="Minimum notice">
             ${opts.map(([n, lbl]) => `<button type="button" class="np" data-lead="${n}"
               aria-pressed="${n === lead}">${esc(lbl)}</button>`).join("")}
@@ -1566,11 +1576,12 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     function drawLeadNote() {
       const p = $(".bell-lead-note", whenBody);
       if (!p) return;
+      // Only speak up when a lead is set — the match count below already covers
+      // the "any date" case, so the default needs no extra prose.
       p.textContent = lead
-        ? `We'll only alert you about trips leaving ${leadPhrase(lead).replace("' notice", "")} or more from now${
-            kind === "rt" && nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.`
-        : `We'll alert you whenever space opens, on any date${
-            kind === "rt" && nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.`;
+        ? `Only trips at least ${leadPhrase(lead).replace("' notice", " ahead")}.`
+        : "";
+      p.hidden = !lead;
     }
 
     function drawDerived() {

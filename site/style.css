@@ -304,71 +304,101 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .bell-wrap { position: relative; margin-left: auto; }
 .bell-btn.on { border-color: var(--gold); color: var(--gold); }
 .bell-pop {
-  position: absolute; z-index: 40; right: 0; top: calc(100% + 8px); width: 292px;
+  position: absolute; z-index: 40; right: 0; top: calc(100% + 8px); width: 318px;
   background: var(--panel); border: 1px solid var(--line); border-radius: var(--radius);
-  box-shadow: var(--shadow); padding: 14px;
+  box-shadow: var(--shadow); padding: 16px; max-height: min(80vh, 660px); overflow-y: auto;
 }
 .bell-pop[hidden] { display: none; }
-.bell-title { margin: 0 0 11px; font-size: 13.5px; font-weight: 700; line-height: 1.4; }
-.bell-cabs { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
-.bell-cab {
-  display: flex; align-items: center; gap: 10px; padding: 8px 11px; width: 100%;
-  border: 1px solid var(--line-2); border-radius: 8px; background: var(--panel);
-  cursor: pointer; font-size: 13.5px; font-weight: 700; text-align: left;
-}
-.bell-cab .swatch { width: 12px; height: 12px; border-radius: 3px; flex-shrink: 0; }
-.bell-cab-label { flex: 1; }
-.bell-cab[aria-checked="true"] { border-color: var(--ink-2); background: var(--panel-2); }
-.bell-cab[aria-checked="true"]::after { content: "✓"; color: var(--gold); font-weight: 700; }
-.bell-cab[aria-checked="false"] { opacity: .62; }
-.bell-cab[aria-checked="false"] .swatch { background: var(--ink-3) !important; }
-.bell-pop { width: 330px; max-height: min(76vh, 640px); overflow-y: auto; }
+.bell-title { margin: 0 0 4px; font-size: 15px; font-weight: 700; line-height: 1.25; }
+.bell-sub { margin: 0 0 14px; font-size: 12px; color: var(--ink-3); }
+.bell-sub .arrow { color: var(--gold); }
+
 .bell-sec { margin-bottom: 14px; }
 .bell-sec h3 {
   font-family: var(--font-data); font-size: 10px; letter-spacing: .12em;
-  text-transform: uppercase; color: var(--ink-3); margin: 0 0 7px;
+  text-transform: uppercase; color: var(--ink-3); margin: 0 0 8px;
 }
-.bell-modes { display: flex; gap: 5px; flex-wrap: wrap; }
+
+/* Cabins: compact wrapping chips, not four tall rows. Checked = its cabin
+   colour ring; unchecked = quiet. */
+.bell-cabs { display: flex; flex-wrap: wrap; gap: 7px; }
+.bell-cab {
+  display: inline-flex; align-items: center; gap: 7px; padding: 6px 11px;
+  border: 1px solid var(--line-2); border-radius: 999px; background: var(--panel);
+  cursor: pointer; font-size: 13px; font-weight: 700; color: var(--ink-2);
+}
+.bell-cab .swatch { width: 10px; height: 10px; border-radius: 3px; flex-shrink: 0; }
+.bell-cab[aria-checked="true"] { border-color: var(--ink-2); background: var(--panel-2); color: var(--ink); }
+.bell-cab[aria-checked="false"] { opacity: .5; }
+.bell-cab[aria-checked="false"] .swatch { background: var(--ink-3) !important; }
+
+/* When: segmented control + a wrapping option row. */
+.bell-modes { display: flex; gap: 6px; }
 .bell-mode {
-  flex: 1; min-width: 84px; border: 1px solid var(--line-2); background: var(--panel);
-  border-radius: 8px; padding: 7px 8px; cursor: pointer; font-size: 12.5px; font-weight: 700;
+  flex: 1; border: 1px solid var(--line-2); background: var(--panel);
+  border-radius: 8px; padding: 8px; cursor: pointer; font-size: 12.5px; font-weight: 700;
   color: var(--ink-2);
 }
 .bell-mode.on { border-color: var(--gold); color: var(--gold); background: var(--panel-2); }
-.bell-when-body { margin-top: 10px; }
-.bell-flex { display: flex; gap: 6px; }
-.bell-flex .np { flex: 1; justify-content: center; }
-.bell-hint { margin: 8px 0 0; font-size: 12px; color: var(--ink-3); line-height: 1.45; }
-.bell-derived { color: var(--ink-2); font-family: var(--font-data); font-size: 11.5px; }
-.bell-dates label {
-  display: block; font-size: 12px; color: var(--ink-2); margin-bottom: 9px;
+.bell-when-body { margin-top: 12px; }
+.bell-when-label {
+  font-size: 11.5px; color: var(--ink-3); margin: 0 0 7px;
 }
-.bell-dates label span { display: flex; gap: 6px; margin-top: 4px; }
+/* Notice / flex chips: wrap so nothing ever clips. */
+.bell-flex { display: flex; flex-wrap: wrap; gap: 6px; }
+.bell-flex .np {
+  border: 1px solid var(--line-2); background: var(--panel); border-radius: 999px;
+  padding: 6px 12px; cursor: pointer; font-size: 12.5px; font-weight: 700; color: var(--ink-2);
+}
+.bell-flex .np[aria-pressed="true"] { border-color: var(--gold); color: var(--gold); background: var(--panel-2); }
+.bell-hint { margin: 9px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.bell-derived { margin: 9px 0 0; color: var(--ink-2); font-family: var(--font-data); font-size: 11.5px; }
+.bell-dates { display: grid; gap: 12px; }
+.bell-dates label { display: block; font-size: 12px; color: var(--ink-2); }
+.bell-dates label span { display: flex; gap: 6px; margin-top: 5px; }
 .bell-dates input[type="date"] {
-  flex: 1; min-width: 0; padding: 7px 8px; border: 1px solid var(--line-2); border-radius: 7px;
+  flex: 1; min-width: 0; padding: 8px; border: 1px solid var(--line-2); border-radius: 7px;
   background: var(--surface); color: var(--ink); font: 400 12.5px var(--font-data);
 }
+
+/* One status line: the live match count IS the feedback. */
 .bell-count {
-  margin: 4px 0 10px; font-size: 12.5px; font-weight: 700; line-height: 1.4;
+  margin: 16px 0 12px; font-size: 13px; font-weight: 700; line-height: 1.4;
+  display: flex; gap: 7px; align-items: baseline;
 }
+.bell-count::before { content: "●"; font-size: 9px; position: relative; top: -1px; }
 .bell-count.ok { color: var(--cab-w); }
 .bell-count.none { color: var(--ink-2); font-weight: 400; }
+.bell-count.none::before { color: var(--ink-3); }
 .bell-count.warn { color: var(--amber-ink); }
-.bell-save { width: 100%; justify-content: center; }
+.bell-count.warn::before { content: "▲"; }
+
+.bell-actions { display: flex; align-items: center; gap: 10px; }
+.bell-save { flex: 1; justify-content: center; }
 .bell-save:disabled { opacity: .45; cursor: not-allowed; }
+.bell-offbtn {
+  background: none; border: 0; color: var(--ink-3); cursor: pointer;
+  font-size: 12.5px; padding: 4px; text-decoration: underline; white-space: nowrap;
+}
+.bell-offbtn:hover { color: var(--amber-ink); }
+
+/* Close affordance: only the full-screen mobile sheet needs one (desktop closes
+   on outside-click / Escape, neither of which a phone sheet offers). */
+.bell-x { display: none; }
 @media (max-width: 640px) {
-  /* Full-screen sheet: a 330px popover with date inputs is unusable on a phone. */
+  /* Full-screen sheet: a fixed popover with date inputs is unusable on a phone. */
   .bell-pop {
     position: fixed; inset: 0; width: 100vw; max-height: none; height: 100dvh;
-    border-radius: 0; border: 0; padding: 20px; z-index: 90; overflow-y: auto;
+    border-radius: 0; border: 0; padding: 20px 20px 32px; z-index: 90; overflow-y: auto;
+  }
+  .bell-title { padding-right: 44px; }
+  .bell-x {
+    display: flex; align-items: center; justify-content: center;
+    position: absolute; top: 12px; right: 12px; width: 38px; height: 38px;
+    border-radius: 50%; border: 1px solid var(--line-2); background: var(--panel-2);
+    color: var(--ink); font-size: 24px; line-height: 1; cursor: pointer;
   }
 }
-.bell-offbtn {
-  width: 100%; margin-top: 8px; padding: 8px 12px; border-radius: 8px;
-  border: 1px solid var(--line-2); background: none; color: var(--ink-2);
-  cursor: pointer; font-size: 12.5px;
-}
-.bell-offbtn:hover { border-color: var(--amber-ink); color: var(--amber-ink); }
 
 /* ---------- alerts link in the header ---------- */
 .topbar-right { display: flex; align-items: center; gap: 16px; }
@@ -478,10 +508,6 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 }
 .bell-note { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-2); line-height: 1.45; }
 .bell-note b { color: var(--ink); }
-@media (max-width: 640px) {
-  .bell-wrap { margin-left: 0; }
-  .bell-pop { right: auto; left: 0; width: min(292px, calc(100vw - 32px)); }
-}
 
 /* trip-length control (presets + custom min/max nights) */
 .nights-ctl { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
@@ -712,7 +738,10 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 
 @media (max-width: 640px) {
   .day-panel { width: 100vw; border-left: 0; }
-  .route-toolbar { position: static; }
+  /* backdrop-filter here would establish a containing block that traps the
+     fixed .bell-pop sheet inside the toolbar; the toolbar isn't sticky on
+     mobile, so the blur has nothing to do anyway. */
+  .route-toolbar { position: static; backdrop-filter: none; }
   /* pair panel goes full-screen with a 3-step header:
      1 Out (tap to re-pick) · 2 Back (the list) · 3 Book (summary reveals) */
   .pp-steps { display: flex; gap: 6px; margin: 0 0 16px; padding-right: 34px; }
