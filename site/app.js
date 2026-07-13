@@ -865,6 +865,13 @@ async function boot() {
   loadChanges();
   schedulePoll();
   refreshAlertCount();   // header link reflects what this device is watching
+
+  // Register the service worker for EVERYONE (not just alert users): it
+  // caches the shell offline-first, which is what keeps the app opening
+  // instantly on airport-grade connections. Idempotent, off the boot path.
+  if ("serviceWorker" in navigator) {
+    setTimeout(() => navigator.serviceWorker.register("/sw.js").catch(() => {}), 1500);
+  }
 }
 
 async function loadChanges() {

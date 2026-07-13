@@ -1,14 +1,103 @@
-/* Reward Flights — service worker.
-   Its only job is alerts: receive a push, show it, and open the right page on
-   click. It deliberately does NOT cache the app (the site is already tiny and
-   the data has its own freshness protocol; a caching SW would just risk
-   serving stale availability). */
+/* Reward Flights — service worker: alerts (push) + offline-first shell.
+
+   CACHING SCOPE — same-origin shell only. Availability data is deliberately
+   NOT cached here: it has its own freshness protocol in the app (localStorage
+   snapshot + version compare + stale banner), and a second cache layer would
+   fight it. What we cache:
+   - versioned assets (?v=N urls, /assets/*): cache-first — a new deploy mints
+     new URLs, so cached entries can never go stale, and on a bad connection
+     we skip even the 304 revalidation round-trip;
+   - navigations: network-first with a short timeout, falling back to the
+     cached shell — at dial-up speeds (or offline) the app still opens
+     instantly and paints from its data snapshot. */
 "use strict";
 
 const PUSH_API = "https://alerts-rewardflights.lucy.sh";
+const SHELL_CACHE = "rf-shell-v1";
+const NAV_TIMEOUT_MS = 3500;
 
-self.addEventListener("install", () => self.skipWaiting());
-self.addEventListener("activate", (e) => e.waitUntil(self.clients.claim()));
+self.addEventListener("install", (e) => {
+  e.waitUntil((async () => {
+    // Precache the shell so offline works from the SECOND visit, not the
+    // third: fetch the live index, then pull its versioned asset URLs out.
+    try {
+      const cache = await caches.open(SHELL_CACHE);
+      const res = await fetch("/", { cache: "no-cache" });
+      if (res.ok) {
+        await cache.put("/", res.clone());
+        const html = await res.text();
+        const urls = [...html.matchAll(/(?:src|href)="(\/[^"]+)"/g)]
+          .map((m) => m[1])
+          .filter((u) => /\?v=\d+|^\/assets\//.test(u));
+        await Promise.all(urls.map((u) => cache.add(u).catch(() => {})));
+      }
+    } catch { /* offline install — runtime caching will fill in */ }
+    self.skipWaiting();
+  })());
+});
+
+self.addEventListener("activate", (e) => {
+  e.waitUntil((async () => {
+    for (const k of await caches.keys()) {
+      if (k !== SHELL_CACHE) await caches.delete(k);
+    }
+    await self.clients.claim();
+  })());
+});
+
+/* A versioned asset: served cache-first forever (the URL IS the version). */
+function isImmutable(url) {
+  return url.origin === self.location.origin &&
+    (/[?&]v=\d+/.test(url.search) || url.pathname.startsWith("/assets/"));
+}
+
+self.addEventListener("fetch", (event) => {
+  const req = event.request;
+  if (req.method !== "GET") return;
+  const url = new URL(req.url);
+  if (url.origin !== self.location.origin) return; // data + alerts API manage themselves
+
+  if (req.mode === "navigate") {
+    event.respondWith((async () => {
+      const cache = await caches.open(SHELL_CACHE);
+      try {
+        const fresh = await Promise.race([
+          fetch(req),
+          new Promise((_, rej) => setTimeout(() => rej(new Error("nav timeout")), NAV_TIMEOUT_MS)),
+        ]);
+        if (fresh.ok) cache.put("/", fresh.clone()); // SPA: one shell serves every path
+        return fresh;
+      } catch {
+        const shell = await cache.match("/");
+        if (shell) return shell;
+        return fetch(req); // no cache yet: let the failure surface honestly
+      }
+    })());
+    return;
+  }
+
+  if (isImmutable(url)) {
+    event.respondWith((async () => {
+      const cache = await caches.open(SHELL_CACHE);
+      const hit = await cache.match(req);
+      if (hit) return hit;
+      const res = await fetch(req);
+      if (res.ok) {
+        cache.put(req, res.clone());
+        // A new ?v= supersedes its older siblings — drop them so the cache
+        // doesn't accumulate one copy per deploy.
+        const v = /[?&]v=\d+/.test(url.search);
+        if (v) {
+          for (const k of await cache.keys()) {
+            const ku = new URL(k.url);
+            if (ku.pathname === url.pathname && ku.search !== url.search) await cache.delete(k);
+          }
+        }
+      }
+      return res;
+    })());
+  }
+});
 
 self.addEventListener("push", (event) => {
   let data = {};

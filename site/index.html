@@ -9,14 +9,16 @@
 <link rel="preconnect" href="https://raw.githubusercontent.com" crossorigin>
 <link rel="dns-prefetch" href="https://raw.githubusercontent.com">
 <link rel="preload" as="fetch" href="https://raw.githubusercontent.com/intUnderflow/rewardflights.lucy.sh-data/main/availability.json" crossorigin="anonymous" id="bundle-preload">
-<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612-400.woff2" crossorigin>
-<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612mono-400.woff2" crossorigin>
-<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/archivo-black.woff2" crossorigin>
+<!-- Preload only the two faces on the first-paint critical path (body + data).
+     The display face loads via CSS with font-display:swap — on a slow link the
+     hero shows the fallback for a beat instead of costing 6KB up front. -->
+<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612-400.woff2?v=2" crossorigin>
+<link rel="preload" as="font" type="font/woff2" href="/assets/fonts/b612mono-400.woff2?v=2" crossorigin>
 <!-- ?v= busts the browser cache on deploy: index.html is served no-cache
      (fresh every load), but the shell assets inherit a 4h browser-cache TTL,
      so a NEW url is the reliable way to ship shell changes. BUMP THIS NUMBER
      whenever app.js or style.css changes. -->
-<link rel="stylesheet" href="/style.css?v=28">
+<link rel="stylesheet" href="/style.css?v=29">
 <link rel="manifest" href="/manifest.webmanifest">
 <link rel="apple-touch-icon" href="/assets/icon-192.png">
 <meta name="apple-mobile-web-app-capable" content="yes">
@@ -78,6 +80,6 @@
 <div class="day-panel" id="day-panel" hidden></div>
 <div class="scrim" id="scrim" hidden></div>
 
-<script src="/app.js?v=28" defer></script>
+<script src="/app.js?v=29" defer></script>
 </body>
 </html>

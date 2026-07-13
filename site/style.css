@@ -5,15 +5,15 @@
    Cabin identity is encoded by POSITION (stack order) + color.
    ============================================================ */
 
-@font-face { font-family: 'B612'; src: url('/assets/fonts/b612-400.woff2') format('woff2');
+@font-face { font-family: 'B612'; src: url('/assets/fonts/b612-400.woff2?v=2') format('woff2');
   font-weight: 400; font-style: normal; font-display: swap; }
-@font-face { font-family: 'B612'; src: url('/assets/fonts/b612-700.woff2') format('woff2');
+@font-face { font-family: 'B612'; src: url('/assets/fonts/b612-700.woff2?v=2') format('woff2');
   font-weight: 700; font-style: normal; font-display: swap; }
-@font-face { font-family: 'B612 Mono'; src: url('/assets/fonts/b612mono-400.woff2') format('woff2');
+@font-face { font-family: 'B612 Mono'; src: url('/assets/fonts/b612mono-400.woff2?v=2') format('woff2');
   font-weight: 400; font-style: normal; font-display: swap; }
-@font-face { font-family: 'B612 Mono'; src: url('/assets/fonts/b612mono-700.woff2') format('woff2');
+@font-face { font-family: 'B612 Mono'; src: url('/assets/fonts/b612mono-700.woff2?v=2') format('woff2');
   font-weight: 700; font-style: normal; font-display: swap; }
-@font-face { font-family: 'Archivo Black'; src: url('/assets/fonts/archivo-black.woff2') format('woff2');
+@font-face { font-family: 'Archivo Black'; src: url('/assets/fonts/archivo-black.woff2?v=2') format('woff2');
   font-weight: 400; font-style: normal; font-display: swap; }
 
 :root {

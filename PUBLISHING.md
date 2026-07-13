@@ -50,8 +50,16 @@ cd processor && go build -o <bin path> .
 ## 4. Cloudflare Pages (the site)
 1. Cloudflare dashboard → **Workers & Pages → Create → Pages → Connect to Git**.
 2. Pick `intUnderflow/rewardflights.lucy.sh`.
-3. Build settings: framework **None**, build command *(empty)*, output
-   directory **`site`**.
+3. Build settings: framework **None**, root directory **`site`**, output
+   directory *(empty — served in place)*, build command (minify-on-deploy;
+   the repo itself stays build-free and tests run against the same minified
+   form via `mktestsite.sh` in the session harness):
+
+   ```sh
+   npx esbuild app.js --minify --charset=utf8 --allow-overwrite --outfile=app.js && npx esbuild style.css --minify --charset=utf8 --allow-overwrite --outfile=style.css && npx esbuild sw.js --minify --charset=utf8 --allow-overwrite --outfile=sw.js && npx esbuild assets/world-1.js --minify --charset=utf8 --allow-overwrite --outfile=assets/world-1.js
+   ```
+
+   A failed build leaves the previous deploy live — the safe failure mode.
 4. Deploy, then add the custom domain **rewardflights.lucy.sh**.
 
 `site/_headers` (security headers + CSP) and `site/_redirects` (SPA fallback)
