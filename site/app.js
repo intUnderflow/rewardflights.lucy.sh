@@ -46,6 +46,17 @@ const bitClass = (bit) => BIT_CLASS[bit] || "cab-x";
 /* Cabin bit → BA redemption CabinCode (M/W/C/F). */
 const CABIN_CODE = { 1: "M", 2: "W", 4: "C", 8: "F" };
 
+/* "?cabins=CF" ⇄ bitmask, same letter vocabulary as alert watches. */
+function parseCabins(s) {
+  if (!/^[mwcf]{1,4}$/i.test(s || "")) return null;
+  let m = 0;
+  for (const ch of s.toUpperCase()) m |= { M: 1, W: 2, C: 4, F: 8 }[ch];
+  return m;
+}
+function cabinLetters(mask) {
+  return [1, 2, 4, 8].filter((b) => mask & b).map((b) => CABIN_CODE[b]).join("");
+}
+
 /* THE SIGNATURE gauge, one renderer for every surface that draws it: a fixed
    4-lane seat-stack. Lanes hold FIXED positions bottom→top = Economy(1),
    Premium(2), Business(4), First(8). A present cabin renders as a full bar;
@@ -2717,15 +2728,21 @@ function renderMap(o) {
   /* Controls: cabin chips (always visible — a map that hides cabins is the
      top competitor complaint), a month narrower (the "school holidays" ask;
      default stays the whole year, not a 2-week window), and the same
-     trip-length window as the route pages, seeded from the shared session
-     preference so map → calendar keeps the trip you had in mind. */
-  let mask = cabinLegend().reduce((m, [bit]) => m | bit, 0);
+     trip-length window as the route pages. Cabins and nights are both seeded
+     URL → shared session pref → default, and both write back to each, so the
+     filter survives reload/share and rides along into the calendar pages
+     (which read the same rf:filter pref). */
+  const allMask = cabinLegend().reduce((m, [bit]) => m | bit, 0);
+  let mask = parseCabins(new URLSearchParams(location.search).get("cabins"))
+    ?? (getFilter() ?? allMask);
+  mask &= allMask; if (!mask) mask = allMask;
+  setFilter(mask); // a shared map link's filter should also govern the pages behind its dots
   let monthIdx = -1; // -1 = next 12 months
   let nights = parseNights(new URLSearchParams(location.search).get("nights"))
     || getNightsPref() || NIGHTS_DEFAULT.slice();
   const controls = el(`<div class="section-pad map-controls">
     <div class="chips" role="group" aria-label="Cabins">${cabinLegend().map(([bit, label]) =>
-      `<button type="button" class="chip" aria-pressed="true" data-bit="${bit}">
+      `<button type="button" class="chip" aria-pressed="${!!(mask & bit)}" data-bit="${bit}">
         <span class="swatch ${bitClass(bit)}"></span>${esc(label)}</button>`).join("")}
     </div>
     <label class="map-month-wrap">When
@@ -3018,6 +3035,12 @@ function renderMap(o) {
       if (!next) return; // at least one cabin stays on
       mask = next;
       chip.setAttribute("aria-pressed", String(!!(mask & bit)));
+      setFilter(mask);
+      const u = new URL(location.href);
+      if (mask === allMask) u.searchParams.delete("cabins");
+      else u.searchParams.set("cabins", cabinLetters(mask));
+      const q = u.searchParams.toString();
+      history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
       redraw();
     });
     $(".map-month", controls).addEventListener("change", (e) => {
