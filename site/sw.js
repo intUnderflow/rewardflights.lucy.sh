@@ -16,14 +16,26 @@ const PUSH_API = "https://alerts-rewardflights.lucy.sh";
 const SHELL_CACHE = "rf-shell-v1";
 const NAV_TIMEOUT_MS = 3500;
 
-self.addEventListener("install", (e) => {
+self.addEventListener("install", () => self.skipWaiting());
+
+self.addEventListener("activate", (e) => {
   e.waitUntil((async () => {
-    // Precache the shell so offline works from the SECOND visit, not the
-    // third: fetch the live index, then pull its versioned asset URLs out.
+    await self.clients.claim();
+    for (const k of await caches.keys()) {
+      if (k !== SHELL_CACHE) await caches.delete(k);
+    }
+    // Precache the shell so offline works from the SECOND visit. This runs
+    // in activate, NOT install: navigator.serviceWorker.ready resolves as
+    // soon as a worker is active, so nothing that awaits it (the alert bell,
+    // the home panel) ever queues behind these fetches. waitUntil only keeps
+    // the worker alive while they finish.
     try {
       const cache = await caches.open(SHELL_CACHE);
       const res = await fetch("/", { cache: "no-cache" });
-      if (res.ok) {
+      const cacheable = res.ok && !res.redirected &&
+        new URL(res.url).origin === self.location.origin &&
+        (res.headers.get("content-type") || "").includes("text/html");
+      if (cacheable) {
         await cache.put("/", res.clone());
         const html = await res.text();
         const urls = [...html.matchAll(/(?:src|href)="(\/[^"]+)"/g)]
@@ -31,17 +43,7 @@ self.addEventListener("install", (e) => {
           .filter((u) => /\?v=\d+|^\/assets\//.test(u));
         await Promise.all(urls.map((u) => cache.add(u).catch(() => {})));
       }
-    } catch { /* offline install — runtime caching will fill in */ }
-    self.skipWaiting();
-  })());
-});
-
-self.addEventListener("activate", (e) => {
-  e.waitUntil((async () => {
-    for (const k of await caches.keys()) {
-      if (k !== SHELL_CACHE) await caches.delete(k);
-    }
-    await self.clients.claim();
+    } catch { /* offline activation — runtime caching will fill in */ }
   })());
 });
 

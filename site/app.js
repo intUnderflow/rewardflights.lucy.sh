@@ -996,9 +996,12 @@ async function boot() {
 
   // Register the service worker for EVERYONE (not just alert users): it
   // caches the shell offline-first, which is what keeps the app opening
-  // instantly on airport-grade connections. Idempotent, off the boot path.
+  // instantly on airport-grade connections. Immediately: registration is
+  // cheap (sw.js is ~1KB), precache runs post-activation so nothing that
+  // awaits serviceWorker.ready queues behind it, and any delay here just
+  // delays everything alerts-related on first visits.
   if ("serviceWorker" in navigator) {
-    setTimeout(() => navigator.serviceWorker.register("/sw.js").catch(() => {}), 1500);
+    navigator.serviceWorker.register("/sw.js").catch(() => {});
   }
 
   // The instant connectivity returns: re-sync data and drain the outbox
@@ -1542,19 +1545,35 @@ function refreshHomeModules() {
    route you ever subscribed to and visiting each one. Rendered async (it needs
    the push subscription) and simply absent when there's nothing to show. */
 async function buildAlertsPanel(mount) {
-  const data = await currentAlerts();
-  if (!data || !data.watches.length) { mount.innerHTML = ""; return; }
+  // Paint instantly from the last-known-good copy — waiting on the service
+  // worker + a round-trip to the alerts service made this module pop in a
+  // second late, the one thing this site promises never to do. The server
+  // truth follows and reconciles in place (same pattern as the availability
+  // snapshot). data.sub stays null in the fast paint; actions that need it
+  // resolve the subscription at click time.
+  const cached = Notification?.permission === "granted" ? loadWatchesCache() : null;
+  const paint = (data) => {
+    if (!data || !data.watches.length) { mount.innerHTML = ""; return; }
+    mount.innerHTML = "";
+    const sec = el(`<section class="module alerts-mod">
+      <h2><span class="dot" aria-hidden="true"></span>Your alerts
+        <a class="alerts-manage" href="/alerts">Manage →</a></h2>
+      <div class="card-list"></div>
+    </section>`);
+    const list = $(".card-list", sec);
+    const seen = loadSeen();
+    for (const w of data.watches) list.append(alertRow(w, data, () => buildAlertsPanel(mount), { seen }));
+    mount.append(sec);
+  };
+  if (cached?.length) paint({ sub: null, watches: cached, device: null });
 
-  mount.innerHTML = "";
-  const sec = el(`<section class="module alerts-mod">
-    <h2><span class="dot" aria-hidden="true"></span>Your alerts
-      <a class="alerts-manage" href="/alerts">Manage →</a></h2>
-    <div class="card-list"></div>
-  </section>`);
-  const list = $(".card-list", sec);
-  const seen = loadSeen();
-  for (const w of data.watches) list.append(alertRow(w, data, () => buildAlertsPanel(mount), { seen }));
-  mount.append(sec);
+  const data = await currentAlerts();
+  // Reconcile only when the truth differs from what's on screen — a no-op
+  // repaint would throw away hover/focus for nothing. (Rows resolve the
+  // subscription at click time, so the cached paint is fully functional.)
+  const shown = JSON.stringify(cached?.length ? cached : []);
+  const actual = JSON.stringify(data?.watches || []);
+  if (shown !== actual) paint(data);
 }
 
 /* One row describing a watch: what, when, and whether anything matches today.
@@ -1600,6 +1619,9 @@ function alertRow(w, data, rerender, { editable = false, seen = null } = {}) {
     const btn = e.currentTarget;
     btn.disabled = true; btn.textContent = "…";
     try {
+      // The home panel's fast paint renders from cache with no subscription
+      // in hand — resolve it at click time instead of at render time.
+      if (!data.sub) data.sub = await getSubscription();
       await saveWatches(data.sub, data.watches.filter((x) => x.id !== w.id));
       announce(`Alerts off for ${o} to ${d}.`);
       refreshAlertCount();
@@ -3769,13 +3791,16 @@ function renderMap(o) {
 function refreshAlertCount() {
   const link = $("#alerts-link");
   if (!link) return;
-  currentAlerts().then((data) => {
-    const n = data ? data.watches.length : 0;
+  const apply = (n) => {
     link.hidden = false;
     $(".al-count", link).textContent = n ? String(n) : "";
     link.classList.toggle("on", n > 0);
     link.title = n ? `${n} route${n > 1 ? "s" : ""} you're watching` : "Alerts";
-  });
+  };
+  // Instant from the last-known-good copy; the server truth reconciles.
+  const cached = Notification?.permission === "granted" ? loadWatchesCache() : null;
+  if (cached) apply(cached.length);
+  currentAlerts().then((data) => apply(data ? data.watches.length : 0));
 }
 
 function renderAlerts() {
