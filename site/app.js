@@ -34,7 +34,9 @@ const dataBase = (() => {
 })();
 
 const SNAPSHOT_KEY = "rf:avail:v1";
-const MANIFEST_POLL_MS = 5 * 60 * 1000;
+// One minute: the poll target is the ~200-byte manifest, so a tight loop is
+// nearly free — and a 5-minute gap can miss a seat that opens and goes.
+const MANIFEST_POLL_MS = 60 * 1000;
 const DAY_MS = 86400000;
 const NEW_BADGE_MS = 48 * 3600 * 1000;
 
@@ -211,17 +213,62 @@ const subPayload = (sub) => ({
    Omitting `out` means "any time"; omitting `ret`/`nights` on a round trip
    means "wherever the nights window lands me". */
 
+/* Every alerts-API call goes through a hard timeout: on a blackholing
+   network (captive portal accepting packets into the void) a bare fetch()
+   hangs for minutes, and the bell would spin forever. Retries only where
+   the operation is idempotent. */
+async function apiFetch(path, { method = "GET", body, timeout = 8000, retries = 1 } = {}) {
+  // onLine === false is definitive (true is not): don't make an offline user
+  // sit through timeout+retry before the cached/queued path kicks in.
+  if (navigator.onLine === false) throw new Error("offline");
+  let lastErr;
+  for (let i = 0; i <= retries; i++) {
+    const ctl = new AbortController();
+    const timer = setTimeout(() => ctl.abort(), timeout);
+    try {
+      return await fetch(`${PUSH_API}${path}`, {
+        method,
+        signal: ctl.signal,
+        ...(body !== undefined && {
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        }),
+      });
+    } catch (e) {
+      lastErr = e;
+    } finally {
+      clearTimeout(timer);
+    }
+    if (i < retries) await new Promise((r) => setTimeout(r, 800 * (i + 1)));
+  }
+  throw lastErr;
+}
+
 async function fetchWatches(sub) {
-  const res = await fetch(`${PUSH_API}/watches?endpoint=${encodeURIComponent(sub.endpoint)}`);
+  const res = await apiFetch(`/watches?endpoint=${encodeURIComponent(sub.endpoint)}`);
   if (!res.ok) throw new Error(`alert service unavailable (${res.status})`);
-  return (await res.json()).watches || [];
+  const watches = (await res.json()).watches || [];
+  // Last-known-good copy: offline saves are read-modify-write, and modifying
+  // a GUESS of the list would sync data loss. This cache is the only basis
+  // an offline edit is allowed to build on.
+  try { localStorage.setItem("rf:watches-cache", JSON.stringify(watches)); } catch {}
+  return watches;
+}
+
+/* null = we have never successfully seen the server list on this device —
+   distinct from a cached empty list, which is a fine base to edit. */
+function loadWatchesCache() {
+  try {
+    const raw = localStorage.getItem("rf:watches-cache");
+    return raw === null ? null : JSON.parse(raw);
+  } catch { return null; }
 }
 
 /* The full device view: watches plus delivery telemetry. `device.reachable` is
    false when we've sent this device pushes it never acknowledged — the silent-
    suppression case that has no browser-visible signal. */
 async function fetchDevice(sub) {
-  const res = await fetch(`${PUSH_API}/watches?endpoint=${encodeURIComponent(sub.endpoint)}`);
+  const res = await apiFetch(`/watches?endpoint=${encodeURIComponent(sub.endpoint)}`);
   if (!res.ok) throw new Error(`alert service unavailable (${res.status})`);
   const j = await res.json();
   return { watches: j.watches || [], device: j.device || null };
@@ -247,26 +294,107 @@ function wireWatch(w) {
 
 /* Saves the list and returns the server's echo (watches with ids + status),
    so callers can e.g. re-baseline a just-edited watch by its new id. */
+/* Thrown when a save couldn't reach the server but IS safely queued in the
+   outbox — callers show "will sync when you're back online" instead of an
+   error. Server REJECTIONS (4xx) still throw plain errors: a watch the
+   server won't accept must never sit silently in a retry queue. */
+class QueuedOffline extends Error {
+  constructor() { super("queued for sync"); this.queued = true; }
+}
+
 async function saveWatches(sub, watches) {
   if (!watches.length) {
     // Nothing left to watch: drop the subscription rather than keep a dangling
     // endpoint on file.
-    await fetch(`${PUSH_API}/unsubscribe`, {
-      method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ endpoint: sub.endpoint }),
-    });
+    try {
+      const res = await apiFetch("/unsubscribe", { method: "POST", body: { endpoint: sub.endpoint } });
+      void res;
+    } catch {
+      await queueOutbox({ endpoint: sub.endpoint, op: "unsubscribe", payload: { endpoint: sub.endpoint } });
+      await sub.unsubscribe().catch(() => {});
+      throw new QueuedOffline();
+    }
     await sub.unsubscribe().catch(() => {});
     return [];
   }
-  const res = await fetch(`${PUSH_API}/subscribe`, {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ ...subPayload(sub), watches: watches.map(wireWatch) }),
-  });
+  const payload = { ...subPayload(sub), watches: watches.map(wireWatch) };
+  let res;
+  try {
+    res = await apiFetch("/subscribe", { method: "POST", body: payload });
+  } catch {
+    // Network-level failure only: queue the LATEST desired state and let the
+    // sync machinery deliver it when connectivity returns.
+    await queueOutbox({ endpoint: sub.endpoint, op: "subscribe", payload });
+    throw new QueuedOffline();
+  }
   if (!res.ok) {
     const detail = await res.json().catch(() => ({}));
     throw new Error(detail.error || `couldn't save alerts (${res.status})`);
   }
-  return (await res.json().catch(() => ({}))).watches || [];
+  const echo = (await res.json().catch(() => ({}))).watches || [];
+  try { localStorage.setItem("rf:watches-cache", JSON.stringify(echo)); } catch {}
+  return echo;
+}
+
+/* ---------------- offline outbox (alert saves survive dead networks) ------ */
+
+/* One pending operation per endpoint — last write wins, exactly like the
+   server's own semantics (POST /subscribe replaces the whole list). Lives in
+   IndexedDB so the service worker's Background Sync handler can read it too;
+   browsers without Background Sync (Safari) flush on the window's "online"
+   event and at boot instead. */
+function outboxDB() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("rf-outbox", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("ops", { keyPath: "endpoint" });
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function queueOutbox(op) {
+  try {
+    const db = await outboxDB();
+    await new Promise((resolve, reject) => {
+      const tx = db.transaction("ops", "readwrite");
+      tx.objectStore("ops").put({ ...op, queuedAt: Date.now() });
+      tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+    });
+    db.close();
+    // One-shot Background Sync where the platform has it: delivery happens
+    // even if the tab is closed before the network returns.
+    try {
+      const reg = await navigator.serviceWorker.ready;
+      await reg.sync?.register("rf-outbox");
+    } catch { /* no SW / no sync: the online-event + boot flush covers it */ }
+  } catch { /* IDB unavailable (private mode): the save error stands */ }
+}
+
+async function flushOutbox() {
+  try {
+    const db = await outboxDB();
+    const ops = await new Promise((resolve, reject) => {
+      const req = db.transaction("ops").objectStore("ops").getAll();
+      req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error);
+    });
+    for (const op of ops) {
+      try {
+        const res = await apiFetch(op.op === "subscribe" ? "/subscribe" : "/unsubscribe",
+          { method: "POST", body: op.payload, retries: 0 });
+        // Delivered (or rejected outright — either way the queue entry is
+        // done; a 4xx will never succeed by retrying).
+        if (res.ok || (res.status >= 400 && res.status < 500)) {
+          await new Promise((resolve, reject) => {
+            const tx = db.transaction("ops", "readwrite");
+            tx.objectStore("ops").delete(op.endpoint);
+            tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+          });
+          if (res.ok) refreshAlertCount();
+        }
+      } catch { /* still offline — keep it queued */ }
+    }
+    db.close();
+  } catch { /* IDB unavailable */ }
 }
 
 /* ---------------- watches: helpers + the live match count ---------------- */
@@ -872,6 +1000,14 @@ async function boot() {
   if ("serviceWorker" in navigator) {
     setTimeout(() => navigator.serviceWorker.register("/sw.js").catch(() => {}), 1500);
   }
+
+  // The instant connectivity returns: re-sync data and drain the outbox
+  // rather than waiting out the poll interval. (Tab refocus already syncs
+  // via visibilitychange; this covers the visible-tab-on-flapping-wifi case.)
+  window.addEventListener("online", () => { checkForUpdate(); flushOutbox(); });
+  // Drain anything queued by a previous session (covers browsers without
+  // Background Sync, and syncs that fired while no page was open to hear).
+  setTimeout(flushOutbox, 2500);
 }
 
 async function loadChanges() {
@@ -925,8 +1061,10 @@ async function checkForUpdate() {
     // Cache-bust the tiny manifest so we see new versions promptly.
     const manifest = await getJSON(`${dataBase}/manifest.json?ts=${Math.floor(Date.now() / 60000)}`, { retries: 0 });
     if (manifest.v && manifest.v !== store.bundle.v) {
-      // New generation: bypass the 5-minute CDN cache via a versioned URL.
-      const fresh = await getJSON(`${dataBase}/availability.json?v=${encodeURIComponent(manifest.v)}`);
+      // New generation: patch forward from the ~2KB changes feed when we can
+      // PROVE equivalence, else fetch the full bundle (versioned URL bypasses
+      // the 5-minute CDN cache either way).
+      const fresh = await deltaOrFullBundle(manifest);
       // Guard against a stale CDN replica: only adopt when the bundle we got
       // back actually IS a new version. Otherwise we'd re-adopt the same data
       // and fire a false "updated" pulse + destructive re-render every poll.
@@ -952,6 +1090,79 @@ async function checkForUpdate() {
 function isTypingInSearch() {
   const a = document.activeElement;
   return !!(a && a.tagName === "INPUT" && a.closest(".search-card"));
+}
+
+/* Reach manifest.v by patching the in-memory snapshot with the changes feed
+   (~2KB) instead of refetching the whole bundle (~27KB) — on a 20kbps link
+   that's one second instead of eleven, with far fewer chances to stall.
+   The patch is adopted ONLY when provably equivalent: the recount of
+   route+date pairs must match the manifest's own counts.routeDates exactly.
+   Every unprovable situation falls back to the full fetch. */
+async function deltaOrFullBundle(manifest) {
+  const full = () => getJSON(`${dataBase}/availability.json?v=${encodeURIComponent(manifest.v)}`);
+  const old = store.bundle;
+  try {
+    if (typeof manifest.counts?.routeDates !== "number") return full();
+    if (manifest.epoch !== old.epoch) return full();        // year rollover re-anchors everything
+    // The feed reflects "a" bit changes only — a bundle carrying the seats
+    // layer would silently desync, so delta is gated off until the feed
+    // grows seat-transition entries.
+    if (Object.values(old.routes).some((e) => e.s)) return full();
+
+    const feed = await getJSON(`${dataBase}/changes/recent.json?v=${encodeURIComponent(manifest.v)}`, { retries: 1 });
+    if (feed.schema !== 1 || feed.v !== manifest.v) return full(); // stale CDN replica
+    const all = feed.entries || [];
+    const entries = all.filter((e) => e.t > old.t);
+    // Overlap proof: if every entry is newer than our snapshot, older ones
+    // may have rolled off the feed's 1000-entry cap — we can't know what we
+    // missed.
+    if (all.length && entries.length === all.length) return full();
+
+    const next = structuredClone(old);
+    for (let i = entries.length - 1; i >= 0; i--) {          // oldest first; newest wins
+      const e = entries[i];
+      const route = next.routes[e.r];
+      const s = route?.a?.[e.al];
+      if (typeof s !== "string") return full();              // new route/airline: not patchable
+      const idx = dayIndexOf(e.d);
+      if (!(Number.isInteger(idx) && idx >= 0 && idx < s.length)) return full(); // horizon moved
+      const mask = e.k === "closed"
+        ? 0
+        : [...(e.c || "")].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
+      route.a[e.al] = s.slice(0, idx) + mask.toString(16).toUpperCase() + s.slice(idx + 1);
+    }
+    // The generator drops dates before its source commit's UTC date, and the
+    // feed doesn't report past roll-off — mirror the drop before recounting
+    // or every midnight would fail the invariant.
+    const cutoffIdx = Math.floor((manifest.t * 1000 - store.epochMs) / DAY_MS);
+    if (cutoffIdx > 0) {
+      for (const entry of Object.values(next.routes)) {
+        for (const [al, str] of Object.entries(entry.a)) {
+          const upto = Math.min(cutoffIdx, str.length);
+          if (str.slice(0, upto) !== "0".repeat(upto)) {
+            entry.a[al] = "0".repeat(upto) + str.slice(upto);
+          }
+        }
+      }
+    }
+    // Equivalence proof: count route+date pairs with availability (union
+    // across airlines per day) and demand an exact match with the manifest.
+    let routeDates = 0;
+    for (const entry of Object.values(next.routes)) {
+      const strs = Object.values(entry.a);
+      const len = strs[0]?.length || 0;
+      for (let i = 0; i < len; i++) {
+        for (const str of strs) if (str[i] !== "0") { routeDates++; break; }
+      }
+    }
+    if (routeDates !== manifest.counts.routeDates) return full();
+
+    next.v = manifest.v;
+    next.t = manifest.t;
+    return next;
+  } catch {
+    return full();
+  }
 }
 
 function showBanner(text, withRetry) {
@@ -1394,6 +1605,13 @@ function alertRow(w, data, rerender, { editable = false, seen = null } = {}) {
       refreshAlertCount();
       rerender();
     } catch (err) {
+      if (err.queued) {
+        // Offline: the change is in the outbox — reflect it, don't fail it.
+        announce(`You're offline — alerts for ${o} to ${d} will switch off when you're back online.`);
+        data.watches = data.watches.filter((x) => x.id !== w.id);
+        rerender();
+        return;
+      }
       btn.disabled = false; btn.textContent = "Turn off";
       announce(String(err.message || err));
     }
@@ -1686,14 +1904,28 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     }
 
     pop.innerHTML = `<div class="sk-line" style="height:150px"></div>`;
-    let all = [], mine = null;
+    let all = [], mine = null, unreachable = false;
     try {
       const sub = await getSubscription();               // no permission prompt yet
       if (sub) all = await fetchWatches(sub);
       mine = all.find((w) => w.route === routeKey && w.kind === kind) || null;
-    } catch { /* store unreachable → offer a fresh panel anyway */ }
+    } catch {
+      // Service unreachable (apiFetch gave up after its timeout): fall back
+      // to the last-known-good copy so the panel reflects reality, and say
+      // so instead of silently presenting a fresh setup over an existing
+      // watch.
+      unreachable = true;
+      all = loadWatchesCache() || [];
+      mine = all.find((w) => w.route === routeKey && w.kind === kind) || null;
+    }
 
     renderPanel(mine, all);
+    if (unreachable) {
+      const warn = el(`<p class="bell-note">The alerts service is unreachable right now — showing
+        this device's last copy. Changes will be queued and synced when you're back online.</p>`);
+      const title = $(".bell-title", pop);
+      if (title) title.after(warn); else pop.prepend(warn);
+    }
   }
 
   function renderPanel(mine, all) {
@@ -1963,8 +2195,16 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       note.textContent = "";
       try {
         const sub = await getSubscription({ create: true });
-        const list = (await fetchWatches(sub).catch(() => []))
-          .filter((x) => !(x.route === routeKey && x.kind === kind));
+        // Read-modify-write against the SERVER list, falling back to the
+        // last-known-good local copy when the network is down. With neither,
+        // refuse: editing a guessed list would sync away the other watches.
+        const list = (await fetchWatches(sub).catch(() => {
+          const cached = loadWatchesCache();
+          if (cached === null) {
+            throw new Error("Can't reach the alerts service, and this device has no local copy of your alerts to edit safely — try again once you're back online.");
+          }
+          return cached;
+        })).filter((x) => !(x.route === routeKey && x.kind === kind));
         if (w) list.push(w);
         const saved = await saveWatches(sub, list);
         // Editing the party size changes the watch's match set under a NEW
@@ -1988,6 +2228,16 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         announce(note.textContent);
         setTimeout(close, 1500);
       } catch (err) {
+        if (err instanceof QueuedOffline) {
+          // Not a failure: the change is in the outbox and will sync itself.
+          setLabel(!!w);
+          note.textContent = w
+            ? "You're offline — alert saved on this device; it'll sync the moment you're back online."
+            : "You're offline — the change is saved on this device and will sync automatically.";
+          announce(note.textContent);
+          setTimeout(close, 2500);
+          return;
+        }
         btnEl.disabled = false; btnEl.textContent = was;
         if (err instanceof PermissionError) {
           note.innerHTML = permissionHelpHTML(err.state);
@@ -3620,6 +3870,12 @@ async function drawAlertsPage(body) {
       refreshAlertCount();
       rerender();
     } catch (err) {
+      if (err.queued) {
+        announce("You're offline — all alerts will switch off when you're back online.");
+        data.watches = [];
+        rerender();
+        return;
+      }
       btn.disabled = false; btn.textContent = "Turn all off";
       status(body, String(err.message || err));
     }
@@ -3630,10 +3886,8 @@ async function drawAlertsPage(body) {
     const btn = e.currentTarget;
     btn.disabled = true; btn.textContent = "Sending…";
     try {
-      const res = await fetch(`${PUSH_API}/test`, {
-        method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ endpoint: data.sub.endpoint }),
-      });
+      // retries: 0 — a retried /test could fire a duplicate notification.
+      const res = await apiFetch("/test", { method: "POST", body: { endpoint: data.sub.endpoint }, retries: 0 });
       if (res.status === 410) {
         // The push service retired this device's endpoint; the server has
         // already dropped it. Re-subscribe transparently and keep the alerts.

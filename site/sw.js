@@ -65,7 +65,14 @@ self.addEventListener("fetch", (event) => {
           fetch(req),
           new Promise((_, rej) => setTimeout(() => rej(new Error("nav timeout")), NAV_TIMEOUT_MS)),
         ]);
-        if (fresh.ok) cache.put("/", fresh.clone()); // SPA: one shell serves every path
+        // Belt against interception (captive portals, enterprise MITM roots):
+        // only our own origin's un-redirected HTML may become the offline
+        // shell. TLS blocks the classic portal forgery already; this closes
+        // the残 remaining paths cheaply.
+        const cacheable = fresh.ok && !fresh.redirected &&
+          new URL(fresh.url).origin === self.location.origin &&
+          (fresh.headers.get("content-type") || "").includes("text/html");
+        if (cacheable) cache.put("/", fresh.clone()); // SPA: one shell serves every path
         return fresh;
       } catch {
         const shell = await cache.match("/");
@@ -138,6 +145,54 @@ async function ackDelivery() {
       keepalive: true,
     });
   } catch { /* diagnostic only — a failed ack must never affect the alert */ }
+}
+
+/* ---- offline outbox: deliver queued alert saves when the network returns.
+   The queue is written by the page (IndexedDB "rf-outbox"); this handler
+   makes delivery survive the tab being closed. Browsers without Background
+   Sync flush from the page instead (online event + boot). ---- */
+self.addEventListener("sync", (event) => {
+  if (event.tag === "rf-outbox") event.waitUntil(flushOutboxSW());
+});
+
+function outboxDBSW() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open("rf-outbox", 1);
+    req.onupgradeneeded = () => req.result.createObjectStore("ops", { keyPath: "endpoint" });
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error);
+  });
+}
+
+async function flushOutboxSW() {
+  const db = await outboxDBSW();
+  const ops = await new Promise((resolve, reject) => {
+    const req = db.transaction("ops").objectStore("ops").getAll();
+    req.onsuccess = () => resolve(req.result); req.onerror = () => reject(req.error);
+  });
+  for (const op of ops) {
+    try {
+      const res = await fetch(`${PUSH_API}${op.op === "subscribe" ? "/subscribe" : "/unsubscribe"}`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify(op.payload),
+      });
+      // Delivered, or rejected outright (a 4xx never succeeds by retrying).
+      if (res.ok || (res.status >= 400 && res.status < 500)) {
+        await new Promise((resolve, reject) => {
+          const tx = db.transaction("ops", "readwrite");
+          tx.objectStore("ops").delete(op.endpoint);
+          tx.oncomplete = resolve; tx.onerror = () => reject(tx.error);
+        });
+      }
+    } catch {
+      // Still offline: leaving the op queued makes the sync retry later —
+      // rethrow so the platform knows this attempt didn't finish.
+      db.close();
+      throw new Error("outbox not drained");
+    }
+  }
+  db.close();
 }
 
 self.addEventListener("notificationclick", (event) => {
