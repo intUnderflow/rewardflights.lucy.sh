@@ -596,7 +596,18 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .pxp:hover { border-color: var(--ink-3); }
 .pxp[aria-pressed="true"] { background: var(--ink); border-color: var(--ink); color: var(--surface); }
 /* honest fallback line: seat counts unknown for this route at pax >= 2 */
-.pax-note { font-family: var(--font-data); font-size: 12px; color: var(--ink-3); margin: 8px 0 0; }
+/* The party-size honesty warning: while seat-count coverage is partial,
+   this is the line that stops a family of four trusting a 1-seat day —
+   it wears the site's amber warning treatment, not fine print. */
+.pax-note {
+  display: flex; align-items: baseline; gap: 9px;
+  margin: 10px 0 0; padding: 9px 13px; max-width: 620px;
+  background: var(--amber-bg); color: var(--amber-ink);
+  border: 1px solid color-mix(in srgb, var(--amber-ink) 35%, transparent);
+  border-radius: 8px; font-size: 13px; font-weight: 700; line-height: 1.45;
+}
+.pax-note::before { content: "▲"; font-size: 10px; flex-shrink: 0; position: relative; top: -1px; }
+.pax-note[hidden] { display: none; }
 /* day/pair panel per-cabin party annotations */
 .dp-cab-pax, .pp-row-pax, .pp-cta-pax { display: inline-block; margin-left: 8px; font-family: var(--font-data); font-size: 10.5px; color: var(--ink-3); }
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }
