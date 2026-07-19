@@ -113,11 +113,9 @@ body.modal-open { overflow: hidden; }
   letter-spacing: .01em; text-transform: none; color: var(--ink-3);
   white-space: nowrap; margin-left: -3px; align-self: center;
 }
-/* Keep the header uncluttered on small phones where space is tight. */
-@media (max-width: 420px) { .wordmark .byline { display: none; } }
 .mk-m { fill: var(--cab-m); } .mk-w { fill: var(--cab-w); }
 .mk-c { fill: var(--cab-c); } .mk-f { fill: var(--cab-f); }
-.freshness { font-family: var(--font-data); font-size: 12px; color: var(--ink-2); }
+.freshness { font-family: var(--font-data); font-size: 12px; color: var(--ink-2); white-space: nowrap; }
 .freshness.stale { color: var(--amber-ink); }
 
 /* ---------- banner (errors / stale) ---------- */
@@ -490,6 +488,11 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 @media (max-width: 560px) {
   .alerts-link { padding: 4px 8px; }
   .topbar-right { gap: 10px; }
+  /* Phone header: shed the two lowest-priority bits so the wordmark, Alerts
+     and a one-line timestamp all fit without wrapping. */
+  .wordmark .byline { display: none; }
+  .freshness .fr-prefix { display: none; }
+  .freshness { font-size: 11px; }
 }
 
 /* ---------- my-alerts page ---------- */

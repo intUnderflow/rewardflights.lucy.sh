@@ -1054,7 +1054,9 @@ function renderFreshness() {
   const elx = $("#freshness");
   if (!store.bundle) { elx.textContent = "…"; return; }
   const ageMs = Date.now() - store.bundle.t * 1000;
-  elx.textContent = `data as of ${freshLabel()}`;
+  // The "data as of" prefix is a separate span so the phone header can drop it
+  // (it stays in the title tooltip) and keep just the timestamp on one line.
+  elx.innerHTML = `<span class="fr-prefix">data as of </span>${esc(freshLabel())}`;
   elx.classList.toggle("stale", ageMs > 24 * 3600 * 1000);
   elx.title = `Availability data generated from source updated ${timeAgo(store.bundle.t)}. Always verify with the airline.`;
 }
