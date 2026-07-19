@@ -359,6 +359,35 @@ func TestHorizonGrowth(t *testing.T) {
 	})
 }
 
+// TestExactDatesEntirelyBeyondHorizon is the "alert me for dates BA hasn't
+// released yet" case: a bounded watch whose ENTIRE outbound range lies past
+// the current horizon (TestHorizonGrowth only crosses the frontier with its
+// tail). Baseline must be silent — there is nothing to match yet — and the
+// watch must fire the instant those dates load, which is exactly the promise
+// the client now makes by letting exact-date alerts reach beyond the horizon.
+func TestExactDatesEntirelyBeyondHorizon(t *testing.T) {
+	// Horizon is Oct 1–10; the watched dates Oct 20–25 are wholly beyond it.
+	prev := bundleWithDays(t, "2026-10-01T09:00", 10, map[string]map[int]string{
+		"LON-TYO": {3: "C"}, // route is known, but not on the watched dates
+	})
+	h := newHarness(t, alertstore.Watch{
+		Route: "LON-TYO", Kind: alertstore.KindOW, Cabins: []string{"C"},
+		Out: &alertstore.Range{From: "2026-10-20", To: "2026-10-25"},
+	})
+	h.w.Baseline(prev)
+	if len(h.cap.pubs) != 0 {
+		t.Fatalf("baseline of a wholly-beyond-horizon watch must be silent, got %v", h.cap.bodies())
+	}
+	// BA loads through Oct 26; the watched dates arrive already holding Business.
+	next := bundleWithDays(t, "2026-10-01T10:00", 26, map[string]map[int]string{
+		"LON-TYO": {3: "C", 20: "C", 22: "C"},
+	})
+	h.w.Cycle(next)
+	if len(h.cap.pubs) != 1 {
+		t.Fatalf("the watch must fire when its far-future dates load, got %v", h.cap.bodies())
+	}
+}
+
 func TestOneWayDetection(t *testing.T) {
 	h := newHarness(t, unbounded(alertstore.KindOW, "C", "F"))
 	h.w.Baseline(bundleAt(t, "2026-10-01T09:00", map[string]map[int]string{"LON-TYO": {}}))

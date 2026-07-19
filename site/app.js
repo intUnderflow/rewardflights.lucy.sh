@@ -38,6 +38,13 @@ const SNAPSHOT_KEY = "rf:avail:v1";
 // nearly free — and a 5-minute gap can miss a seat that opens and goes.
 const MANIFEST_POLL_MS = 60 * 1000;
 const DAY_MS = 86400000;
+// How far ahead an EXACT-DATE alert may reach. BA releases award space ~355
+// days out, so alerts for known dates that aren't on sale yet are a core use
+// case; this cap (~18 months) sits generously past the release window while
+// still catching year-typos. The server has no future cap and fires such a
+// watch the moment its dates load (EC-3 frontier), so this is purely the UI
+// guard-rail on the date picker.
+const EXACT_MAX_AHEAD_DAYS = 540;
 const NEW_BADGE_MS = 48 * 3600 * 1000;
 
 /* Cabin bit → color class. Position in the seat-stack is ascending bit
@@ -426,12 +433,16 @@ function matchesNow(w, { list = false } = {}) {
 
   const t0 = Math.max(0, todayIndex());
   const last = store.bundle.days - 1;
-  const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
   // A lead-time watch floors the outbound at today + leadDays (rolling), which
   // must give the same answer the server does.
-  const floor = w.leadDays ? clamp(t0 + w.leadDays, t0, last) : t0;
-  const oFrom = w.out?.from ? clamp(isoToIdx(w.out.from), t0, last) : floor;
-  const oTo = w.out?.to ? clamp(isoToIdx(w.out.to), t0, last) : last;
+  const floor = w.leadDays ? Math.min(last, t0 + w.leadDays) : t0;
+  // Mirror the SERVER's asymmetric clamp (clampRange): From only rises to the
+  // watched start, To only falls to the horizon. A range entirely beyond the
+  // horizon therefore collapses to From > To (empty) — NOT onto the last day,
+  // which a symmetric clamp would do, inventing a false "matches right now"
+  // for an exact-date watch whose dates aren't even released yet.
+  const oFrom = w.out?.from ? Math.max(floor, isoToIdx(w.out.from)) : floor;
+  const oTo = w.out?.to ? Math.min(last, isoToIdx(w.out.to)) : last;
 
   // A party watch counts only days with evidence of >= minSeats together —
   // the same predicate the alert server fires on (its satisfiedBits), so the
@@ -464,8 +475,9 @@ function matchesNow(w, { list = false } = {}) {
   const ret = legBits(rev);
   const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
   // No return range given → it's implied by the outbound window + nights.
-  const rFrom = w.ret?.from ? clamp(isoToIdx(w.ret.from), t0, last) : t0;
-  const rTo = w.ret?.to ? clamp(isoToIdx(w.ret.to), t0, last) : last;
+  // Same asymmetric clamp as the outbound (server parity).
+  const rFrom = w.ret?.from ? Math.max(t0, isoToIdx(w.ret.from)) : t0;
+  const rTo = w.ret?.to ? Math.min(last, isoToIdx(w.ret.to)) : last;
 
   for (let d = oFrom; d <= oTo; d++) {
     const o = out[d] & mask;
@@ -2100,7 +2112,10 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       }
       // exact
       const t0 = Math.max(0, todayIndex());
-      const minIso = idxToIso(t0), maxIso = idxToIso(store.bundle.days - 1);
+      // The picker reaches beyond the released horizon on purpose: exact-date
+      // alerts for not-yet-on-sale dates are the point. The watch waits at
+      // "nothing matches yet" until BA loads those dates.
+      const minIso = idxToIso(t0), maxIso = idxToIso(t0 + EXACT_MAX_AHEAD_DAYS);
       whenBody.append(el(`<div class="bell-dates">
         <label>Leave between
           <span><input type="date" class="bd-of" min="${minIso}" max="${maxIso}" value="${esc(outFrom || defaultOut()[0])}">
@@ -2175,10 +2190,13 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         const [df, dt] = defaultOut();
         w.out = { from: outFrom || df, to: outTo || dt };
         if (kind === "rt" && (retFrom || retTo)) {
-          const last = store.bundle.days - 1;
+          // When one return field is filled and the other is auto-derived,
+          // derive it from the outbound + nights WITHOUT clamping to the
+          // horizon — an exact-date watch can lie entirely beyond it, and a
+          // clamp would drag the return before the outbound (infeasible).
           w.ret = {
-            from: retFrom || idxToIso(Math.min(last, isoToIdx(w.out.from) + w.nights.min)),
-            to: retTo || idxToIso(Math.min(last, isoToIdx(w.out.to) + w.nights.max)),
+            from: retFrom || idxToIso(isoToIdx(w.out.from) + w.nights.min),
+            to: retTo || idxToIso(isoToIdx(w.out.to) + w.nights.max),
           };
         }
       }
