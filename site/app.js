@@ -2338,20 +2338,6 @@ function revDepthNoteHTML(o, d) {
   return `<p class="rev-note">Return ${d}→${o}: ${parts.join(" · ")} days · next 12 months</p>`;
 }
 
-/* Foot-of-calendar explainer: BA opens award space ~355 days before
-   departure (fact-checked — the schedule and a guaranteed 8/2/4 M/W/C reward
-   seats load at T-355), so blank far-future dates read as "not on sale yet",
-   not "sold out". Appended once as a sibling AFTER the calendars so it
-   survives the filter redraws that clear `body`. Uses only glyphs present in
-   the subset fonts (● — “ ” ’, no ½/ℹ). */
-function calReleaseNote() {
-  return el(`<aside class="cal-note"><span><b>Not seeing space far in the future? It may just not be released yet.</b>
-    British Airways usually opens award seats about 355 days — roughly a year — before departure,
-    and guarantees at least 8 Economy, 2 Premium Economy and 4 Business reward seats the moment a
-    flight goes on sale. So a blank stretch at the end of the calendar most often means
-    “not released yet”, not “sold out” — set an alert above and we’ll tell you when a cabin opens.</span></aside>`);
-}
-
 function renderRoute(o, d) {
   current.page = "route"; current.params = { o, d };
   const key = `${o}-${d}`;
@@ -2400,7 +2386,7 @@ function renderRoute(o, d) {
   const toolbar = el(`<div class="route-toolbar"></div>`);
   const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
   const body = el(`<div></div>`);
-  mainEl.append(toolbar, paxNote, container, body, calReleaseNote());
+  mainEl.append(toolbar, paxNote, container, body);
 
   let mask = 0, firstDraw = true, chipsEl = null;
   function rebuildChips() {
@@ -2499,19 +2485,45 @@ function daysInMonth(mo) { return mo.end - mo.start; }
    (same shape as bits) when a party size >= 2 is active on a route with seat
    data. `bits` stays the PRESENCE array: a day with seats but fewer than the
    party must render dim (with honest copy), never as empty. */
+/* Beyond the data horizon (the furthest day BA has loaded, ~355 days out)
+   there is no data at all — so a blank there means "not on sale yet", not
+   "sold out". These render that distinctly on the calendar itself, replacing
+   the old blanket note below it. A whole month past the horizon becomes a
+   "Not released yet" card; the boundary month keeps its grid with the beyond-
+   horizon days hatched. Both are 0-availability by construction (no data). */
+function unreleasedMonthCard(mo, first) {
+  return el(`<section class="month month-unreleased" id="month-${mo.y}-${mo.m}"
+      aria-label="${fmtMonth.format(first)} — not released yet">
+    <h3>${fmtMonth.format(first)}</h3>
+    <p class="month-unrel">Not released yet</p>
+    <p class="month-unrel-sub">British Airways opens award seats about 355 days before departure.
+      Set an alert and we'll tell you when these dates go on sale.</p>
+  </section>`);
+}
+function unreleasedDayCell(dnum, idx) {
+  return el(`<span class="day unreleased"
+      aria-label="${esc(fmtDate.format(dayDate(idx)))} — not released yet"
+      title="Not released yet — BA opens award seats about 355 days ahead">
+    <span class="num">${dnum}</span></span>`);
+}
+
 function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
   const first = utcDate(mo.y, mo.m, 1);
   const tbits = paxCtx ? paxCtx.tbits : bits;
   const pax = paxCtx ? paxCtx.pax : 1;
+  const horizon = bits.length; // last released day; beyond it = not on sale yet
+  if (mo.start >= horizon) return unreleasedMonthCard(mo, first);
 
   // Months with nothing to show collapse to a compact card — a full grid of
   // empty cells is noise when the answer is simply "no". The collapse check
   // is presence-based on purpose: under-threshold days render as dim cells.
+  // A month straddling the horizon never collapses: its unreleased tail must
+  // stay visible (and distinct from the sold-out days before it).
   let any = false, anyShown = false;
   for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, bits.length); i++) {
     if (bits[i]) { any = true; if (bits[i] & mask) { anyShown = true; break; } }
   }
-  if (!anyShown) {
+  if (!anyShown && mo.end <= horizon) {
     return el(`<section class="month month-compact" id="month-${mo.y}-${mo.m}" aria-label="${fmtMonth.format(first)}">
       <h3>${fmtMonth.format(first)}</h3>
       <p class="month-empty">${any ? "No seats in the selected cabins" : "No seats this month"}</p>
@@ -2531,6 +2543,7 @@ function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
   const nDays = daysInMonth(mo);
   for (let dnum = 1; dnum <= nDays; dnum++) {
     const idx = mo.start + dnum - 1;
+    if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx)); continue; }
     const v = (idx >= 0 && idx < bits.length) ? bits[idx] : 0;
     const tv = (idx >= 0 && idx < tbits.length) ? tbits[idx] : 0;
     const shown = tv & mask;
@@ -2652,7 +2665,7 @@ function renderTrip(o, d) {
   const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
   const container = el(`<div></div>`);
   const body = el(`<div></div>`);
-  mainEl.append(toolbar, paxNote, container, body, calReleaseNote());
+  mainEl.append(toolbar, paxNote, container, body);
 
   let mask = 0, firstDraw = true, chipsEl = null;
 
@@ -2819,11 +2832,13 @@ function renderTrip(o, d) {
      when the truth is "not enough seats". */
   function monthCalTrip(mo, rb, rbAll, rbAny, n) {
     const first = utcDate(mo.y, mo.m, 1);
+    const horizon = outBits.length; // beyond it = not released yet, not sold out
+    if (mo.start >= horizon) return unreleasedMonthCard(mo, first);
     let anyOut = false;
     for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, outBits.length); i++) {
       if (outBits[i]) { anyOut = true; break; }
     }
-    if (!anyOut) {
+    if (!anyOut && mo.end <= horizon) {
       return el(`<section class="month month-compact" id="month-${mo.y}-${mo.m}" aria-label="${fmtMonth.format(first)}">
         <h3>${fmtMonth.format(first)}</h3>
         <p class="month-empty">No outbound seats this month</p>
@@ -2843,6 +2858,7 @@ function renderTrip(o, d) {
     const nDays = daysInMonth(mo);
     for (let dnum = 1; dnum <= nDays; dnum++) {
       const idx = mo.start + dnum - 1;
+      if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx)); continue; }
       const vOut = (idx >= 0 && idx < outBits.length) ? outBits[idx] : 0;
       const v = (idx >= 0 && idx < rb.length) ? rb[idx] : 0;
       const isPast = idx < t0;

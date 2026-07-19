@@ -609,20 +609,26 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .pax-note::before { content: "▲"; font-size: 10px; flex-shrink: 0; position: relative; top: -1px; }
 .pax-note[hidden] { display: none; }
 
-/* Foot-of-calendar award-release explainer. Informational, NOT a warning —
-   neutral panel with a quiet gold dot, so it reads as helpful context, not
-   the amber honesty warning above. */
-.cal-note {
-  display: flex; gap: 11px; align-items: baseline;
-  margin: 30px 0 0; padding: 14px 17px; max-width: 640px;
-  background: var(--panel); border: 1px solid var(--line);
-  border-radius: var(--radius); font-size: 13px; color: var(--ink-2); line-height: 1.55;
+/* "Not released yet" calendar states: beyond BA's ~355-day release window
+   there is no data, so we mark those slots distinctly rather than letting an
+   empty far-future cell read as "sold out". A whole month becomes a dashed
+   placeholder card; the boundary month keeps its grid with the unreleased
+   days hatched (distinct from flat-empty and dimmed-past cells). */
+.month-unreleased {
+  display: flex; flex-direction: column; gap: 5px;
+  border-style: dashed; justify-content: center;
 }
-.cal-note::before {
-  content: "●"; color: var(--gold); font-size: 8px; flex-shrink: 0;
-  position: relative; top: -2px;
+.month-unreleased h3 { margin: 0; color: var(--ink-2); font-weight: 700; }
+.month-unrel { margin: 0; font-size: 12.5px; font-weight: 700; color: var(--ink-2); }
+.month-unrel-sub { margin: 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
+.day.unreleased {
+  background:
+    repeating-linear-gradient(-45deg,
+      transparent 0 4px,
+      color-mix(in srgb, var(--ink-3) 16%, transparent) 4px 5px),
+    var(--cell-empty);
 }
-.cal-note b { color: var(--ink); font-weight: 700; }
+.day.unreleased .num { color: var(--ink-3); opacity: .75; }
 /* day/pair panel per-cabin party annotations */
 .dp-cab-pax, .pp-row-pax, .pp-cta-pax { display: inline-block; margin-left: 8px; font-family: var(--font-data); font-size: 10.5px; color: var(--ink-3); }
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }
