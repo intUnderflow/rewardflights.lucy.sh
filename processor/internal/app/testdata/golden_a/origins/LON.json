@@ -75,7 +75,5 @@
  "source": {
   "note": "Derived from github.com/intUnderflow/rewardflights. Availability facts provided as-is, with no warranty and no guarantee of accuracy or bookability.",
   "repo": "https://github.com/intUnderflow/rewardflights"
- },
- "t": 1770000000,
- "v": "0123456789abcdef0123456789abcdef01234567"
+ }
 }

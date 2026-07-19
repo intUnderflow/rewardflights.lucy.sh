@@ -17,13 +17,21 @@ document's scope.
   the exact same bytes (no wall clock anywhere), so unchanged data creates no
   git churn and every diff line is a real data change.
 
-## Provenance fields (every JSON file)
+## Provenance fields
 
 | Field | Type | Meaning |
 |---|---|---|
 | `v` | string | Commit SHA of the **source** repo this generation was built from. Provenance, and the in-band change detector — CORS blocks reading `ETag` from raw.githubusercontent.com, so compare `v` instead. |
 | `t` | number | The source commit's committer timestamp, unix seconds. This is "data as of" — **not** the processing wall clock. |
 | `schema` | number | Format version, currently `1`. Bumped **only** on breaking changes; check `schema === 1` and prompt for an app update otherwise. New fields, airlines, routes and place codes are data, not schema — ignore anything unknown. |
+
+`schema` appears on every file. `t` and `v` appear **only** on the files a
+consumer polls or fetches for version — `manifest.json`, `availability.json`,
+`changes/recent.json`, and the `flights/` detail files. The **origin shards**
+and **`places.json`** deliberately omit `t`/`v`: they are versioned by the
+manifest, and embedding the per-commit sha/time would rewrite every shard on
+every commit (even unchanged ones), flooding the data repo with no-op diffs. A
+shard-mode client cache-busts a shard with `?v=<manifest.v>`.
 
 ## Keys and codes
 
@@ -42,8 +50,8 @@ document's scope.
 |---|---|
 | `manifest.json` | ~200 B stable entrypoint: generation id, counts, epoch. Poll this. |
 | `availability.json` | Whole-dataset bundle: airlines, places, per-route day strings. |
-| `origins/<ORIGIN>.json` | Per-origin shard, same shape as the bundle, filtered. |
-| `places.json` | Standalone copy of the place table. |
+| `origins/<ORIGIN>.json` | Per-origin shard: the bundle's shape (minus `t`/`v`), routes filtered to that origin. |
+| `places.json` | Standalone copy of the place table (no `t`/`v`). |
 | `flights/<ORIG>/<DEST>/<YYYY-MM>.json` | Per-flight detail for one route-month (only where the source provides it). |
 | `changes/recent.json` | Rolling feed of recently opened/closed/changed availability. |
 | `FORMAT.md` | This document. |

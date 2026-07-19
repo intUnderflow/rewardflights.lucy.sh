@@ -310,19 +310,31 @@ func Build(in Inputs) (*Output, error) {
 		return nil
 	}
 
-	availability := func(routes, places map[string]any) map[string]any {
-		return map[string]any{
-			"airlines": airlinesJSON, "days": days, "epoch": epochStr,
-			"source": provenanceBlock, "places": places, "routes": routes,
-			"schema": 1, "t": in.SourceTime, "v": in.SHA,
-		}
-	}
-	if err := put("availability.json", availability(routesJSON, placesJSON)); err != nil {
+	// The bundle is the site's poll/fetch target, so it carries the volatile
+	// t (source time) and v (source sha) the client uses for change detection.
+	if err := put("availability.json", map[string]any{
+		"airlines": airlinesJSON, "days": days, "epoch": epochStr,
+		"source": provenanceBlock, "places": placesJSON, "routes": routesJSON,
+		"schema": 1, "t": in.SourceTime, "v": in.SHA,
+	}); err != nil {
 		return nil, err
 	}
 
-	// Origin shards: identical shape, routes filtered to the origin, places
-	// filtered to the codes those routes reference.
+	// Origin shards and places.json deliberately OMIT t/v. They are not
+	// fetched by the site (it versions off the bundle + manifest), and
+	// embedding the per-commit sha/time rewrote all ~170 shards on EVERY
+	// source commit even when an origin's routes were unchanged — an explosion
+	// of no-op diffs in the data repo. Without t/v a shard is byte-identical
+	// across commits that don't touch it, so emit.Sync leaves it alone and git
+	// commits only the origins that actually moved. Version lives in the
+	// manifest; a shard-mode client cache-busts with ?v=<manifest.v>.
+	shardData := func(routes, places map[string]any) map[string]any {
+		return map[string]any{
+			"airlines": airlinesJSON, "days": days, "epoch": epochStr,
+			"source": provenanceBlock, "places": places, "routes": routes,
+			"schema": 1,
+		}
+	}
 	origins := map[string]bool{}
 	for route := range routeBits {
 		origins[route[:3]] = true
@@ -337,13 +349,13 @@ func Build(in Inputs) (*Output, error) {
 			oPlaces[route[:3]] = placesJSON[route[:3]]
 			oPlaces[route[4:]] = placesJSON[route[4:]]
 		}
-		if err := put("origins/"+origin+".json", availability(oRoutes, oPlaces)); err != nil {
+		if err := put("origins/"+origin+".json", shardData(oRoutes, oPlaces)); err != nil {
 			return nil, err
 		}
 	}
 
 	if err := put("places.json", map[string]any{
-		"places": placesJSON, "schema": 1, "t": in.SourceTime, "v": in.SHA,
+		"places": placesJSON, "schema": 1,
 	}); err != nil {
 		return nil, err
 	}

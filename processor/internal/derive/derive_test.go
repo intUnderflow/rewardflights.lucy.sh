@@ -401,3 +401,37 @@ func TestSeatContradictionWarnings(t *testing.T) {
 		t.Errorf("negative seat count leaked into flights detail: %v", got)
 	}
 }
+
+// TestShardsStableAcrossCommits locks in the anti-churn fix: two generations
+// from identical data but different source commits (sha/time) produce
+// BYTE-IDENTICAL origin shards and places.json — because those omit t/v — so
+// git commits nothing for an unchanged origin. The bundle, which the site
+// polls for its version, still changes.
+func TestShardsStableAcrossCommits(t *testing.T) {
+	mk := func(sha string, ts int64) *Output {
+		route := &source.Route{Dates: map[string]source.DateEntry{
+			"2026-07-12": {Cabins: []string{"M", "C"}, Path: "src/2026-07-12.json"},
+		}}
+		ds := &source.Dataset{Airlines: map[string]*source.Airline{
+			"british-airways": {Slug: "british-airways", Routes: map[string]*source.Route{"ABZ-LON": route}},
+		}}
+		var buf bytes.Buffer
+		out, err := Build(Inputs{Dataset: ds, Places: testPlaces, Airlines: testRegistry,
+			SHA: sha, SourceTime: ts, Log: warnings.New(&buf)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return out
+	}
+	a := mk("sha-one", 1770000000)
+	b := mk("sha-two", 1770000099)
+	if !bytes.Equal(a.Files["origins/ABZ.json"], b.Files["origins/ABZ.json"]) {
+		t.Error("origin shard changed across commits with identical data — would churn the data repo")
+	}
+	if !bytes.Equal(a.Files["places.json"], b.Files["places.json"]) {
+		t.Error("places.json changed across commits with identical data")
+	}
+	if bytes.Equal(a.Files["availability.json"], b.Files["availability.json"]) {
+		t.Error("the bundle must carry t/v and differ across commits (the site polls it)")
+	}
+}
