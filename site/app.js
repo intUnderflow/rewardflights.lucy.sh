@@ -894,6 +894,11 @@ function next12Months() {
   return out;
 }
 
+/* "2026-07" for a next12Months() entry — the URL form of a month filter. */
+function monthISO(mo) {
+  return `${mo.y}-${String(mo.m + 1).padStart(2, "0")}`;
+}
+
 /* pax > 1 counts only days with evidence of >= pax seats; a route without
    the seats layer falls back to presence (callers gate the honest note). */
 function routeTotals(routeKey, pax = 1) {
@@ -3441,7 +3446,18 @@ function renderMap(o) {
     ?? (getFilter() ?? allMask);
   mask &= allMask; if (!mask) mask = allMask;
   setFilter(mask); // a shared map link's filter should also govern the pages behind its dots
-  let monthIdx = -1; // -1 = next 12 months
+  // -1 = next 12 months. Seeded from ?month=YYYY-MM like nights/cabins — a
+  // calendar month, not an index, so a shared URL keeps meaning as months
+  // roll over; one that has rolled out of the window quietly falls back to
+  // "any time".
+  let monthIdx = -1;
+  {
+    const mq = new URLSearchParams(location.search).get("month");
+    if (/^\d{4}-\d{2}$/.test(mq || "")) {
+      const mi = next12Months().findIndex((mo) => monthISO(mo) === mq);
+      if (mi >= 0) monthIdx = mi;
+    }
+  }
   let nights = parseNights(new URLSearchParams(location.search).get("nights"))
     || getNightsPref() || NIGHTS_DEFAULT.slice();
   // Party size: same seed order and, like cabins, a shared map link's pax
@@ -3455,8 +3471,9 @@ function renderMap(o) {
     </div>
     <label class="map-month-wrap">When
       <select class="map-month" aria-label="Travel month">
-        <option value="-1">Any time (next 12 months)</option>
-        ${next12Months().map((mo, i) => `<option value="${i}">${esc(mo.label)}</option>`).join("")}
+        <option value="-1"${monthIdx < 0 ? " selected" : ""}>Any time (next 12 months)</option>
+        ${next12Months().map((mo, i) =>
+          `<option value="${i}"${i === monthIdx ? " selected" : ""}>${esc(mo.label)}</option>`).join("")}
       </select>
     </label>
     <div class="nights-ctl" role="group" aria-label="Trip length in nights">
@@ -3775,6 +3792,11 @@ function renderMap(o) {
     });
     $(".map-month", controls).addEventListener("change", (e) => {
       monthIdx = Number(e.target.value);
+      const u = new URL(location.href);
+      if (monthIdx < 0) u.searchParams.delete("month");
+      else u.searchParams.set("month", monthISO(next12Months()[monthIdx]));
+      const q = u.searchParams.toString();
+      history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
       redraw();
     });
     onNightsChange = redraw;
