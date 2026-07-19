@@ -608,6 +608,21 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 }
 .pax-note::before { content: "▲"; font-size: 10px; flex-shrink: 0; position: relative; top: -1px; }
 .pax-note[hidden] { display: none; }
+
+/* Foot-of-calendar award-release explainer. Informational, NOT a warning —
+   neutral panel with a quiet gold dot, so it reads as helpful context, not
+   the amber honesty warning above. */
+.cal-note {
+  display: flex; gap: 11px; align-items: baseline;
+  margin: 30px 0 0; padding: 14px 17px; max-width: 640px;
+  background: var(--panel); border: 1px solid var(--line);
+  border-radius: var(--radius); font-size: 13px; color: var(--ink-2); line-height: 1.55;
+}
+.cal-note::before {
+  content: "●"; color: var(--gold); font-size: 8px; flex-shrink: 0;
+  position: relative; top: -2px;
+}
+.cal-note b { color: var(--ink); font-weight: 700; }
 /* day/pair panel per-cabin party annotations */
 .dp-cab-pax, .pp-row-pax, .pp-cta-pax { display: inline-block; margin-left: 8px; font-family: var(--font-data); font-size: 10.5px; color: var(--ink-3); }
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }

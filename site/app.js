@@ -2320,6 +2320,20 @@ function revDepthNoteHTML(o, d) {
   return `<p class="rev-note">Return ${d}→${o}: ${parts.join(" · ")} days · next 12 months</p>`;
 }
 
+/* Foot-of-calendar explainer: BA opens award space ~355 days before
+   departure (fact-checked — the schedule and a guaranteed 8/2/4 M/W/C reward
+   seats load at T-355), so blank far-future dates read as "not on sale yet",
+   not "sold out". Appended once as a sibling AFTER the calendars so it
+   survives the filter redraws that clear `body`. Uses only glyphs present in
+   the subset fonts (● — “ ” ’, no ½/ℹ). */
+function calReleaseNote() {
+  return el(`<aside class="cal-note"><span><b>Not seeing space far in the future? It may just not be released yet.</b>
+    British Airways usually opens award seats about 355 days — roughly a year — before departure,
+    and guarantees at least 8 Economy, 2 Premium Economy and 4 Business reward seats the moment a
+    flight goes on sale. So a blank stretch at the end of the calendar most often means
+    “not released yet”, not “sold out” — set an alert above and we’ll tell you when a cabin opens.</span></aside>`);
+}
+
 function renderRoute(o, d) {
   current.page = "route"; current.params = { o, d };
   const key = `${o}-${d}`;
@@ -2368,7 +2382,7 @@ function renderRoute(o, d) {
   const toolbar = el(`<div class="route-toolbar"></div>`);
   const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
   const body = el(`<div></div>`);
-  mainEl.append(toolbar, paxNote, container, body);
+  mainEl.append(toolbar, paxNote, container, body, calReleaseNote());
 
   let mask = 0, firstDraw = true, chipsEl = null;
   function rebuildChips() {
@@ -2620,7 +2634,7 @@ function renderTrip(o, d) {
   const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
   const container = el(`<div></div>`);
   const body = el(`<div></div>`);
-  mainEl.append(toolbar, paxNote, container, body);
+  mainEl.append(toolbar, paxNote, container, body, calReleaseNote());
 
   let mask = 0, firstDraw = true, chipsEl = null;
 
