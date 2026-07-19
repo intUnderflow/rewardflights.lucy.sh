@@ -108,6 +108,13 @@ body.modal-open { overflow: hidden; }
   font-size: 15px; letter-spacing: .04em; text-transform: uppercase;
 }
 .wordmark b { font-weight: inherit; color: var(--gold); }
+.wordmark .byline {
+  font-family: var(--font-ui); font-size: 10.5px; font-weight: 400;
+  letter-spacing: .01em; text-transform: none; color: var(--ink-3);
+  white-space: nowrap; margin-left: -3px; align-self: center;
+}
+/* Keep the header uncluttered on small phones where space is tight. */
+@media (max-width: 420px) { .wordmark .byline { display: none; } }
 .mk-m { fill: var(--cab-m); } .mk-w { fill: var(--cab-w); }
 .mk-c { fill: var(--cab-c); } .mk-f { fill: var(--cab-f); }
 .freshness { font-family: var(--font-data); font-size: 12px; color: var(--ink-2); }
@@ -561,6 +568,7 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .alert-when {
   grid-column: 1 / -1; font-family: var(--font-data); font-size: 11.5px; color: var(--ink-2);
 }
+.alert-when .aw-cabins { color: var(--ink); font-weight: 700; }
 .alert-state { grid-column: 1 / -1; font-size: 12px; display: flex; gap: 12px; flex-wrap: wrap; }
 .as-ok { color: var(--cab-w); }
 .as-new { color: var(--gold); font-weight: 700; }
@@ -624,11 +632,17 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .day.unreleased {
   background:
     repeating-linear-gradient(-45deg,
-      transparent 0 4px,
-      color-mix(in srgb, var(--ink-3) 16%, transparent) 4px 5px),
+      transparent 0 5px,
+      color-mix(in srgb, var(--ink-3) 42%, transparent) 5px 8px),
     var(--cell-empty);
 }
-.day.unreleased .num { color: var(--ink-3); opacity: .75; }
+.day.unreleased .num { color: var(--ink-3); opacity: .8; }
+/* Caption under a boundary month whose tail is unreleased — the hatched cells
+   need an explanation when this is the last month shown (no card follows). */
+.month-unrel-inline {
+  margin: 12px 0 0; padding-top: 11px; border-top: 1px solid var(--line);
+  font-size: 11.5px; color: var(--ink-3); line-height: 1.5;
+}
 /* day/pair panel per-cabin party annotations */
 .dp-cab-pax, .pp-row-pax, .pp-cta-pax { display: inline-block; margin-left: 8px; font-family: var(--font-data); font-size: 10.5px; color: var(--ink-3); }
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }

@@ -1619,7 +1619,9 @@ function alertRow(w, data, rerender, { editable = false, seen = null } = {}) {
       ${editable ? `<a class="alert-edit" href="${href}?alert=1">Edit</a>` : ""}
       <button type="button" class="alert-off" aria-label="Turn off alerts for ${o} to ${d}">Turn off</button>
     </span>
-    <span class="alert-when">${esc(watchSummary(w))}</span>
+    <span class="alert-when"><span class="aw-cabins">${
+      cabs.length === cabinLegend().length ? "All cabins" : esc(cabs.map(cabinLabel).join(", "))
+    }</span> · ${esc(watchSummary(w))}</span>
     <span class="alert-state">${problem
       ? `<span class="as-warn">⚠ ${esc(problem)}</span>`
       : fresh && fresh.count && fresh.everSeen
@@ -2506,6 +2508,14 @@ function unreleasedDayCell(dnum, idx) {
       title="Not released yet — BA opens award seats about 355 days ahead">
     <span class="num">${dnum}</span></span>`);
 }
+/* Caption for a month that STRADDLES the horizon: it renders a grid (so the
+   hatched cells alone would have no explanation on this, the last month), so
+   spell it out. idx is the first unreleased day of the month. */
+function unreleasedCaptionEl(idx) {
+  const d = dayDate(idx);
+  return el(`<p class="month-unrel-inline">Dates from ${d.getUTCDate()} ${fmtMonthShort.format(d)}
+    aren't released yet — BA opens award seats about 355 days ahead. Set an alert to hear when they open.</p>`);
+}
 
 function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
   const first = utcDate(mo.y, mo.m, 1);
@@ -2579,6 +2589,7 @@ function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
     grid.append(cell);
   }
   $(".mc", box).textContent = `${monthDays}d`;
+  if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
   return box;
 }
 
@@ -2897,6 +2908,7 @@ function renderTrip(o, d) {
       grid.append(cell);
     }
     $(".mc", box).textContent = `${monthDays}d`;
+    if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
     return box;
   }
 
