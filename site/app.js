@@ -1778,7 +1778,7 @@ function cabinChips(perCabin, onChange, chipTitle) {
 
 const NIGHTS_DEFAULT = [1, 30];
 const NIGHTS_PRESETS = [
-  ["Weekend", 2, 4],
+  ["Short break", 2, 4],
   ["1 week", 5, 9],
   ["2 weeks", 10, 16],
   ["Flexible", 1, 30],
