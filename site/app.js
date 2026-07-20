@@ -1978,9 +1978,9 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     // Seed from the existing watch if there is one; otherwise from what the
     // user has already told this page (cabin filter + trip length + picked day).
     const seedMask = mine ? watchMask(mine) : (defaultMask || 15);
-    const nights = mine?.nights
+    let nights = mine?.nights
       ? [mine.nights.min, mine.nights.max]
-      : (kind === "rt" ? (ctx.nights || NIGHTS_ANY) : null);
+      : (kind === "rt" ? (ctx.nights || NIGHTS_ANY).slice() : null);
     let mode = mine?.out ? "exact" : (ctx.pickedOut && !mine ? "around" : "any");
     if (mine?.out && ctx.pickedOut && !mine.ret) mode = "exact";
     let flex = 7;
@@ -2023,6 +2023,12 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       $(".bell-cabs", cabs).append(row);
     }
     pop.append(cabs);
+
+    /* --- trip length (round trips) --- The return is derived from this, so
+       showing it here answers "where did the N nights come from?" and lets
+       the user change it for the watch (seeded from the page, not written
+       back to it). --- */
+    if (kind === "rt") pop.append(bellNightsControl());
 
     /* --- travelling as (party size) --- */
     if (partyRowShown) {
@@ -2137,6 +2143,53 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         });
       }
       drawReturnNote();
+    }
+
+    /* Trip-length control inside the bell — the return everywhere (any-time
+       pairing, the exact-dates derived note) hangs off this, so it belongs
+       with the watch, not only on the page. Class-scoped inputs (not the
+       page control's np-min/np-max ids). Watch-scoped: it seeds from the page
+       but doesn't write the URL/pref back. */
+    function bellNightsControl() {
+      const wrap = el(`<div class="bell-sec bell-nights"><h3>Trip length</h3>
+        <div class="nights-ctl" role="group" aria-label="Trip length in nights">
+          ${NIGHTS_PRESETS.map(([label, lo, hi]) =>
+            `<button type="button" class="np" data-lo="${lo}" data-hi="${hi}" aria-pressed="false">
+               ${esc(label)} <span class="np-r">${lo}–${hi}</span></button>`).join("")}
+          <span class="np-custom">
+            <input type="number" class="bnp-min" inputmode="numeric" min="1" max="60" aria-label="Minimum nights">
+            <span aria-hidden="true">–</span>
+            <input type="number" class="bnp-max" inputmode="numeric" min="1" max="60" aria-label="Maximum nights">
+            <span class="np-unit">nights</span>
+          </span>
+        </div></div>`);
+      const minIn = $(".bnp-min", wrap), maxIn = $(".bnp-max", wrap);
+      const sync = () => {
+        for (const b of wrap.querySelectorAll(".np")) {
+          b.setAttribute("aria-pressed",
+            Number(b.dataset.lo) === nights[0] && Number(b.dataset.hi) === nights[1] ? "true" : "false");
+        }
+        minIn.value = nights[0]; maxIn.value = nights[1];
+      };
+      const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+      const apply = (lo, hi) => {
+        nights = [lo, hi];
+        sync();
+        drawReturnNote(); // exact-mode derived return depends on nights
+        recount();        // and so does the live match count
+      };
+      const fromInputs = (which) => {
+        let lo = clamp(Math.round(Number(minIn.value)) || nights[0], 1, 60);
+        let hi = clamp(Math.round(Number(maxIn.value)) || nights[1], 1, 60);
+        if (lo > hi) { if (which === "min") hi = lo; else lo = hi; }
+        apply(lo, hi);
+      };
+      wrap.querySelectorAll(".np").forEach((bb) =>
+        bb.addEventListener("click", () => apply(Number(bb.dataset.lo), Number(bb.dataset.hi))));
+      minIn.addEventListener("change", () => fromInputs("min"));
+      maxIn.addEventListener("change", () => fromInputs("max"));
+      sync();
+      return wrap;
     }
 
     /* The return is DERIVED, not entered: you set the leave window and the
