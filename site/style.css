@@ -364,6 +364,12 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .bell-hint { margin: 9px 0 0; font-size: 11.5px; color: var(--ink-3); line-height: 1.45; }
 .bell-derived { margin: 9px 0 0; color: var(--ink-2); font-family: var(--font-data); font-size: 11.5px; }
 .bell-dates { display: grid; gap: 12px; }
+/* Derived return window (leave dates + trip length -> latest return). */
+.bell-return-note {
+  margin: 0; padding: 10px 12px; border-radius: 8px;
+  background: var(--panel-2); font-size: 11.5px; color: var(--ink-3); line-height: 1.5;
+}
+.bell-return-note .brn-lead { display: block; color: var(--ink); font-weight: 700; margin-bottom: 2px; }
 .bell-dates label { display: block; font-size: 12px; color: var(--ink-2); }
 .bell-dates label span { display: flex; gap: 6px; margin-top: 5px; }
 .bell-dates input[type="date"] {

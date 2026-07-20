@@ -544,6 +544,9 @@ function watchProblem(w) {
         (w.kind === "rt" && !store.seatRoutes.has(reverseRoute(w.route))))) {
     return `This route has no seat-count data yet, so an alert for ${w.minSeats}${w.minSeats === 4 ? "+" : ""} seats together can never fire.`;
   }
+  if (w.out?.from && w.out?.to && isoToIdx(w.out.from) > isoToIdx(w.out.to)) {
+    return "Your leave window starts after it ends.";
+  }
   if (w.out?.to && isoToIdx(w.out.to) < t0) return "These dates have passed.";
   if (w.kind === "rt" && w.out && w.ret) {
     const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
@@ -1983,7 +1986,6 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     let flex = 7;
     let lead = mine?.leadDays || 0;   // "any time, but N days' notice" (rolling)
     let outFrom = mine?.out?.from || "", outTo = mine?.out?.to || "";
-    let retFrom = mine?.ret?.from || "", retTo = mine?.ret?.to || "";
     // Party size. The row renders only when this ROUTE can answer "does a
     // party of N fit?" (both legs for a round trip) — a control that can
     // never fire is a broken promise — or when an existing watch already
@@ -2125,20 +2127,33 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
           <span><input type="date" class="bd-of" min="${minIso}" max="${maxIso}" value="${esc(outFrom || defaultOut()[0])}">
           <input type="date" class="bd-ot" min="${minIso}" max="${maxIso}" value="${esc(outTo || defaultOut()[1])}"></span>
         </label>
-        ${kind === "rt" ? `<label>Come back between
-          <span><input type="date" class="bd-rf" min="${minIso}" max="${maxIso}" value="${esc(retFrom || "")}">
-          <input type="date" class="bd-rt" min="${minIso}" max="${maxIso}" value="${esc(retTo || "")}"></span>
-        </label>
-        <p class="bell-hint">Leave the return blank and we'll work it out from your trip length${
-          nights ? ` (${nights[0]}–${nights[1]} nights)` : ""}.</p>` : ""}
+        ${kind === "rt" ? `<p class="bell-return-note" role="status"></p>` : ""}
       </div>`));
       for (const i of whenBody.querySelectorAll("input")) {
         i.addEventListener("input", () => {
           outFrom = $(".bd-of", whenBody).value; outTo = $(".bd-ot", whenBody).value;
-          if (kind === "rt") { retFrom = $(".bd-rf", whenBody)?.value || ""; retTo = $(".bd-rt", whenBody)?.value || ""; }
+          drawReturnNote();
           recount();
         });
       }
+      drawReturnNote();
+    }
+
+    /* The return is DERIVED, not entered: you set the leave window and the
+       trip length (nights), so we show the resulting return window — with the
+       latest possible return called out — for a calendar sanity-check. */
+    function drawReturnNote() {
+      const note = $(".bell-return-note", whenBody);
+      if (!note) return;
+      const [minN, maxN] = nights || NIGHTS_ANY;
+      const of = outFrom || defaultOut()[0], ot = outTo || defaultOut()[1];
+      const ofi = isoToIdx(of), oti = isoToIdx(ot);
+      if (!Number.isInteger(ofi) || !Number.isInteger(oti) || oti < ofi) { note.textContent = ""; return; }
+      const earliest = idxToIso(ofi + minN), latest = idxToIso(oti + maxN);
+      const tripLen = minN === maxN ? `${minN}-night` : `${minN}–${maxN} night`;
+      note.innerHTML = `<b class="brn-lead">Home by ${esc(fmtRange(latest, latest))} at the latest.</b>
+        You'd return between ${esc(fmtRange(earliest, earliest))} and ${esc(fmtRange(latest, latest))}
+        (${tripLen} trips) — worth a check against your calendar.`;
     }
 
     function defaultOut() {
@@ -2193,16 +2208,10 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       } else if (mode === "exact") {
         const [df, dt] = defaultOut();
         w.out = { from: outFrom || df, to: outTo || dt };
-        if (kind === "rt" && (retFrom || retTo)) {
-          // When one return field is filled and the other is auto-derived,
-          // derive it from the outbound + nights WITHOUT clamping to the
-          // horizon — an exact-date watch can lie entirely beyond it, and a
-          // clamp would drag the return before the outbound (infeasible).
-          w.ret = {
-            from: retFrom || idxToIso(isoToIdx(w.out.from) + w.nights.min),
-            to: retTo || idxToIso(isoToIdx(w.out.to) + w.nights.max),
-          };
-        }
+        // The return is IMPLIED by the outbound window + trip length (nights)
+        // — never a separate input. w.ret stays unset; the engine pairs each
+        // outbound day D with returns in [D+minNights, D+maxNights], and the
+        // panel shows the user the derived latest return to check.
       }
       return w;
     }
