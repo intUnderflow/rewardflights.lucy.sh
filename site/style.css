@@ -108,10 +108,14 @@ body.modal-open { overflow: hidden; }
   font-size: 15px; letter-spacing: .04em; text-transform: uppercase;
 }
 .wordmark b { font-weight: inherit; color: var(--gold); }
+/* Two-line lockup: the byline sits UNDER the wordmark, so it adds height, not
+   width — it can't crowd the Alerts pill even on a narrow phone. */
+.wm-text { display: flex; flex-direction: column; }
+.wm-name { line-height: 1; }
 .wordmark .byline {
   font-family: var(--font-ui); font-size: 10.5px; font-weight: 400;
   letter-spacing: .01em; text-transform: none; color: var(--ink-3);
-  white-space: nowrap; margin-left: -3px; align-self: center;
+  white-space: nowrap; line-height: 1.1; margin-top: 2px;
 }
 .mk-m { fill: var(--cab-m); } .mk-w { fill: var(--cab-w); }
 .mk-c { fill: var(--cab-c); } .mk-f { fill: var(--cab-f); }
@@ -494,9 +498,9 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 @media (max-width: 560px) {
   .alerts-link { padding: 4px 8px; }
   .topbar-right { gap: 10px; }
-  /* Phone header: shed the two lowest-priority bits so the wordmark, Alerts
-     and a one-line timestamp all fit without wrapping. */
-  .wordmark .byline { display: none; }
+  /* Phone header: the byline now sits UNDER the wordmark (adds height, not
+     width), so it stays; just shed the "data as of" prefix and shrink the
+     timestamp so wordmark + Alerts + one-line timestamp still fit. */
   .freshness .fr-prefix { display: none; }
   .freshness { font-size: 11px; }
 }
