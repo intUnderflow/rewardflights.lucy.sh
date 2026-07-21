@@ -973,6 +973,107 @@ function roundTripBits(outKey, retKey, mask, minNights, maxNights, pax = 1) {
   return round;
 }
 
+/* ---------------- multi-city chain engine ----------------
+   Foundation for spoke-city planning (e.g. Billund→London→Tokyo): not yet wired
+   to any view. Generalises the round-trip engine from a fixed out/return pair to
+   an N-leg itinerary so a search whose endpoints have no direct route resolves
+   through the London hub instead of coming up empty. See MULTICITY-SPEC.md. */
+
+/* Concrete routings that actually exist in the data for a searched O→D: the
+   direct route first, then any one-stop O→H→D through a hub the graph connects.
+   The route graph is a star around London, so for a spoke city this is
+   O(out-degree) — usually the single path [O, "LON", D]. maxStops caps the
+   number of intermediate hubs; returns [] for O===D. */
+function resolveRoutings(o, d, { maxStops = 1 } = {}) {
+  if (o === d) return [];
+  const dests = (k) => store.destsByOrigin.get(k) || [];
+  const paths = [];
+  if (dests(o).includes(d)) paths.push([o, d]);
+  if (maxStops >= 1) {
+    for (const h of dests(o)) {
+      if (h === o || h === d) continue;
+      if (dests(h).includes(d)) paths.push([o, h, d]);
+    }
+  }
+  return paths;
+}
+
+/* Per-departure-day cabin mask for completing a whole itinerary.
+   path = [A, B, C, …]; every adjacent pair is a route that must exist.
+   gaps = one [min, max] day-window per junction (so path.length - 2 entries):
+   [0, 1] = a same-day-or-overnight connection through the hub, [7, 14] = a
+   stopover of that many nights. So Billund→Tokyo return is ONE call:
+   chainBits(["BLL","LON","TYO","LON","BLL"], mask, [[0,1],[7,14],[0,1]], pax, 1).
+
+   Chain legs are SEPARATE redemptions, so — unlike roundTripBits — the cabin
+   filter must NOT couple the legs: a Billund hop with no Club must never hide
+   a Club long-haul (measured: BLL-LON has 0 premium-economy days while
+   LON-TYO has 112 — same-cabin would return nothing forever). `focus` names
+   the leg the mask applies to (callers default it to the longest leg); every
+   other leg just needs award space in ANY cabin for the same party. The
+   result's bits are the FOCUS leg's cabins, keyed by first-leg departure day.
+   focus = null couples all legs to one cabin (the single-ticket semantics):
+   with path [A,B,A], gaps [[minN,maxN]] that is exactly roundTripBits, which
+   mctest.js cross-checks. Missing leg / bad gaps / bad focus → all zeros.
+   O(legs × days × window); pax>1 thresholds every leg and falls back to
+   presence where a leg has no seats layer, matching the round-trip engine's
+   honest-note contract. Uncached: callers are dormant; wire a cache alongside
+   rtCache (reset in adoptBundle, pax+gaps+focus in the key) when a view
+   adopts this. */
+function chainBits(path, mask, gaps, pax = 1, focus = null) {
+  const days = store.bundle.days;
+  const empty = () => new Uint8Array(days);
+  if (!Array.isArray(path) || path.length < 2) return empty();
+  if (!Array.isArray(gaps) || gaps.length !== path.length - 2) return empty();
+  const nLegs = path.length - 1;
+  if (focus !== null && !(Number.isInteger(focus) && focus >= 0 && focus < nLegs)) return empty();
+  const t0 = Math.max(0, todayIndex());
+  const legBits = (k) => (pax > 1 ? (routeBitsAtLeast(k, pax) ?? routeBits(k)) : routeBits(k));
+  const legs = [];
+  for (let i = 0; i < nLegs; i++) {
+    const key = `${path[i]}-${path[i + 1]}`;
+    if (!store.bundle.routes[key]) return empty();
+    legs.push(legBits(key));
+  }
+  // Backward pass: reach[d] = what legs i..end permit if leg i departs day d.
+  // In focus mode the payload changes shape at the focus leg — legs after it
+  // carry a 15/0 feasibility sentinel, the focus leg stamps its own cabins,
+  // legs before it pass those cabins through untouched. Leg 0 is clamped to
+  // today; inner legs start at 0 (harmless — junctions only move forward).
+  let reach = null;
+  for (let i = nLegs - 1; i >= 0; i--) {
+    const cur = empty(), leg = legs[i], start = i === 0 ? t0 : 0;
+    const gap = i < nLegs - 1 ? gaps[i] : null;
+    const gMin = gap ? Math.max(0, gap[0]) : 0, gMax = gap ? gap[1] : 0;
+    const coupled = focus === null;
+    const own_mask = coupled || i === focus ? mask : 15;
+    // Early-exit ceiling for the window OR: sentinels saturate at 15, focus
+    // cabins at mask.
+    const full = coupled ? 0 : (i + 1 > focus ? 15 : mask & 15);
+    for (let d = start; d < days; d++) {
+      const own = leg[d] & own_mask;
+      if (!own) continue;
+      let v;
+      if (!gap) {
+        v = coupled || i === focus ? own : 15;
+      } else {
+        let acc = 0;
+        const hi = Math.min(days - 1, d + gMax);
+        if (coupled) {
+          for (let n = d + gMin; n <= hi && acc !== own; n++) acc |= reach[n] & own;
+          v = own & acc;
+        } else {
+          for (let n = d + gMin; n <= hi && acc !== full; n++) acc |= reach[n];
+          v = i === focus ? (acc ? own : 0) : i < focus ? acc : (acc ? 15 : 0);
+        }
+      }
+      cur[d] = v;
+    }
+    reach = cur;
+  }
+  return reach;
+}
+
 /* ---------------- boot ---------------- */
 
 const mainEl = $("#main");
