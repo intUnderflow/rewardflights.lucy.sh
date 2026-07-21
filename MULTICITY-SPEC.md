@@ -124,11 +124,15 @@ independent bookings, and the UI should say so.
      untouched — the via path only activates where the empty state used to
      be.
    - "Where can you go" (map + `/from/` list) shows the whole reachable
-     world (`viaDestsFrom`): via destinations render as hollow cabin-colored
-     rings under the solid nonstop dots (and badged cards), counted by the
-     chain engine with the same overnight stops, and click through to the
-     via calendar. chainBits gained the rtCache-style cache this made
-     necessary (the map recounts on every pan frame).
+     world (`viaDestsFrom`): via dots look like every other dot — hovering
+     (or focusing) any dot draws its ROUTE as projected great-circle arcs
+     (`gcRuns`, antimeridian-safe), one arc nonstop or two with a gold ring
+     at the overnight connection (owner call: a permanent translucent
+     treatment read as noise; the routing appears when you ask). List cards
+     badge "via LON". All counts come from the chain engine with the same
+     overnight stops and click through to the via calendar. chainBits
+     gained the rtCache-style cache this made necessary (the map recounts
+     on every pan frame).
 
    *Level 1.5 (cheap follow-on, not built):* when a direct route exists but
    the filtered view is empty, also offer the via-hub alternative —

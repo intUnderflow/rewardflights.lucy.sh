@@ -4567,6 +4567,35 @@ function ne1Raw(l, p) {
     p * (1.007226 + p2 * (0.015085 + p4 * (-0.044475 + 0.028874 * p2 - 0.005916 * p4))),
   ];
 }
+/* Great-circle arc between two [lat, lon], sampled and projected, split into
+   runs where the longitude wraps so an antimeridian crossing never draws a
+   line across the whole map. */
+function gcRuns(g1, g2, steps = 40) {
+  const rad = Math.PI / 180;
+  const vec = ([lat, lon]) =>
+    [Math.cos(lat * rad) * Math.cos(lon * rad), Math.cos(lat * rad) * Math.sin(lon * rad), Math.sin(lat * rad)];
+  const a = vec(g1), b = vec(g2);
+  const w = Math.acos(Math.max(-1, Math.min(1, a[0] * b[0] + a[1] * b[1] + a[2] * b[2])));
+  if (w < 1e-9) return [];
+  const runs = [];
+  let run = [], prevLon = null;
+  for (let i = 0; i <= steps; i++) {
+    const t = i / steps;
+    const s1 = Math.sin((1 - t) * w) / Math.sin(w), s2 = Math.sin(t * w) / Math.sin(w);
+    const x = s1 * a[0] + s2 * b[0], y = s1 * a[1] + s2 * b[1], z = s1 * a[2] + s2 * b[2];
+    const lat = Math.asin(Math.max(-1, Math.min(1, z))) / rad;
+    const lon = Math.atan2(y, x) / rad;
+    if (prevLon !== null && Math.abs(lon - prevLon) > 180) {
+      if (run.length > 1) runs.push(run);
+      run = [];
+    }
+    prevLon = lon;
+    run.push(projectLL(lat, lon));
+  }
+  if (run.length > 1) runs.push(run);
+  return runs;
+}
+
 function projectLL(lat, lon) {
   const W = window.WORLD1, r = Math.PI / 180;
   const [x, y] = ne1Raw(lon * r, lat * r);
@@ -4711,9 +4740,9 @@ function renderMap(o) {
     <div class="map-loading"><div class="sk-line" style="height:200px"></div></div>
   </div>`);
   mainEl.append(panel, el(`<p class="map-legend">Dot colour is the best cabin
-    available; dot size is how many days have round trips. Hollow dots connect
-    with one overnight stop (the cabin applies to the long legs). Drag to pan,
-    scroll or pinch to zoom.</p>`));
+    available; dot size is how many days have round trips. Hover a dot to see
+    its route — one-stop journeys show their overnight connection. Drag to
+    pan, scroll or pinch to zoom.</p>`));
 
   loadWorld().then(() => {
     if (current.page !== "map" || current.params.o !== o) return; // navigated away
@@ -4762,6 +4791,7 @@ function renderMap(o) {
         aria-label="World map of destinations from ${esc(placeName(o))}">
       <path class="map-sea" d="${W.sphere}"></path>
       <path class="map-land" d="${W.land}"></path>
+      <g class="map-paths" aria-hidden="true"></g>
       <g class="map-dots"></g>
     </svg>`);
     const tip = el(`<div class="tip map-tip" hidden></div>`);
@@ -4801,7 +4831,7 @@ function renderMap(o) {
         const [x, y] = projectLL(g[0], g[1]);
         // Radius grows with the square root of match-days so area ~ days.
         const r = (2.1 + Math.sqrt(days) * 0.38) / kOf();
-        (spot.via ? viaParts : parts).push(`<circle class="map-dot ${bitClass(best)}${unverified ? " map-dot-unv" : ""}${spot.via ? " map-dot-via" : ""}" cx="${x}" cy="${y}" r="${r}"${spot.via ? ` stroke-width="${1.1 / kOf()}"` : ""}
+        (spot.via ? viaParts : parts).push(`<circle class="map-dot ${bitClass(best)}${unverified ? " map-dot-unv" : ""}${spot.via ? " map-dot-via" : ""}" cx="${x}" cy="${y}" r="${r}"
           tabindex="0" role="link" data-code="${d}" data-days="${days}" data-best="${best}"${unverified ? ` data-unv="1"` : ""}${spot.via ? ` data-via="${spot.via}"` : ""}
           aria-label="${esc(placeName(d))}: ${days} day${days > 1 ? "s" : ""} with round trips${spot.via ? ` via ${esc(placeName(spot.via))} (overnight stop)` : ""}${
             pax > 1 ? (unverified ? " — seat counts pending, shown for any party" : ` for ${pax} travelling together`) : ""} — open calendar"></circle>`);
@@ -4809,6 +4839,7 @@ function renderMap(o) {
       // Paint order (SVG: later wins): via dots underneath, nonstop dots
       // above them, the origin marker on top.
       dotsG.innerHTML = viaParts.join("") + parts.join("") + originDot;
+      pathsG.innerHTML = ""; // hover state doesn't survive a redraw
       const monthLabel = monthIdx >= 0 ? ` in ${next12Months()[monthIdx].label}` : "";
       const nightsLabel = nights[0] === NIGHTS_DEFAULT[0] && nights[1] === NIGHTS_DEFAULT[1]
         ? "" : ` of ${nights[0]}–${nights[1]} nights`;
@@ -4836,10 +4867,37 @@ function renderMap(o) {
       tip.style.left = `${x}px`;
       tip.style.top = `${above > 4 ? above : dr.bottom - pr.top + 8}px`;
     }
-    dotsG.addEventListener("pointerover", (e) => { const d = e.target.closest(".map-dot"); if (d) showMapTip(d); });
-    dotsG.addEventListener("pointerout", () => { tip.hidden = true; });
-    dotsG.addEventListener("focusin", (e) => { const d = e.target.closest(".map-dot"); if (d) showMapTip(d); });
-    dotsG.addEventListener("focusout", () => { tip.hidden = true; });
+    /* Hovering (or focusing) a dot draws its route: one great-circle arc
+       nonstop, two arcs with a ringed connection point for a via journey —
+       the routing appears exactly when you ask about a destination, instead
+       of a permanent visual treatment on the dot. */
+    const pathsG = $(".map-paths", svg);
+    function showPath(dot) {
+      hidePath();
+      if (!og) return;
+      const dg = store.bundle.places[dot.dataset.code]?.g;
+      if (!dg) return;
+      const cab = bitClass(Number(dot.dataset.best));
+      const hubG = dot.dataset.via ? store.bundle.places[dot.dataset.via]?.g : null;
+      const segs = hubG ? [[og, hubG], [hubG, dg]] : [[og, dg]];
+      const w = 1.3 / kOf();
+      let html = "";
+      for (const [a, b] of segs) {
+        for (const run of gcRuns(a, b)) {
+          html += `<polyline class="map-path ${cab}" stroke-width="${w}" points="${run.map(([x, y]) => `${x},${y}`).join(" ")}"></polyline>`;
+        }
+      }
+      if (hubG) {
+        const [hx, hy] = projectLL(hubG[0], hubG[1]);
+        html += `<circle class="map-path-hub" cx="${hx}" cy="${hy}" r="${2.6 / kOf()}" stroke-width="${w}"></circle>`;
+      }
+      pathsG.innerHTML = html;
+    }
+    function hidePath() { pathsG.innerHTML = ""; }
+    dotsG.addEventListener("pointerover", (e) => { const d = e.target.closest(".map-dot"); if (d) { showMapTip(d); showPath(d); } });
+    dotsG.addEventListener("pointerout", () => { tip.hidden = true; hidePath(); });
+    dotsG.addEventListener("focusin", (e) => { const d = e.target.closest(".map-dot"); if (d) { showMapTip(d); showPath(d); } });
+    dotsG.addEventListener("focusout", () => { tip.hidden = true; hidePath(); });
     /* A click that wobbles across two overlapping dots presses on one and
        releases on the other, so the browser fires the click on their common
        ancestor (the group) — the dot the press started on is the intent. */

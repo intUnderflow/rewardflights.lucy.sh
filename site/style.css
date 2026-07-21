@@ -661,11 +661,12 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }
 /* map: pair lacks seat data at pax >= 2 — shown at any-party, cued hollow-ish */
 .map-dot-unv { fill-opacity: .45; stroke-dasharray: 2 1.4; }
-/* Via (one-stop) destinations: hollow — the fill drops out, the cabin colour
-   moves to the ring, so nonstop dots stay visually primary at any zoom. */
-.map-dot-via { fill-opacity: .18; stroke: currentColor; }
-.map-dot-via.cab-m { color: var(--cab-m); } .map-dot-via.cab-w { color: var(--cab-w); }
-.map-dot-via.cab-c { color: var(--cab-c); } .map-dot-via.cab-f { color: var(--cab-f); }
+/* Hovered route: great-circle arc(s) in the dot's cabin colour, the overnight
+   connection ringed in brand gold. Never interactive — dots own the pointer. */
+.map-path { fill: none; stroke-linecap: round; opacity: .85; pointer-events: none; }
+.map-path.cab-m { stroke: var(--cab-m); } .map-path.cab-w { stroke: var(--cab-w); }
+.map-path.cab-c { stroke: var(--cab-c); } .map-path.cab-f { stroke: var(--cab-f); }
+.map-path-hub { fill: var(--surface); stroke: var(--gold); pointer-events: none; }
 .dc-badge.dc-via { color: var(--gold); border-color: var(--gold); }
 
 /* year strip — 12 months at a glance */
