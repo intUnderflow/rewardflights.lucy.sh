@@ -4446,28 +4446,58 @@ function renderFrom(o) {
 
   mainEl.innerHTML = "";
   const dests = (store.destsByOrigin.get(o) || []).slice();
-  const vias = viaDestsFrom(o);
+  const allVias = viaDestsFrom(o);
+  // Maximum stops: 0 = nonstop only, 1 (default) = everything. URL-borne and
+  // carried across the List/Map toggle, mirroring the map's control.
+  const stops = new URLSearchParams(location.search).get("stops") === "0" ? 0 : 1;
+  const vias = stops ? allVias : new Map();
   // The list respects an active party size (URL → pref → 1) so its counts
   // agree with the map and the calendars behind the cards. Routes without
   // seat data keep any-party counts, with the honest note below.
   const pax = activePax();
   const conn = getConnPref() ?? 1; // the calendar behind a via card reads the same pref
+  const mapQS = [pax > 1 ? `pax=${pax}` : "", stops === 0 ? "stops=0" : ""].filter(Boolean).join("&");
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
     <div class="view-toggle" role="group" aria-label="View">
-      <span class="vt-on" aria-current="page">List</span><a href="/map/${o}${pax > 1 ? `?pax=${pax}` : ""}">Map</a>
+      <span class="vt-on" aria-current="page">List</span><a href="/map/${o}${mapQS ? `?${mapQS}` : ""}">Map</a>
     </div>
-    <p class="page-sub">${dests.length + vias.size} destinations with award seats in the next year${
-      vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}.
+    <p class="page-sub">${dests.length + vias.size} destination${dests.length + vias.size === 1 ? "" : "s"} with award seats in the next year${
+      vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}${
+      !stops && allVias.size ? ` (nonstop only — ${allVias.size} more with one stop)` : ""}.
       Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).</p>
+    <div class="nights-ctl stops-ctl" role="group" aria-label="Maximum stops">
+      <span class="nc-label">Stops</span>
+      <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
+      <button type="button" class="np" data-stops="1" aria-pressed="${stops === 1}">≤1 stop</button>
+    </div>
     ${pax > 1 ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
   </div>`));
 
-  if (!dests.length && !vias.size) {
+  mainEl.querySelectorAll(".stops-ctl .np").forEach((b) => b.addEventListener("click", () => {
+    const u = new URL(location.href);
+    if (Number(b.dataset.stops) === 1) u.searchParams.delete("stops");
+    else u.searchParams.set("stops", "0");
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+    route(); // rebuild the list under the new scope
+  }));
+
+  if (!dests.length && !allVias.size) {
     mainEl.append(el(`<div class="empty-state">
       <div class="big">No destinations right now.</div>
       <p>No award seats from ${esc(placeName(o))} in the current data.</p></div>`));
+    return;
+  }
+
+  if (!dests.length && !vias.size) {
+    // Everything reachable needs a stop, and the filter hides those.
+    mainEl.append(el(`<div class="empty-state">
+      <div class="big">No nonstop destinations.</div>
+      <p>${allVias.size} destination${allVias.size > 1 ? "s are" : " is"} reachable with one overnight stop.</p>
+      <p><a class="btn" href="/from/${o}">Show 1-stop journeys</a></p>
+    </div>`));
     return;
   }
 
@@ -4613,12 +4643,16 @@ function renderMap(o) {
   // nonstop option must never be buried under its one-stop neighbours.
   const spots = dests.map((d) => ({ d, via: null, both: true }))
     .concat([...vias].map(([d, { hub, both }]) => ({ d, via: hub, both })));
+  // Maximum stops: 0 = nonstop only, 1 (default) = the whole reachable world.
+  // URL-borne (no session pref — it's a per-exploration scope, like month)
+  // and carried across the List/Map toggle so switching views keeps it.
+  let stops = new URLSearchParams(location.search).get("stops") === "0" ? 0 : 1;
   mainEl.innerHTML = "";
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Where can you go from ${esc(placeName(o))}?</h1>
     <div class="view-toggle" role="group" aria-label="View">
-      <a href="/from/${o}">List</a><span class="vt-on" aria-current="page">Map</span>
+      <a href="/from/${o}${stops === 0 ? "?stops=0" : ""}">List</a><span class="vt-on" aria-current="page">Map</span>
     </div>
     <p class="page-sub">Every dot is a destination with bookable round trips —
       tap one for its calendar.</p>
@@ -4674,6 +4708,11 @@ function renderMap(o) {
           `<option value="${i}"${i === monthIdx ? " selected" : ""}>${esc(mo.label)}</option>`).join("")}
       </select>
     </label>
+    <div class="nights-ctl stops-ctl" role="group" aria-label="Maximum stops">
+      <span class="nc-label">Stops</span>
+      <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
+      <button type="button" class="np" data-stops="1" aria-pressed="${stops === 1}">≤1 stop</button>
+    </div>
     <div class="nights-ctl" role="group" aria-label="Trip length in nights">
       <span class="nc-label">Trip length</span>
       ${NIGHTS_PRESETS.map(([label, lo, hi]) =>
@@ -4819,7 +4858,9 @@ function renderMap(o) {
       }
       let unverifiedShown = 0, viaShown = 0;
       const viaParts = [];
+      const poolSize = stops ? spots.length : spots.length - vias.size;
       for (const spot of spots) {
+        if (!stops && spot.via) continue;
         const d = spot.d;
         const g = store.bundle.places[d]?.g;
         const { days, best, unverified } = metric(spot);
@@ -4845,7 +4886,8 @@ function renderMap(o) {
         ? "" : ` of ${nights[0]}–${nights[1]} nights`;
       const paxLabel = pax > 1 ? ` for ${pax} travelling together` : "";
       $(".map-count", controls).textContent =
-        `${shown} of ${spots.length} destinations have round trips${paxLabel}${nightsLabel}${monthLabel} in the cabins you picked` +
+        `${shown} of ${poolSize} destination${poolSize === 1 ? " has" : "s have"} round trips${paxLabel}${nightsLabel}${monthLabel} in the cabins you picked` +
+        (!stops && vias.size ? ` (nonstop only — ${vias.size} more with one stop)` : "") +
         (viaShown ? ` — ${viaShown} with an overnight stop` : "") +
         (unverifiedShown ? ` (${unverifiedShown} shown for any party — seat counts pending)` : "") +
         (unplaced ? ` (${unplaced} more can't be placed on the map yet — see the list)` : "") + ".";
@@ -5059,6 +5101,16 @@ function renderMap(o) {
       history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
       redraw();
     });
+    controls.querySelectorAll(".stops-ctl .np").forEach((b) => b.addEventListener("click", () => {
+      stops = Number(b.dataset.stops);
+      controls.querySelectorAll(".stops-ctl .np").forEach((x) =>
+        x.setAttribute("aria-pressed", String(Number(x.dataset.stops) === stops)));
+      const u = new URL(location.href);
+      if (stops === 1) u.searchParams.delete("stops"); else u.searchParams.set("stops", "0");
+      const q = u.searchParams.toString();
+      history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+      redraw();
+    }));
     onNightsChange = redraw;
     onPaxChange = redraw;
 

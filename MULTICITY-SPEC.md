@@ -130,8 +130,11 @@ independent bookings, and the UI should say so.
      at the overnight connection, while every dot OFF the route dims so the
      arcs read through dense clusters (owner calls: a permanent translucent
      treatment read as noise; the routing appears when you ask). List cards
-     badge "via LON". All counts come from the chain engine with the same
-     overnight stops and click through to the via calendar. chainBits
+     badge "via LON". A maximum-stops filter (Nonstop / ≤1 stop, `?stops=`,
+     default ≤1, carried across the List↔Map toggle) scopes both views; the
+     count line names what a Nonstop scope hides. All counts come from the
+     chain engine with the same overnight stops and click through to the
+     via calendar. chainBits
      gained the rtCache-style cache this made necessary (the map recounts
      on every pan frame).
 
