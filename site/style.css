@@ -829,6 +829,20 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .pp-oneways { margin: 10px 0 0; font-size: 12.5px; color: var(--ink-2); }
 .pp-oneways a { font-weight: 700; }
 
+/* via trips (one-stop multi-city) */
+.via-badge { display: inline-block; vertical-align: middle; margin-left: 10px; padding: 4px 10px;
+  border: 1px solid var(--gold); border-radius: 999px; color: var(--gold);
+  font: 700 11px/1 var(--font-data); letter-spacing: .06em; text-transform: uppercase; white-space: nowrap; }
+.pp-legs { display: flex; flex-direction: column; gap: 7px; margin: 0 0 14px; }
+.pp-leg { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
+  border: 1px solid var(--line); border-radius: 8px; }
+.pp-leg-route { font-family: var(--font-data); font-weight: 700; font-size: 12.5px; flex: none; }
+.pp-leg-date { font-size: 13px; font-weight: 700; flex: 1; }
+.pp-leg-date small { font-family: var(--font-data); font-weight: 400; font-size: 10.5px; color: var(--ink-3); }
+.pp-leg-go { font-family: var(--font-data); font-size: 12px; font-weight: 700; color: var(--gold); text-decoration: none; white-space: nowrap; }
+.pp-leg-go:hover { text-decoration: underline; }
+.vp-lh { margin: 0 0 14px; }
+
 /* ---------- explore (/from/XXX) ---------- */
 .dest-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(230px, 1fr)); gap: 14px; margin-top: 26px; }
 .dest-card {

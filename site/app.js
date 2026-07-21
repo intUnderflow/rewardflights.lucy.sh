@@ -1006,27 +1006,29 @@ function resolveRoutings(o, d, { maxStops = 1 } = {}) {
    chainBits(["BLL","LON","TYO","LON","BLL"], mask, [[0,1],[7,14],[0,1]], pax, 1).
 
    Chain legs are SEPARATE redemptions, so — unlike roundTripBits — the cabin
-   filter must NOT couple the legs: a Billund hop with no Club must never hide
-   a Club long-haul (measured: BLL-LON has 0 premium-economy days while
-   LON-TYO has 112 — same-cabin would return nothing forever). `focus` names
-   the leg the mask applies to (callers default it to the longest leg); every
-   other leg just needs award space in ANY cabin for the same party. The
-   result's bits are the FOCUS leg's cabins, keyed by first-leg departure day.
-   focus = null couples all legs to one cabin (the single-ticket semantics):
-   with path [A,B,A], gaps [[minN,maxN]] that is exactly roundTripBits, which
-   mctest.js cross-checks. Missing leg / bad gaps / bad focus → all zeros.
-   O(legs × days × window); pax>1 thresholds every leg and falls back to
-   presence where a leg has no seats layer, matching the round-trip engine's
-   honest-note contract. Uncached: callers are dormant; wire a cache alongside
-   rtCache (reset in adoptBundle, pax+gaps+focus in the key) when a view
-   adopts this. */
+   filter must NOT couple every leg: a Billund hop with no Club must never
+   hide a Club long-haul (measured: BLL-LON has 0 premium-economy days while
+   LON-TYO has 112 — all-legs-coupled would return nothing forever). `focus`
+   is the ARRAY of leg indices the mask applies to — the long-haul legs
+   (callers use focusLegs) — and those legs are coupled to one shared cabin
+   (a "Club" trip means Club on both long legs); every other leg just needs
+   award space in ANY cabin for the same party. The result's bits are the
+   focus legs' shared cabins, keyed by first-leg departure day. focus = null
+   couples ALL legs (the single-ticket semantics): with path [A,B,A], gaps
+   [[minN,maxN]] that is exactly roundTripBits, which mctest.js cross-checks.
+   Missing leg / bad gaps / bad focus → all zeros. O(legs × days × window);
+   pax>1 thresholds every leg and falls back to presence where a leg has no
+   seats layer, matching the round-trip engine's honest-note contract.
+   Uncached — cheap enough to recompute per draw (O(days × window) per call);
+   revisit alongside rtCache only if profiling ever says so. */
 function chainBits(path, mask, gaps, pax = 1, focus = null) {
   const days = store.bundle.days;
   const empty = () => new Uint8Array(days);
   if (!Array.isArray(path) || path.length < 2) return empty();
   if (!Array.isArray(gaps) || gaps.length !== path.length - 2) return empty();
   const nLegs = path.length - 1;
-  if (focus !== null && !(Number.isInteger(focus) && focus >= 0 && focus < nLegs)) return empty();
+  if (focus !== null && !(Array.isArray(focus) && focus.length &&
+      focus.every((f) => Number.isInteger(f) && f >= 0 && f < nLegs))) return empty();
   const t0 = Math.max(0, todayIndex());
   const legBits = (k) => (pax > 1 ? (routeBitsAtLeast(k, pax) ?? routeBits(k)) : routeBits(k));
   const legs = [];
@@ -1035,43 +1037,92 @@ function chainBits(path, mask, gaps, pax = 1, focus = null) {
     if (!store.bundle.routes[key]) return empty();
     legs.push(legBits(key));
   }
-  // Backward pass: reach[d] = what legs i..end permit if leg i departs day d.
-  // In focus mode the payload changes shape at the focus leg — legs after it
-  // carry a 15/0 feasibility sentinel, the focus leg stamps its own cabins,
-  // legs before it pass those cabins through untouched. Leg 0 is clamped to
-  // today; inner legs start at 0 (harmless — junctions only move forward).
+  // Backward pass: reach[d] = the focus cabins legs i..end can still complete
+  // if leg i departs day d. One rule covers every leg: a focus leg ANDs its
+  // own masked cabins into the payload; a non-focus leg gates on any-space
+  // and passes the payload through untouched (seeded at 15 = "every cabin
+  // still possible" when no focus leg follows). Leg 0 is clamped to today;
+  // inner legs start at 0 (harmless — junctions only move forward).
   let reach = null;
   for (let i = nLegs - 1; i >= 0; i--) {
     const cur = empty(), leg = legs[i], start = i === 0 ? t0 : 0;
     const gap = i < nLegs - 1 ? gaps[i] : null;
     const gMin = gap ? Math.max(0, gap[0]) : 0, gMax = gap ? gap[1] : 0;
-    const coupled = focus === null;
-    const own_mask = coupled || i === focus ? mask : 15;
-    // Early-exit ceiling for the window OR: sentinels saturate at 15, focus
-    // cabins at mask.
-    const full = coupled ? 0 : (i + 1 > focus ? 15 : mask & 15);
+    const isFocus = focus === null || focus.includes(i);
     for (let d = start; d < days; d++) {
-      const own = leg[d] & own_mask;
+      const own = leg[d] & (isFocus ? mask : 15);
       if (!own) continue;
-      let v;
-      if (!gap) {
-        v = coupled || i === focus ? own : 15;
-      } else {
+      let v = isFocus ? own : 15;
+      if (gap) {
         let acc = 0;
+        const cap = isFocus ? own : 15;
         const hi = Math.min(days - 1, d + gMax);
-        if (coupled) {
-          for (let n = d + gMin; n <= hi && acc !== own; n++) acc |= reach[n] & own;
-          v = own & acc;
-        } else {
-          for (let n = d + gMin; n <= hi && acc !== full; n++) acc |= reach[n];
-          v = i === focus ? (acc ? own : 0) : i < focus ? acc : (acc ? 15 : 0);
-        }
+        for (let n = d + gMin; n <= hi && acc !== cap; n++) acc |= reach[n] & cap;
+        v = isFocus ? own & acc : acc;
       }
       cur[d] = v;
     }
     reach = cur;
   }
   return reach;
+}
+
+/* The legs a via-trip's cabin filter should target: every leg at least half
+   as long as the longest (so BLL→LON→TYO focuses the 9,500km long-haul, not
+   the 700km hop, and a balanced NYC→LON→DXB focuses both). Great-circle via
+   the places' g coords; a leg with no coords counts as length 0. */
+function focusLegs(path) {
+  const km = [];
+  for (let i = 0; i < path.length - 1; i++) {
+    const ga = store.bundle.places[path[i]]?.g, gb = store.bundle.places[path[i + 1]]?.g;
+    if (!ga || !gb) { km.push(0); continue; }
+    const rad = Math.PI / 180;
+    const s = Math.sin(((gb[0] - ga[0]) * rad) / 2) ** 2 +
+      Math.cos(ga[0] * rad) * Math.cos(gb[0] * rad) * Math.sin(((gb[1] - ga[1]) * rad) / 2) ** 2;
+    km.push(2 * 6371 * Math.asin(Math.sqrt(s)));
+  }
+  const max = Math.max(...km);
+  const legs = km.map((k, i) => (max > 0 && k >= max / 2 ? i : -1)).filter((i) => i >= 0);
+  return legs.length ? legs : km.map((_, i) => i); // no coords anywhere → couple everything
+}
+
+/* The hub for a one-stop O→D when no direct route exists — with `both`, one
+   that also gets you home (D→hub→O). First candidate wins (the graph is a
+   star, so there's rarely more than one). null = direct exists or unreachable. */
+function viaHub(o, d, { both = false } = {}) {
+  if (store.bundle.routes[`${o}-${d}`]) return null;
+  const out = resolveRoutings(o, d).filter((p) => p.length === 3).map((p) => p[1]);
+  if (!both) return out[0] ?? null;
+  const back = new Set(resolveRoutings(d, o).filter((p) => p.length === 3).map((p) => p[1]));
+  return out.find((h) => back.has(h)) ?? null;
+}
+
+/* Connection window at the hub, in days: 0 = same day only, 1 = same or next
+   day (the default — long-haul arrivals often land the next calendar day),
+   2 = up to two days. URL ?conn= → session pref → 1. */
+function parseConn(s) { return /^[0-2]$/.test(s || "") ? Number(s) : null; }
+function getConnPref() { try { return parseConn(sessionStorage.getItem("rf:conn")); } catch { return null; } }
+function setConnPref(c) { try { sessionStorage.setItem("rf:conn", String(c)); } catch {} }
+function activeConn(params = new URLSearchParams(location.search)) {
+  return parseConn(params.get("conn")) ?? getConnPref() ?? 1;
+}
+
+/* Seat-count filtering is only honest at ONE consistent threshold: every leg
+   of the chain must carry the seats layer, mirroring pairSeatsKnown. */
+function chainSeatsKnown(path) {
+  for (let i = 0; i < path.length - 1; i++)
+    if (!store.seatRoutes.has(`${path[i]}-${path[i + 1]}`)) return false;
+  return true;
+}
+
+/* Everywhere you can get to from o in at most one stop — the search's
+   destination universe. Tiny even from the hub itself (≤ out-degree²·small). */
+function reachableDests(o) {
+  const direct = store.destsByOrigin.get(o) || [];
+  const set = new Set(direct);
+  for (const h of direct)
+    for (const d2 of store.destsByOrigin.get(h) || []) if (d2 !== o) set.add(d2);
+  return set;
 }
 
 /* ---------------- boot ---------------- */
@@ -1630,10 +1681,15 @@ function renderHome() {
     onPick: (p) => { homeSel.origin = p.code; originIn.value = p.name; updateHint(); destIn.focus(); maybeGo(); },
   });
   attachAutocomplete(destIn, {
-    getRestrict: () => homeSel.origin
-      ? new Set(store.destsByOrigin.get(homeSel.origin) || []) : allDests,
+    // Everywhere reachable in one stop, not just direct routes — searching
+    // BLL→TYO must resolve to the via-London trip, not "no places match".
+    getRestrict: () => homeSel.origin ? reachableDests(homeSel.origin) : allDests,
+    // Sparklines only for direct routes: a via pair's year-shape is the
+    // chain's, not any single route's — no sparkline beats a wrong one.
     sparkFor: (code) => homeSel.origin
-      ? monthCounts("route", `${homeSel.origin}-${code}`) : null,
+      ? ((store.destsByOrigin.get(homeSel.origin) || []).includes(code)
+          ? monthCounts("route", `${homeSel.origin}-${code}`) : null)
+      : null,
     onPick: (p) => { homeSel.dest = p.code; destIn.value = p.name; maybeGo(); },
   });
   originIn.addEventListener("input", () => { homeSel.origin = null; updateHint(); });
@@ -1951,6 +2007,83 @@ function paxControl(pax, onChange) {
     wrap.querySelectorAll(".pxp").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
     onChange(n);
   }));
+  return wrap;
+}
+
+/* Trip-length control (presets + custom range), shared by the direct and via
+   round-trip views. getNights feeds the pressed state; onApply runs after the
+   session pref and URL mirror are written, with the caller updating its own
+   window and recounting. */
+function nightsControlEl(getNights, onApply) {
+  const wrap = el(`<div class="nights-ctl" role="group" aria-label="Trip length in nights">
+    <span class="nc-label">Trip length</span>
+    ${NIGHTS_PRESETS.map(([label, lo, hi]) =>
+      `<button type="button" class="np" data-lo="${lo}" data-hi="${hi}" aria-pressed="false">
+         ${esc(label)} <span class="np-r">${lo}–${hi}</span></button>`).join("")}
+    <span class="np-custom">
+      <input id="np-min" type="number" inputmode="numeric" min="1" max="60" aria-label="Minimum nights">
+      <span aria-hidden="true">–</span>
+      <input id="np-max" type="number" inputmode="numeric" min="1" max="60" aria-label="Maximum nights">
+      <span class="np-unit">nights</span>
+    </span>
+  </div>`);
+  const minIn = $("#np-min", wrap), maxIn = $("#np-max", wrap);
+  function sync() {
+    const [lo, hi] = getNights();
+    for (const b of wrap.querySelectorAll(".np")) {
+      b.setAttribute("aria-pressed",
+        Number(b.dataset.lo) === lo && Number(b.dataset.hi) === hi ? "true" : "false");
+    }
+    minIn.value = lo; maxIn.value = hi;
+  }
+  function apply(lo, hi) {
+    setNightsPref(lo, hi);
+    const u = new URL(location.href);
+    u.searchParams.set("nights", `${lo}-${hi}`);
+    history.replaceState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
+    onApply(lo, hi);
+    sync();
+  }
+  const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
+  function fromInputs(which) {
+    const [curLo, curHi] = getNights();
+    let lo = clamp(Math.round(Number(minIn.value)) || curLo, 1, 60);
+    let hi = clamp(Math.round(Number(maxIn.value)) || curHi, 1, 60);
+    if (lo > hi) { if (which === "min") hi = lo; else lo = hi; }
+    apply(lo, hi);
+  }
+  wrap.querySelectorAll(".np").forEach((b) =>
+    b.addEventListener("click", () => apply(Number(b.dataset.lo), Number(b.dataset.hi))));
+  minIn.addEventListener("change", () => fromInputs("min"));
+  maxIn.addEventListener("change", () => fromInputs("max"));
+  sync();
+  return wrap;
+}
+
+/* Connection-window control at the via hub — same chip pattern as the nights
+   presets (and the same .np class family deliberately: one visual language
+   for "narrow the trip"). */
+function connControlEl(hub, getConn, onApply) {
+  const wrap = el(`<div class="nights-ctl conn-ctl" role="group" aria-label="Connection window at ${esc(placeName(hub))}">
+    <span class="nc-label">Change at ${esc(placeName(hub))}</span>
+    ${[["Same day", 0], ["≤1 day", 1], ["≤2 days", 2]].map(([label, c]) =>
+      `<button type="button" class="np" data-conn="${c}" aria-pressed="false">${label}</button>`).join("")}
+  </div>`);
+  function sync() {
+    for (const b of wrap.querySelectorAll(".np"))
+      b.setAttribute("aria-pressed", Number(b.dataset.conn) === getConn() ? "true" : "false");
+  }
+  wrap.querySelectorAll(".np").forEach((b) => b.addEventListener("click", () => {
+    const c = Number(b.dataset.conn);
+    setConnPref(c);
+    const u = new URL(location.href);
+    if (c === 1) u.searchParams.delete("conn"); else u.searchParams.set("conn", String(c));
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+    onApply(c);
+    sync();
+  }));
+  sync();
   return wrap;
 }
 
@@ -2511,6 +2644,13 @@ function renderRoute(o, d) {
   setTitle(`${o} → ${d}`);
   if (!store.bundle) { renderRouteSkeleton(o, d); return; }
 
+  // Same via upgrade as /trip/: a one-stop chain beats a dead end. One-way
+  // only needs the outbound direction to resolve.
+  if (!store.bundle.routes[key]) {
+    const hub = viaHub(o, d);
+    if (hub) { renderViaRoute(o, d, hub); return; }
+  }
+
   mainEl.innerHTML = "";
   const route = store.bundle.routes[key];
   const head = el(`<div class="route-head">
@@ -2794,6 +2934,13 @@ function renderTrip(o, d) {
   setTitle(`${o} ⇄ ${d}`);
   if (!store.bundle) { renderRouteSkeleton(o, d, "⇄"); return; }
 
+  // No direct route but a one-stop routing exists both ways → the via-trip
+  // calendar (BLL→TYO becomes BLL→LON→TYO), not an empty state.
+  if (!store.bundle.routes[key]) {
+    const hub = viaHub(o, d, { both: true });
+    if (hub) { renderViaTrip(o, d, hub); return; }
+  }
+
   mainEl.innerHTML = "";
   const routeData = store.bundle.routes[key];
   mainEl.append(el(`<div class="route-head">
@@ -2869,52 +3016,10 @@ function renderTrip(o, d) {
   }
   function syncPaxNote() { paxNote.hidden = !(pax > 1 && !pairKnown); }
 
-  function buildNightsControl() {
-    const wrap = el(`<div class="nights-ctl" role="group" aria-label="Trip length in nights">
-      <span class="nc-label">Trip length</span>
-      ${NIGHTS_PRESETS.map(([label, lo, hi]) =>
-        `<button type="button" class="np" data-lo="${lo}" data-hi="${hi}" aria-pressed="false">
-           ${esc(label)} <span class="np-r">${lo}–${hi}</span></button>`).join("")}
-      <span class="np-custom">
-        <input id="np-min" type="number" inputmode="numeric" min="1" max="60" aria-label="Minimum nights">
-        <span aria-hidden="true">–</span>
-        <input id="np-max" type="number" inputmode="numeric" min="1" max="60" aria-label="Maximum nights">
-        <span class="np-unit">nights</span>
-      </span>
-    </div>`);
-    const minIn = $("#np-min", wrap), maxIn = $("#np-max", wrap);
-    function sync() {
-      for (const b of wrap.querySelectorAll(".np")) {
-        b.setAttribute("aria-pressed",
-          Number(b.dataset.lo) === nights[0] && Number(b.dataset.hi) === nights[1] ? "true" : "false");
-      }
-      minIn.value = nights[0]; maxIn.value = nights[1];
-    }
-    function apply(lo, hi) {
-      nights = [lo, hi];
-      setNightsPref(lo, hi);
-      const u = new URL(location.href);
-      u.searchParams.set("nights", `${lo}-${hi}`);
-      history.replaceState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
-      sync();
-      rebuildChips(); // recounts chips; chips' onChange redraws the calendars
-    }
-    const clamp = (v, lo, hi) => Math.min(hi, Math.max(lo, v));
-    function fromInputs(which) {
-      let lo = clamp(Math.round(Number(minIn.value)) || nights[0], 1, 60);
-      let hi = clamp(Math.round(Number(maxIn.value)) || nights[1], 1, 60);
-      if (lo > hi) { if (which === "min") hi = lo; else lo = hi; }
-      apply(lo, hi);
-    }
-    wrap.querySelectorAll(".np").forEach((b) =>
-      b.addEventListener("click", () => apply(Number(b.dataset.lo), Number(b.dataset.hi))));
-    minIn.addEventListener("change", () => fromInputs("min"));
-    maxIn.addEventListener("change", () => fromInputs("max"));
-    sync();
-    return wrap;
-  }
-
-  toolbar.append(buildNightsControl());
+  toolbar.append(nightsControlEl(() => nights, (lo, hi) => {
+    nights = [lo, hi];
+    rebuildChips(); // recounts chips; chips' onChange redraws the calendars
+  }));
   if (store.hasAnySeatData) {
     toolbar.append(paxControl(pax, (n) => {
       pax = n;
@@ -3431,6 +3536,697 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
 }
 
 /* Shared modal chrome: show panel + scrim, make the page inert, trap Tab. */
+/* ---------------- via trips (one-stop multi-city) ---------------- */
+
+/* Shared honesty line for every via view: the two facts a user must not
+   discover at the BA checkout. */
+function viaNoteHTML(o, d, hub) {
+  return `<p class="rev-note">No direct route — this journey changes at ${esc(placeName(hub))},
+    as separate award bookings per leg. Dates are matched on award space, not flight
+    times: verify connection timings when booking. Alerts aren't available for via trips yet.</p>`;
+}
+
+/* Month year-strip for the via calendars — same recounted-from-the-engine
+   rule as every number on the trip pages. */
+function viaYearStrip(months, rb, mask, legend, t0, body, animate, ariaFor) {
+  const strip = el(`<div class="year-strip" role="group" aria-label="Jump to month"></div>`);
+  months.forEach((mo, mi) => {
+    let c = 0;
+    for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, rb.length); i++) if (rb[i]) c++;
+    const now = new Date();
+    const isCur = mo.y === now.getFullYear() && mo.m === now.getMonth();
+    const btn = el(`<button type="button" class="ys-month${isCur ? " current" : ""}" aria-label="${esc(ariaFor(mo, c))}">
+      <span class="ys-label">${mo.label}</span>
+      <span class="ys-bars" aria-hidden="true"></span>
+      <span class="ys-count">${c || "·"}</span>
+    </button>`);
+    const bars = $(".ys-bars", btn);
+    for (const [bit] of legend) {
+      if (!(bit & mask)) continue;
+      let n = 0;
+      for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, rb.length); i++)
+        if (rb[i] & bit) n++;
+      if (!n) continue;
+      const bar = document.createElement("i");
+      bar.className = bitClass(bit);
+      bar.style.height = `${Math.max(2, Math.round((n / Math.max(1, daysInMonth(mo))) * 30))}px`;
+      if (animate) bar.style.animationDelay = `${mi * 30}ms`;
+      else bar.style.animation = "none";
+      bars.append(bar);
+    }
+    btn.addEventListener("click", () => {
+      const target = $(`#month-${mo.y}-${mo.m}`, body);
+      if (target) target.scrollIntoView({ behavior: "smooth", block: "start" });
+    });
+    strip.append(btn);
+  });
+  return strip;
+}
+
+/* Round-trip calendar for a pair with NO direct route, chained through a hub:
+   BLL ⇄ TYO renders as BLL→LON→TYO out and TYO→LON→BLL home. Same page shape
+   as renderTrip; the engine is chainBits with the cabin filter on the
+   long-haul legs (focusLegs), and the honesty notes name the hub. */
+function renderViaTrip(o, d, hub) {
+  current.page = "trip"; current.params = { o, d, hub };
+  setTitle(`${o} ⇄ ${d} via ${hub}`);
+
+  const fullPath = [o, hub, d, hub, o];
+  const outPath = [o, hub, d];
+  const focus = focusLegs(fullPath);
+  const focusOut = focusLegs(outPath);
+
+  const params = new URLSearchParams(location.search);
+  let nights = parseNights(params.get("nights")) || getNightsPref() || NIGHTS_DEFAULT.slice();
+  let pax = activePax(params);
+  let conn = activeConn(params);
+  const seatsKnown = chainSeatsKnown(fullPath);
+  const ep = () => (pax > 1 && seatsKnown ? pax : 1);
+  const gapsFor = (c) => [[0, c], [Math.max(1, nights[0]), nights[1]], [0, c]];
+
+  mainEl.innerHTML = "";
+  mainEl.append(el(`<div class="route-head">
+    <p class="crumbs"><a href="/">Search</a> · <a href="/from/${o}">All from ${esc(placeName(o))}</a></p>
+    <div class="route-title-row">
+      <h1 class="route-title" aria-label="${o} to ${d} round trip via ${esc(placeName(hub))}">${o} <a class="arrow arrow-swap" href="/trip/${d}-${o}${nightsQS()}"
+        title="Swap — plan ${d} ⇄ ${o} instead" aria-label="Swap origin and destination — plan ${d} to ${o} round trips">⇄</a> ${d}
+        <span class="via-badge">via ${esc(placeName(hub))}</span></h1>
+      ${tripSegHTML(o, d, "trip")}
+    </div>
+    <p class="route-cities">${esc(placeName(o))}${placeCountry(o) ? `, ${esc(placeCountry(o))}` : ""}
+      <span class="via">to</span>
+      ${esc(placeName(d))}${placeCountry(d) ? `, ${esc(placeCountry(d))}` : ""}</p>
+    ${viaNoteHTML(o, d, hub)}
+  </div>`));
+
+  const t0 = todayIndex();
+  const legend = cabinLegend();
+  const allMask = legend.reduce((m, [bit]) => m | bit, 0);
+
+  const toolbar = el(`<div class="route-toolbar"></div>`);
+  const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
+  const container = el(`<div></div>`);
+  const body = el(`<div></div>`);
+  mainEl.append(toolbar, paxNote, container, body);
+
+  let mask = 0, firstDraw = true, chipsEl = null;
+
+  function perCabinVia() {
+    const rb = chainBits(fullPath, allMask, gapsFor(conn), ep(), focus);
+    const per = new Map();
+    for (let i = Math.max(0, t0); i < rb.length; i++) {
+      const v = rb[i];
+      if (!v) continue;
+      for (const [bit] of legend) if (v & bit) per.set(bit, (per.get(bit) || 0) + 1);
+    }
+    return per;
+  }
+
+  function rebuildChips() {
+    const forN = ep() > 1 ? ` for ${pax} travelling together` : "";
+    const fresh = cabinChips(perCabinVia(), (m) => { mask = m; drawCalendars(); },
+      (count, label) => count
+        ? `${count} departure days completing the whole trip with ${label} on the long-haul legs${forN}`
+        : `No ${label} trips${forN} within ${nights[0]}–${nights[1]} nights`);
+    if (chipsEl) chipsEl.replaceWith(fresh); else toolbar.prepend(fresh);
+    chipsEl = fresh;
+  }
+  function syncPaxNote() { paxNote.hidden = !(pax > 1 && !seatsKnown); }
+
+  toolbar.append(nightsControlEl(() => nights, (lo, hi) => { nights = [lo, hi]; rebuildChips(); }));
+  toolbar.append(connControlEl(hub, () => conn, (c) => { conn = c; rebuildChips(); }));
+  if (store.hasAnySeatData) {
+    toolbar.append(paxControl(pax, (n) => {
+      pax = n;
+      setPaxPref(n);
+      mirrorPaxURL(n);
+      syncPaxNote();
+      rebuildChips();
+    }));
+  }
+  rebuildChips(); // synchronously sets mask + first drawCalendars()
+  syncPaxNote();
+
+  function drawCalendars() {
+    const animate = firstDraw;
+    firstDraw = false;
+    container.innerHTML = ""; body.innerHTML = "";
+    const n = ep();
+    const gaps = gapsFor(conn);
+    const rb = chainBits(fullPath, mask, gaps, n, focus);
+    const rbAll = mask === allMask ? rb : chainBits(fullPath, allMask, gaps, n, focus);
+    const rbAny = n > 1 ? chainBits(fullPath, allMask, gaps, 1, focus) : null;
+    // The presence base for dim/empty: can the OUTBOUND journey (both legs)
+    // even happen that day, any cabin, any party?
+    const outAny = chainBits(outPath, allMask, [[0, conn]], 1, focusOut);
+    const months = next12Months();
+
+    container.append(viaYearStrip(months, rb, mask, legend, Math.max(0, t0), body, animate,
+      (mo, c) => `${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with complete trips${n > 1 ? ` for ${pax} travelling together` : ""}`));
+
+    const grid = el(`<div class="months"></div>`);
+    for (const mo of months) grid.append(monthCalVia(mo, rb, rbAll, rbAny, outAny, n));
+    body.append(grid);
+  }
+
+  /* LIT = the whole chain completes (stack = long-haul cabins), DIM = the
+     outbound journey works but the trip doesn't complete (the panel explains),
+     empty = you can't even reach ${d} that day. Same three honesty axes as the
+     direct trip calendar. */
+  function monthCalVia(mo, rb, rbAll, rbAny, outAny, n) {
+    const first = utcDate(mo.y, mo.m, 1);
+    const horizon = outAny.length;
+    if (mo.start >= horizon) return unreleasedMonthCard(mo, first);
+    let anyOut = false;
+    for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, outAny.length); i++) {
+      if (outAny[i]) { anyOut = true; break; }
+    }
+    if (!anyOut && mo.end <= horizon) {
+      return el(`<section class="month month-compact" id="month-${mo.y}-${mo.m}" aria-label="${fmtMonth.format(first)}">
+        <h3>${fmtMonth.format(first)}</h3>
+        <p class="month-empty">No outbound journeys this month</p>
+      </section>`);
+    }
+
+    const box = el(`<section class="month" id="month-${mo.y}-${mo.m}" aria-label="${fmtMonth.format(first)}">
+      <h3>${fmtMonth.format(first)} <span class="mc"></span></h3>
+      <div class="dow">${["Mo","Tu","We","Th","Fr","Sa","Su"].map((dw) => `<span>${dw}</span>`).join("")}</div>
+      <div class="grid"></div>
+    </section>`);
+    const grid = $(".grid", box);
+    const lead = (first.getUTCDay() + 6) % 7;
+    for (let i = 0; i < lead; i++) grid.append(el(`<span class="day pad"></span>`));
+
+    let monthDays = 0;
+    const nDays = daysInMonth(mo);
+    for (let dnum = 1; dnum <= nDays; dnum++) {
+      const idx = mo.start + dnum - 1;
+      if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx)); continue; }
+      const vOut = (idx >= 0 && idx < outAny.length) ? outAny[idx] : 0;
+      const v = (idx >= 0 && idx < rb.length) ? rb[idx] : 0;
+      const isPast = idx < Math.max(0, t0);
+      if (!vOut || isPast) {
+        grid.append(el(`<span class="day${isPast ? " past" : ""}"><span class="num">${dnum}</span><span class="stack"></span></span>`));
+        continue;
+      }
+      if (v) monthDays++;
+      const dateLabel = esc(fmtDate.format(dayDate(idx)));
+      const hiddenBits = v ? 0 : ((idx >= 0 && idx < rbAll.length) ? rbAll[idx] : 0);
+      const smallerParty = !v && !hiddenBits && n > 1 && rbAny
+        ? ((idx >= 0 && idx < rbAny.length) ? rbAny[idx] : 0) : 0;
+      const aria = v
+        ? `${dateLabel}: whole trip possible with ${esc(cabNames(v))} on the long-haul legs${n > 1 ? ` for ${pax} travelling together` : ""}`
+        : hiddenBits
+          ? `${dateLabel}: whole trip possible in ${esc(cabNames(hiddenBits))} — hidden by your cabin filter`
+          : smallerParty
+            ? `${dateLabel}: trip open in ${esc(cabNames(smallerParty))} for a smaller party — no sign of ${pax} seats together`
+            : `${dateLabel}: outbound journey only — no return completes within ${nights[0]}–${nights[1]} nights`;
+      const cell = el(`<button type="button" class="day has${v ? "" : " dim"}" aria-label="${aria}">
+        <span class="num">${dnum}</span>
+        ${stackHTML(v || vOut)}
+      </button>`);
+      const tipNote = v ? "long-haul cabins — hops just need any award space" : hiddenBits
+        ? `whole trip open in ${cabNames(hiddenBits)} — hidden by your cabin filter`
+        : smallerParty
+          ? `trip open for a smaller party — no sign of ${pax} seats together`
+          : "outbound journey only — no return completes in window";
+      cell.addEventListener("click", () => pickOutbound(idx));
+      cell.addEventListener("mouseenter", (e) => showTip(e.currentTarget, idx, v, tipNote));
+      cell.addEventListener("mouseleave", hideTip);
+      cell.addEventListener("focus", (e) => showTip(e.currentTarget, idx, v, tipNote));
+      cell.addEventListener("blur", hideTip);
+      grid.append(cell);
+    }
+    $(".mc", box).textContent = `${monthDays}d`;
+    if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
+    return box;
+  }
+
+  function pickOutbound(idx) {
+    const iso = isoOf(dayDate(idx));
+    const u = new URL(location.href);
+    u.searchParams.set("out", iso);
+    u.searchParams.delete("ret");
+    history.pushState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
+    openViaPanel(o, hub, d, idx, nights, conn, mask, null, pax);
+  }
+
+  const outIdx = tripDayIndex(params.get("out") || "");
+  if (outIdx >= 0) {
+    const outAny = chainBits(outPath, allMask, [[0, conn]], 1, focusOut);
+    if (outAny[outIdx]) {
+      const retP = params.get("ret") || "";
+      openViaPanel(o, hub, d, outIdx, nights, conn, mask, tripDayIndex(retP) >= 0 ? retP : null, pax);
+    }
+  }
+}
+
+/* The via-trip day panel: the first-leg departure is pinned; the long-haul
+   dates that connect are shown per leg with their own booking links (separate
+   redemptions — BA can't book a multi-city award online), and every return
+   long-haul day that completes the trip is a radio row. */
+function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1) {
+  const kOut1 = `${o}-${hub}`, kOut2 = `${hub}-${d}`, kRet1 = `${d}-${hub}`, kRet2 = `${hub}-${o}`;
+  const b1 = routeBits(kOut1), b2 = routeBits(kOut2), r1 = routeBits(kRet1), r2 = routeBits(kRet2);
+  const days = store.bundle.days;
+  const [lo, hi] = nights;
+  const minN = Math.max(1, lo);
+  const outIso = isoOf(dayDate(idx));
+  panelReturnFocus = document.activeElement;
+  panelEl.setAttribute("role", "dialog");
+  panelEl.setAttribute("aria-modal", "true");
+  panelEl.setAttribute("aria-labelledby", "dp-title");
+  panelEl.innerHTML = "";
+  panelCloseHook = () => {
+    const u = new URL(location.href);
+    if (!u.searchParams.has("out") && !u.searchParams.has("ret")) return;
+    u.searchParams.delete("out"); u.searchParams.delete("ret");
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+  };
+
+  const legLink = (from, to, dayIdx) =>
+    `<a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
+       href="${baBookingURL(from, to, isoOf(dayDate(dayIdx)), 0, null, pax)}">Book ↗</a>`;
+  const legRow = (from, to, dayIdx, bits, extra = "") => `
+    <div class="pp-leg">
+      <span class="pp-leg-route">${from}→${to}</span>
+      <span class="pp-leg-date">${esc(fmtRet.format(dayDate(dayIdx)))}${extra}</span>
+      ${stackHTML(bits, { size: "row" })}
+      ${legLink(from, to, dayIdx)}
+    </div>`;
+
+  // Long-haul departures reachable from the pinned hop day — kept only when
+  // the whole trip can still complete from them. Rows are PRESENCE-based
+  // (the cabin filter orders them, never hides them).
+  const rowsFor = (n) => {
+    const rows = [];
+    const rEnd = Math.min(days - 1, n + hi);
+    for (let r = n + minN; r <= rEnd; r++) {
+      if (!r1[r]) continue;
+      const home = [];
+      for (let h = r; h <= Math.min(days - 1, r + conn); h++) if (r2[h]) home.push(h);
+      if (!home.length) continue;
+      rows.push({ r, iso: isoOf(dayDate(r)), bits: r1[r], n: r - n, home,
+        shares: (r1[r] & b2[n] & mask) ? 1 : 0 });
+    }
+    rows.sort((a, b) => b.shares - a.shares || a.n - b.n);
+    return rows;
+  };
+  const nOpts = [];
+  for (let n = idx; n <= Math.min(days - 1, idx + conn); n++) {
+    if (!b2[n] || !b1[idx]) continue;
+    const rows = rowsFor(n);
+    if (rows.length) nOpts.push({ n, rows });
+  }
+
+  if (!nOpts.length) {
+    // Honest dead end: name which junction fails and offer the fix.
+    let lhAny = false;
+    for (let n = idx; n <= Math.min(days - 1, idx + conn); n++) if (b2[n]) lhAny = true;
+    const alreadyWide = lo === NIGHTS_DEFAULT[0] && hi === NIGHTS_DEFAULT[1];
+    const lead = !lhAny
+      ? `No ${hub}→${d} award space within ${conn === 0 ? "the same day" : `${conn} day${conn > 1 ? "s" : ""}`} of this departure.`
+      : `The outbound journey works, but no return completes within ${lo}–${hi} nights.`;
+    const fixHint = !lhAny && conn < 2
+      ? `<p><button type="button" class="btn" id="vp-conn2">Allow up to 2 days at ${esc(placeName(hub))}</button></p>`
+      : lhAny && !alreadyWide
+        ? `<p><button type="button" class="btn" id="vp-widen">Widen trip length to ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights</button></p>`
+        : "";
+    panelEl.append(el(`<div>
+      <button class="dp-close" type="button" aria-label="Close">×</button>
+      <div class="dp-head">
+        <div>
+          <p class="dp-date">${esc(fmtDate.format(dayDate(idx)))}</p>
+          <p class="dp-route" id="dp-title">${o} <span style="color:var(--gold)" aria-hidden="true">→</span> ${hub} <span style="color:var(--gold)" aria-hidden="true">→</span> ${d}</p>
+        </div>
+        ${stackHTML(b1[idx], { size: "row" })}
+      </div>
+      <p class="dp-lead">${lead}</p>
+      ${fixHint}
+      <p class="dp-lead">Book what's open one way:</p>
+      <div class="pp-legs">${legRow(o, hub, idx, b1[idx])}</div>
+      <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
+        Availability moves fast — verify with British Airways before planning.</p>
+    </div>`));
+    showPanelChrome();
+    $("#vp-widen", panelEl)?.addEventListener("click", () => {
+      setNightsPref(NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]);
+      const u = new URL(location.href);
+      u.searchParams.set("nights", `${NIGHTS_DEFAULT[0]}-${NIGHTS_DEFAULT[1]}`);
+      history.replaceState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
+      route();
+    });
+    $("#vp-conn2", panelEl)?.addEventListener("click", () => {
+      setConnPref(2);
+      const u = new URL(location.href);
+      u.searchParams.set("conn", "2");
+      history.replaceState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
+      route();
+    });
+    return;
+  }
+
+  panelEl.append(el(`<div>
+    <button class="dp-close" type="button" aria-label="Close">×</button>
+    <div class="pp-steps">
+      <button type="button" class="pp-step" id="pp-step-out" title="Change the outbound day"><b>1</b> Out</button>
+      <span class="pp-step on" id="pp-step-back"><b>2</b> Back</span>
+      <span class="pp-step" id="pp-step-book"><b>3</b> Book</span>
+    </div>
+    <div class="dp-head">
+      <div>
+        <p class="dp-date">${esc(fmtDate.format(dayDate(idx)))} — pick your return</p>
+        <p class="dp-route" id="dp-title">${o} <span style="color:var(--gold)" aria-hidden="true">→</span> ${d} <span style="color:var(--gold)" aria-hidden="true">→</span> ${o}</p>
+        <p class="pp-sub">via ${esc(placeName(hub))} · ${lo}–${hi} nights · separate bookings per leg</p>
+      </div>
+    </div>
+    <p class="pp-ret-label">Outbound</p>
+    <div class="pp-legs" id="vp-out-legs"></div>
+    <div id="vp-lh-choice"></div>
+    <p class="pp-ret-label" id="pp-ret-label">Return (${d} → ${o})</p>
+    ${pax > 1 && !chainSeatsKnown([o, hub, d, hub, o]) ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
+    <div class="pp-rows" role="radiogroup" aria-labelledby="pp-ret-label"></div>
+    <div class="pp-summary${retIso ? "" : " pp-unrevealed"}">
+      <p class="pp-sum-line" id="pp-sum-line"></p>
+      <p class="pp-ret-label">Book the return legs</p>
+      <div class="pp-legs" id="vp-ret-legs"></div>
+      <p class="pp-oneways" id="vp-cabin-line"></p>
+    </div>
+    <p class="dp-note">Four separate award bookings, matched on award space (not flight
+      times — verify connections). Seen in data as of ${esc(freshLabel())}.</p>
+  </div>`));
+
+  let ni = 0, sel = 0;
+  const rowsWrap = $(".pp-rows", panelEl);
+  const summaryEl = $(".pp-summary", panelEl);
+  const stepBack = $("#pp-step-back", panelEl), stepBook = $("#pp-step-book", panelEl);
+
+  function drawOutLegs() {
+    const { n } = nOpts[ni];
+    $("#vp-out-legs", panelEl).innerHTML =
+      legRow(o, hub, idx, b1[idx]) +
+      legRow(hub, d, n, b2[n], n === idx ? " <small>(same day)</small>" : "");
+    const choice = $("#vp-lh-choice", panelEl);
+    choice.innerHTML = "";
+    if (nOpts.length > 1) {
+      const seg = el(`<div class="nights-ctl vp-lh" role="group" aria-label="${hub} to ${d} departure day">
+        <span class="nc-label">${hub}→${d} on</span>
+        ${nOpts.map(({ n: nn }, i) =>
+          `<button type="button" class="np" data-i="${i}" aria-pressed="${i === ni}">${esc(fmtRet.format(dayDate(nn)))}</button>`).join("")}
+      </div>`);
+      seg.querySelectorAll(".np").forEach((btn) => btn.addEventListener("click", () => {
+        ni = Number(btn.dataset.i);
+        sel = 0;
+        drawOutLegs(); drawRows(false);
+      }));
+      choice.append(seg);
+    }
+  }
+
+  function updateSummary() {
+    const { n, rows } = nOpts[ni];
+    const r = rows[sel];
+    $("#pp-sum-line", panelEl).textContent =
+      `${o}→${d} ${fmtRet.format(dayDate(idx))} · ${d}→${o} ${fmtRet.format(dayDate(r.r))} · ${r.n} night${r.n === 1 ? "" : "s"} in ${placeName(d)}`;
+    $("#vp-ret-legs", panelEl).innerHTML =
+      legRow(d, hub, r.r, r.bits) +
+      legRow(hub, o, r.home[0], r2[r.home[0]], r.home[0] === r.r ? " <small>(same day)</small>" : "") +
+      (r.home.length > 1
+        ? `<p class="pp-oneways">or ${hub}→${o} on ${r.home.slice(1).map((h) =>
+            `<a target="_blank" rel="noopener noreferrer" href="${baBookingURL(hub, o, isoOf(dayDate(h)), 0, null, pax)}">${esc(fmtRet.format(dayDate(h)))} ↗</a>`).join(" · ")}</p>`
+        : "");
+    const shared = b2[n] & r.bits & mask;
+    const sharedAll = b2[n] & r.bits;
+    $("#vp-cabin-line", panelEl).textContent = shared
+      ? `${cabNames(shared)} open on both long-haul legs.`
+      : sharedAll
+        ? `No filtered cabin is open on both long-haul legs — out: ${cabNames(b2[n])}, back: ${cabNames(r.bits)}.`
+        : `No single cabin both ways — out: ${cabNames(b2[n])}, back: ${cabNames(r.bits)}.`;
+  }
+
+  function reveal() {
+    summaryEl.classList.remove("pp-unrevealed");
+    stepBack.classList.remove("on");
+    stepBook.classList.add("on");
+  }
+
+  function drawRows(restore) {
+    const { rows } = nOpts[ni];
+    rowsWrap.innerHTML = "";
+    for (const r of rows) {
+      rowsWrap.append(el(`<button type="button" class="pp-row" role="radio" aria-checked="false"
+          tabindex="-1" data-iso="${r.iso}"
+          aria-label="Return ${esc(fmtRet.format(dayDate(r.r)))}, ${r.n} night${r.n === 1 ? "" : "s"}, ${esc(cabNames(r.bits))} open">
+        <span class="pp-radio" aria-hidden="true"></span>
+        <span class="pp-row-date">${esc(fmtRet.format(dayDate(r.r)))}</span>
+        <span class="pp-row-n">${r.n} night${r.n === 1 ? "" : "s"}</span>
+        ${stackHTML(r.bits, { size: "row" })}
+      </button>`));
+    }
+    const rowEls = [...rowsWrap.children];
+    if (restore && retIso) {
+      const i = rows.findIndex((r) => r.iso === retIso);
+      if (i >= 0) { sel = i; reveal(); }
+    }
+    function selectRow(i, user) {
+      sel = i;
+      rowEls.forEach((rEl, j) => {
+        rEl.setAttribute("aria-checked", j === i ? "true" : "false");
+        rEl.tabIndex = j === i ? 0 : -1;
+      });
+      updateSummary();
+      if (!user) return;
+      reveal();
+      const u = new URL(location.href);
+      const had = u.searchParams.has("ret");
+      u.searchParams.set("out", outIso);
+      u.searchParams.set("ret", rows[i].iso);
+      const url = `${u.pathname}?${u.searchParams.toString()}`;
+      if (had) history.replaceState(null, "", url);
+      else history.pushState(null, "", url);
+    }
+    rowEls.forEach((rEl, i) => rEl.addEventListener("click", () => selectRow(i, true)));
+    rowsWrap.onkeydown = (e) => {
+      const total = rowEls.length;
+      let to = -1;
+      if (e.key === "ArrowDown" || e.key === "ArrowRight") to = (sel + 1) % total;
+      else if (e.key === "ArrowUp" || e.key === "ArrowLeft") to = (sel - 1 + total) % total;
+      else if (e.key === "Home") to = 0;
+      else if (e.key === "End") to = total - 1;
+      if (to < 0) return;
+      e.preventDefault();
+      selectRow(to, true);
+      rowEls[to].focus();
+    };
+    selectRow(sel, false);
+  }
+
+  drawOutLegs();
+  drawRows(true);
+  $("#pp-step-out", panelEl).addEventListener("click", closeDayPanel);
+  showPanelChrome();
+}
+
+/* One-way calendar for a pair with no direct route: the two-leg chain
+   (o→hub→d) with the cabin filter on the long-haul leg. */
+function renderViaRoute(o, d, hub) {
+  current.page = "route"; current.params = { o, d, hub };
+  setTitle(`${o} → ${d} via ${hub}`);
+
+  const path = [o, hub, d];
+  const focus = focusLegs(path);
+  const params = new URLSearchParams(location.search);
+  let pax = activePax(params);
+  let conn = activeConn(params);
+  const seatsKnown = chainSeatsKnown(path);
+  const ep = () => (pax > 1 && seatsKnown ? pax : 1);
+
+  mainEl.innerHTML = "";
+  mainEl.append(el(`<div class="route-head">
+    <p class="crumbs"><a href="/">Search</a> · <a href="/from/${o}">All from ${esc(placeName(o))}</a></p>
+    <div class="route-title-row">
+      <h1 class="route-title" aria-label="${o} to ${d} via ${esc(placeName(hub))}">${o} <a class="arrow arrow-swap" href="/route/${d}-${o}"
+        title="Flip direction — view ${d} → ${o}" aria-label="Flip direction — view ${d} to ${o}">→</a> ${d}
+        <span class="via-badge">via ${esc(placeName(hub))}</span></h1>
+      ${tripSegHTML(o, d, "route")}
+    </div>
+    <p class="route-cities">${esc(placeName(o))}${placeCountry(o) ? `, ${esc(placeCountry(o))}` : ""}
+      <span class="via">to</span>
+      ${esc(placeName(d))}${placeCountry(d) ? `, ${esc(placeCountry(d))}` : ""}</p>
+    ${viaNoteHTML(o, d, hub)}
+  </div>`));
+
+  const t0 = Math.max(0, todayIndex());
+  const legend = cabinLegend();
+  const allMask = legend.reduce((m, [bit]) => m | bit, 0);
+
+  const toolbar = el(`<div class="route-toolbar"></div>`);
+  const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
+  const container = el(`<div></div>`);
+  const body = el(`<div></div>`);
+  mainEl.append(toolbar, paxNote, container, body);
+
+  let mask = 0, firstDraw = true, chipsEl = null;
+  const gapsFor = (c) => [[0, c]];
+
+  function rebuildChips() {
+    const rb = chainBits(path, allMask, gapsFor(conn), ep(), focus);
+    const per = new Map();
+    for (let i = t0; i < rb.length; i++) {
+      const v = rb[i];
+      if (!v) continue;
+      for (const [bit] of legend) if (v & bit) per.set(bit, (per.get(bit) || 0) + 1);
+    }
+    const forN = ep() > 1 ? ` for ${pax} travelling together` : "";
+    const fresh = cabinChips(per, (m) => { mask = m; draw(); },
+      (count, label) => count
+        ? `${count} days with the whole journey in ${label} on the long-haul leg${forN}`
+        : `No ${label} journeys${forN} right now`);
+    if (chipsEl) chipsEl.replaceWith(fresh); else toolbar.prepend(fresh);
+    chipsEl = fresh;
+  }
+  function syncPaxNote() { paxNote.hidden = !(pax > 1 && !seatsKnown); }
+
+  toolbar.append(connControlEl(hub, () => conn, (c) => { conn = c; rebuildChips(); }));
+  if (store.hasAnySeatData) {
+    toolbar.append(paxControl(pax, (n) => {
+      pax = n;
+      setPaxPref(n);
+      mirrorPaxURL(n);
+      syncPaxNote();
+      rebuildChips();
+    }));
+  }
+  rebuildChips();
+  syncPaxNote();
+
+  function draw() {
+    const animate = firstDraw;
+    firstDraw = false;
+    container.innerHTML = ""; body.innerHTML = "";
+    const n = ep();
+    const rb = chainBits(path, mask, gapsFor(conn), n, focus);
+    const rbAll = mask === allMask ? rb : chainBits(path, allMask, gapsFor(conn), n, focus);
+    const rbAny = n > 1 ? chainBits(path, allMask, gapsFor(conn), 1, focus) : null;
+    const reachable = n > 1 && rbAny ? rbAny : rbAll; // presence base: any cabin (any party)
+    const months = next12Months();
+
+    container.append(viaYearStrip(months, rb, mask, legend, t0, body, animate,
+      (mo, c) => `${fmtMonth.format(utcDate(mo.y, mo.m, 1))}: ${c} days with the whole journey${n > 1 ? ` for ${pax} travelling together` : ""}`));
+
+    const grid = el(`<div class="months"></div>`);
+    for (const mo of months) {
+      const first = utcDate(mo.y, mo.m, 1);
+      const horizon = rb.length;
+      if (mo.start >= horizon) { grid.append(unreleasedMonthCard(mo, first)); continue; }
+      let any = false;
+      for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, reachable.length); i++)
+        if (reachable[i]) { any = true; break; }
+      if (!any && mo.end <= horizon) {
+        grid.append(el(`<section class="month month-compact" id="month-${mo.y}-${mo.m}" aria-label="${fmtMonth.format(first)}">
+          <h3>${fmtMonth.format(first)}</h3>
+          <p class="month-empty">No journeys this month</p>
+        </section>`));
+        continue;
+      }
+      const box = el(`<section class="month" id="month-${mo.y}-${mo.m}" aria-label="${fmtMonth.format(first)}">
+        <h3>${fmtMonth.format(first)} <span class="mc"></span></h3>
+        <div class="dow">${["Mo","Tu","We","Th","Fr","Sa","Su"].map((dw) => `<span>${dw}</span>`).join("")}</div>
+        <div class="grid"></div>
+      </section>`);
+      const g = $(".grid", box);
+      const leadPad = (first.getUTCDay() + 6) % 7;
+      for (let i = 0; i < leadPad; i++) g.append(el(`<span class="day pad"></span>`));
+      let monthDays = 0;
+      const nDays = daysInMonth(mo);
+      for (let dnum = 1; dnum <= nDays; dnum++) {
+        const idx = mo.start + dnum - 1;
+        if (idx >= horizon) { g.append(unreleasedDayCell(dnum, idx)); continue; }
+        const can = (idx >= 0 && idx < reachable.length) ? reachable[idx] : 0;
+        const v = (idx >= 0 && idx < rb.length) ? rb[idx] : 0;
+        const isPast = idx < t0;
+        if (!can || isPast) {
+          g.append(el(`<span class="day${isPast ? " past" : ""}"><span class="num">${dnum}</span><span class="stack"></span></span>`));
+          continue;
+        }
+        if (v) monthDays++;
+        const dateLabel = esc(fmtDate.format(dayDate(idx)));
+        const hiddenBits = v ? 0 : rbAll[idx];
+        const smallerParty = !v && !hiddenBits && n > 1 && rbAny ? rbAny[idx] : 0;
+        const aria = v
+          ? `${dateLabel}: journey possible with ${esc(cabNames(v))} on the long-haul leg${n > 1 ? ` for ${pax} travelling together` : ""}`
+          : hiddenBits
+            ? `${dateLabel}: journey possible in ${esc(cabNames(hiddenBits))} — hidden by your cabin filter`
+            : `${dateLabel}: journey open in ${esc(cabNames(smallerParty))} for a smaller party — no sign of ${pax} seats together`;
+        const cell = el(`<button type="button" class="day has${v ? "" : " dim"}" aria-label="${aria}">
+          <span class="num">${dnum}</span>
+          ${stackHTML(v || can)}
+        </button>`);
+        const tipNote = v ? "long-haul cabins — the hop just needs any award space" : hiddenBits
+          ? `journey open in ${cabNames(hiddenBits)} — hidden by your cabin filter`
+          : `open for a smaller party — no sign of ${pax} seats together`;
+        cell.addEventListener("click", () => openViaOWPanel(o, hub, d, idx, conn, pax));
+        cell.addEventListener("mouseenter", (e) => showTip(e.currentTarget, idx, v, tipNote));
+        cell.addEventListener("mouseleave", hideTip);
+        cell.addEventListener("focus", (e) => showTip(e.currentTarget, idx, v, tipNote));
+        cell.addEventListener("blur", hideTip);
+        g.append(cell);
+      }
+      $(".mc", box).textContent = `${monthDays}d`;
+      if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
+      grid.append(box);
+    }
+    body.append(grid);
+  }
+}
+
+/* One-way via day panel: both legs with their feasible dates, each its own
+   booking link. */
+function openViaOWPanel(o, hub, d, idx, conn, pax = 1) {
+  const b1 = routeBits(`${o}-${hub}`), b2 = routeBits(`${hub}-${d}`);
+  const days = store.bundle.days;
+  panelReturnFocus = document.activeElement;
+  panelCloseHook = null;
+  panelEl.setAttribute("role", "dialog");
+  panelEl.setAttribute("aria-modal", "true");
+  panelEl.setAttribute("aria-labelledby", "dp-title");
+  panelEl.innerHTML = "";
+
+  const lhRows = [];
+  for (let n = idx; n <= Math.min(days - 1, idx + conn); n++)
+    if (b2[n]) lhRows.push(n);
+
+  const legRow = (from, to, dayIdx, bits, extra = "") => `
+    <div class="pp-leg">
+      <span class="pp-leg-route">${from}→${to}</span>
+      <span class="pp-leg-date">${esc(fmtRet.format(dayDate(dayIdx)))}${extra}</span>
+      ${stackHTML(bits, { size: "row" })}
+      <a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
+         href="${baBookingURL(from, to, isoOf(dayDate(dayIdx)), 0, null, pax)}">Book ↗</a>
+    </div>`;
+
+  panelEl.append(el(`<div>
+    <button class="dp-close" type="button" aria-label="Close">×</button>
+    <div class="dp-head">
+      <div>
+        <p class="dp-date">${esc(fmtDate.format(dayDate(idx)))}</p>
+        <p class="dp-route" id="dp-title">${o} <span style="color:var(--gold)" aria-hidden="true">→</span> ${hub} <span style="color:var(--gold)" aria-hidden="true">→</span> ${d}</p>
+      </div>
+      ${stackHTML(b1[idx], { size: "row" })}
+    </div>
+    <p class="dp-lead">Two separate award bookings, matched on award space — verify
+      connection timings before booking:</p>
+    <div class="pp-legs">
+      ${legRow(o, hub, idx, b1[idx])}
+      ${lhRows.map((n) => legRow(hub, d, n, b2[n], n === idx ? " <small>(same day)</small>" : "")).join("")}
+    </div>
+    <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
+      Availability moves fast — verify with British Airways before planning.</p>
+  </div>`));
+  showPanelChrome();
+}
+
 function showPanelChrome() {
   panelEl.hidden = false; scrimEl.hidden = false;
   document.body.classList.add("modal-open");

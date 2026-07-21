@@ -1,9 +1,10 @@
 # Multi-city reward planning — scope + design spec
 
-Status: SCOPED, engine prototyped dormant (2026-07-21). The chain engine ships
-in `site/app.js` (`resolveRoutings`, `chainBits`) with a full test suite, but no
-view calls it yet. This document records the feasibility findings so the UI
-phase starts from evidence, not memory.
+Status: LEVEL 1 SHIPPED (2026-07-21). The chain engine (`resolveRoutings`,
+`chainBits`, `focusLegs`) and the Level 1 smart-search UI are live: searching
+a pair with no direct route (BLL→TYO) resolves through the hub and renders a
+via-trip calendar with per-leg booking. This document records the feasibility
+findings and the design decisions the adversarial review forced.
 
 Motivating user story: living in Denmark, an award trip to Tokyo is really
 Billund→London→Tokyo — two separate redemptions. Today the site treats
@@ -38,43 +39,43 @@ Two primitives in `site/app.js`, directly after `roundTripBits`:
 
   ```js
   // Billund→Tokyo return in Club: ≤1-day connections at LON, 7–14 nights in
-  // Tokyo, cabin filter on the long-haul (leg 1) — the real itinerary is ONE
-  // call:
-  chainBits(["BLL","LON","TYO","LON","BLL"], 4, [[0,1],[7,14],[0,1]], pax, 1)
+  // Tokyo, Club coupled across BOTH long-haul legs (legs 1 and 2), hops free:
+  chainBits(["BLL","LON","TYO","LON","BLL"], 4, [[0,1],[7,14],[0,1]], pax, [1,2])
   ```
 
-  **`focus` is the load-bearing design decision** (found by adversarial
-  review). Chain legs are separate redemptions, so the cabin filter must not
-  couple them the way `roundTripBits` couples a single-ticket round trip.
-  Measured on the fixture: BLL-LON has **0** premium-economy days while
-  LON-TYO has **112** — a same-cabin W search from Billund would be empty
-  forever, while focus-on-long-haul finds 128 one-way / 81 full-round-trip
-  days on the same data. So `mask` applies only to the `focus` leg (callers
-  default it to the longest leg by great-circle distance — every place ships
-  `g` coords); other legs need award space in ANY cabin for the same party.
-  The result's bits are the focus leg's cabins, keyed by first-leg departure
-  day. `focus = null` keeps the coupled single-ticket semantics, and with
-  path `[A,B,A]`, gaps `[[m,M]]` is *provably* `roundTripBits(A-B, B-A, mask,
-  m, M)` — the cross-check that anchors the engine to shipped code.
+  **`focus` is the load-bearing design decision** (forced by two rounds of
+  adversarial review). Chain legs are separate redemptions, so the cabin
+  filter must not couple every leg the way `roundTripBits` couples a
+  single-ticket round trip: measured, BLL-LON has **0** premium-economy days
+  while LON-TYO has **112** — an all-coupled W search from Billund is empty
+  forever, while the shipped semantics find 73 full-round-trip W days on the
+  same data. Round two caught the overshoot: a single focus leg would light
+  "Club" days whose return long-haul was Economy-only. So `focus` is an
+  ARRAY of leg indices: those legs couple to one shared cabin (a "Club" trip
+  means Club on both long legs), every other leg needs award space in ANY
+  cabin for the same party. `focusLegs(path)` picks them: every leg at least
+  half as long (great-circle, from the places' `g` coords) as the longest.
+  The result's bits are the focus legs' shared cabins, keyed by first-leg
+  departure day. `focus = null` couples ALL legs — with path `[A,B,A]`, gaps
+  `[[m,M]]` that is *provably* `roundTripBits(A-B, B-A, mask, m, M)`, the
+  cross-check anchoring the engine to shipped code.
 
-  Backward pass: `reach[i][d]` = what legs *i..end* permit from day *d*
-  (feasibility sentinel after the focus leg, focus cabins at and before it).
-  O(legs × days × window). pax>1 thresholds every leg with seats data and
-  falls back to presence bits elsewhere (same honest-note contract as the
-  round-trip engine).
+  Backward pass, one rule for every leg: a focus leg ANDs its masked cabins
+  into the payload; a non-focus leg gates on any-space and passes the payload
+  through (seeded at "every cabin" when no focus leg follows). O(legs × days
+  × window). pax>1 thresholds every leg with seats data and falls back to
+  presence elsewhere; the VIEWS apply pax only when every leg has the seats
+  layer (`chainSeatsKnown`), same one-consistent-threshold stance as the
+  direct pages.
 
-Uncached for now; when a view adopts it, add a cache alongside `rtCache`
-(reset in `adoptBundle`, pax + gaps + focus in the key).
-
-Tests: `mctest.js` (harness dir) — 27 checks in the real minified build against
-the `data-out-test` fixture: routing resolution (hub, direct-first, no
-self-trips), every chain shape cross-checked against an independent per-bit
-brute-force reference (coupled AND focus modes, pax 1 and 4, one-way and
-4-leg), equality with `roundTripBits`, zero-gap connection ≡ AND of legs, the
-coupled-W-empty vs focus-W-nonzero asymmetry above, monotonicity (coupled ⊆
-focus, full trip ⊆ its opener, pax 4 ⊆ pax 1), and all-zeros on missing legs /
-malformed gaps / out-of-range focus. Fixture yields 147 one-way and 98
-full-round-trip coupled matching days — real data, not vacuous passes.
+Tests: `mctest.js` (harness dir) — 34 engine checks in the real minified build
+against the `data-out-test` fixture: routing resolution, every chain shape
+cross-checked against an independent per-bit brute-force reference (coupled,
+single-focus, dual-focus; pax 1 and 4; one-way and 4-leg), equality with
+`roundTripBits`, zero-gap connection ≡ AND of legs, the coupled-W-empty vs
+focus-W-nonzero asymmetry, monotonicity (coupled ⊆ focus, more focus legs ⊆
+fewer, full trip ⊆ opener, pax 4 ⊆ pax 1), `focusLegs` picks, and all-zeros on
+every malformed input. `viatest.js` — 30 UI checks (below).
 
 ## Honesty caveat (must surface in the UI)
 
@@ -98,16 +99,30 @@ independent bookings, and the UI should say so.
 
 ## Feature ladder
 
-1. **Smart search (recommended first, the user's own framing).** When a
-   searched pair has no direct route but `resolveRoutings` finds a one-stop,
-   render the trip view over `chainBits` instead of an empty state, with a
-   "via London" badge, a connection-window control (default [0,1] days), and
-   per-leg booking links. Cabin filter targets the longest leg (`focus`); the
-   UI states that plainly ("Club on the London–Tokyo leg; the Billund hop just
-   needs award space"). No new page, no new URL shape beyond a `via` param.
+1. **Smart search — SHIPPED.** The user's own framing: "searching BLL→TYO
+   should be smart enough to work out how to search for this properly."
+   - Home search: destinations reachable in one stop are pickable
+     (`reachableDests`); via pairs get no sparkline (a wrong shape is worse
+     than none). Picking lands on the normal `/trip/O-D` URL.
+   - `/trip/O-D` and `/route/O-D` with no direct route resolve a hub that
+     works in the needed direction(s) (`viaHub`) and render the via calendar:
+     "via London" badge, honesty note (separate bookings; dates matched on
+     award space, not flight times), connection-window control (same day /
+     ≤1 day / ≤2 days at the hub — `?conn=`, default ≤1), trip-length +
+     party controls as on direct pages, cabin chips recounted from the chain
+     with the filter on the long-haul legs, unreleased-horizon cards.
+   - Day panel: outbound legs as separate rows with per-leg BA deep links
+     (BA can't book multi-city awards online), a date chooser when the
+     connection window allows two long-haul days, return days as radio rows
+     (nights measured from the long-haul departure), hop-home dates included,
+     and a cabin line naming what's open on both long legs. Picks pin to
+     `?out=`/`?ret=` and restore on load, as on direct trips.
+   - No alert bell on via pages (chain alerts are a later phase; the note
+     says so). Direct routes are untouched — the via path only activates
+     where the empty state used to be.
 
-   *Level 1.5 (cheap follow-on):* when a direct route exists but the filtered
-   view is empty, also offer the via-hub alternative rather than a dead end —
+   *Level 1.5 (cheap follow-on, not built):* when a direct route exists but
+   the filtered view is empty, also offer the via-hub alternative —
    `resolveRoutings` already returns both, direct first.
 2. **Explicit multi-city builder.** User-composed N-leg itineraries with
    per-junction stopover windows and a chosen focus leg (the engine already
