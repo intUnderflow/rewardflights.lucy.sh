@@ -751,6 +751,7 @@ const store = {
   placeList: [],       // [{code,name,country,search[]}]
   origins: new Set(),
   destsByOrigin: new Map(),
+  chainCache: new Map(),
   monthCache: new Map(),
   rtCache: new Map(),
   hasAnySeatData: false, // any route in the adopted bundle carries the optional "s" seats layer
@@ -781,6 +782,7 @@ function adoptBundle(bundle, fromSnapshot) {
   store.destsByOrigin = new Map();
   store.monthCache = new Map();
   store.rtCache = new Map();
+  store.chainCache = new Map();
   // Seats layer ("s"): optional, additive, per route+airline. Validate it at
   // the same trust boundary as routes/places and recompute the presence flags
   // on EVERY adoption — a localStorage snapshot and the network bundle can
@@ -1047,6 +1049,26 @@ function roundTripBits(outKey, retKey, mask, minNights, maxNights, pax = 1) {
   return round;
 }
 
+/* One-stop destinations from o that have NO direct route: code -> {hub, both}.
+   `both` = the same hub also gets you home, so a round trip is plannable
+   (matching viaHub's rule); a hub that works both ways wins over one that
+   only gets you there. The map and /from/ list use this to show the whole
+   reachable world, not just the nonstop one. */
+function viaDestsFrom(o) {
+  const direct = new Set(store.destsByOrigin.get(o) || []);
+  const out = new Map();
+  for (const h of store.destsByOrigin.get(o) || []) {
+    for (const d of store.destsByOrigin.get(h) || []) {
+      if (d === o || direct.has(d)) continue;
+      const both = (store.destsByOrigin.get(d) || []).includes(h) &&
+        (store.destsByOrigin.get(h) || []).includes(o);
+      const cur = out.get(d);
+      if (!cur || (both && !cur.both)) out.set(d, { hub: h, both });
+    }
+  }
+  return out;
+}
+
 /* ---------------- multi-city chain engine ----------------
    Foundation for spoke-city planning (e.g. Billund→London→Tokyo): not yet wired
    to any view. Generalises the round-trip engine from a fixed out/return pair to
@@ -1093,8 +1115,9 @@ function resolveRoutings(o, d, { maxStops = 1 } = {}) {
    Missing leg / bad gaps / bad focus → all zeros. O(legs × days × window);
    pax>1 thresholds every leg and falls back to presence where a leg has no
    seats layer, matching the round-trip engine's honest-note contract.
-   Uncached — cheap enough to recompute per draw (O(days × window) per call);
-   revisit alongside rtCache only if profiling ever says so. */
+   Cached like roundTripBits (the map calls this per via destination on every
+   pan/zoom frame); chainCache resets on adoptBundle, and everything that
+   changes the answer — including pax and focus — is in the key. */
 function chainBits(path, mask, gaps, pax = 1, focus = null) {
   const days = store.bundle.days;
   const empty = () => new Uint8Array(days);
@@ -1104,6 +1127,8 @@ function chainBits(path, mask, gaps, pax = 1, focus = null) {
   if (focus !== null && !(Array.isArray(focus) && focus.length &&
       focus.every((f) => Number.isInteger(f) && f >= 0 && f < nLegs))) return empty();
   const t0 = Math.max(0, todayIndex());
+  const ck = `${path.join(".")}|${mask}|${gaps.map((g) => g.join("-")).join(".")}|${pax}|${focus ? focus.join(".") : "*"}|${t0}`;
+  if (store.chainCache.has(ck)) return store.chainCache.get(ck);
   const legBits = (k) => (pax > 1 ? (routeBitsAtLeast(k, pax) ?? routeBits(k)) : routeBits(k));
   const legs = [];
   for (let i = 0; i < nLegs; i++) {
@@ -1138,6 +1163,7 @@ function chainBits(path, mask, gaps, pax = 1, focus = null) {
     }
     reach = cur;
   }
+  store.chainCache.set(ck, reach);
   return reach;
 }
 
@@ -4420,22 +4446,25 @@ function renderFrom(o) {
 
   mainEl.innerHTML = "";
   const dests = (store.destsByOrigin.get(o) || []).slice();
+  const vias = viaDestsFrom(o);
   // The list respects an active party size (URL → pref → 1) so its counts
   // agree with the map and the calendars behind the cards. Routes without
   // seat data keep any-party counts, with the honest note below.
   const pax = activePax();
+  const conn = getConnPref() ?? 1; // the calendar behind a via card reads the same pref
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
     <div class="view-toggle" role="group" aria-label="View">
       <span class="vt-on" aria-current="page">List</span><a href="/map/${o}${pax > 1 ? `?pax=${pax}` : ""}">Map</a>
     </div>
-    <p class="page-sub">${dests.length} destinations with award seats in the next year.
+    <p class="page-sub">${dests.length + vias.size} destinations with award seats in the next year${
+      vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}.
       Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).</p>
     ${pax > 1 ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
   </div>`));
 
-  if (!dests.length) {
+  if (!dests.length && !vias.size) {
     mainEl.append(el(`<div class="empty-state">
       <div class="big">No destinations right now.</div>
       <p>No award seats from ${esc(placeName(o))} in the current data.</p></div>`));
@@ -4443,18 +4472,14 @@ function renderFrom(o) {
   }
 
   // Counts are ROUND-TRIPPABLE days over the default window (any cabin): a day
-  // counts only when its outbound has a valid same-cabin return. Destinations
-  // with outbound space but zero such days keep their card, grayed and badged.
+  // counts only when its outbound has a valid same-cabin return — for a via
+  // destination, when the whole chain completes (cabins coupled on the long
+  // legs, hops any space, overnight stops at the hub). Destinations with
+  // outbound space but zero such days keep their card, grayed and badged.
   const t0 = Math.max(0, todayIndex());
   const allMask = cabinLegend().reduce((m, [bit]) => m | bit, 0);
   const months = next12Months();
-  const cards = dests.map((d) => {
-    const key = `${o}-${d}`;
-    // Per-route honesty: a pair without seat data on both legs counts at
-    // any-party (never silently vanishing at pax >= 2) and gets a badge.
-    const known = pax <= 1 || pairSeatsKnown(key, `${d}-${o}`);
-    const cardPax = known ? pax : 1;
-    const rt = roundTripBits(key, `${d}-${o}`, allMask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1], cardPax);
+  const tally = (rt) => {
     let total = 0, union = 0;
     for (let i = t0; i < rt.length; i++) if (rt[i]) { total++; union |= rt[i]; }
     const counts = months.map((mo) => {
@@ -4462,23 +4487,46 @@ function renderFrom(o) {
       for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, rt.length); i++) if (rt[i]) n++;
       return n;
     });
+    return { total, union, counts };
+  };
+  const cards = dests.map((d) => {
+    const key = `${o}-${d}`;
+    // Per-route honesty: a pair without seat data on both legs counts at
+    // any-party (never silently vanishing at pax >= 2) and gets a badge.
+    const known = pax <= 1 || pairSeatsKnown(key, `${d}-${o}`);
+    const cardPax = known ? pax : 1;
+    const rt = roundTripBits(key, `${d}-${o}`, allMask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1], cardPax);
     const unverified = pax > 1 && !known;
     // Outbound totals follow the SAME coverage rule as the round-trip
     // numbers: a card badged "shown for any party" must not mix in
     // pax-thresholded outbound swatches or sort rank.
-    return { d, key, total, union, counts, unverified, out: routeTotals(key, cardPax) };
-  }).sort((a, b) => b.total - a.total || b.out.total - a.out.total);
+    return { d, key, via: null, ...tally(rt), unverified, out: routeTotals(key, cardPax) };
+  }).concat([...vias].map(([d, { hub, both }]) => {
+    const fullPath = [o, hub, d, hub, o];
+    const outPath = [o, hub, d];
+    // Hop legs carry no seat data, so via counts are any-party (badged below).
+    const rt = both
+      ? chainBits(fullPath, allMask, [[1, conn], [NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]], [1, conn]], 1, focusLegs(fullPath))
+      : new Uint8Array(store.bundle.days);
+    const ob = chainBits(outPath, allMask, [[1, conn]], 1, focusLegs(outPath));
+    let obTotal = 0, obUnion = 0;
+    for (let i = t0; i < ob.length; i++) if (ob[i]) { obTotal++; obUnion |= ob[i]; }
+    return { d, key: `${o}-${d}`, via: hub, ...tally(rt), unverified: pax > 1,
+      out: { total: obTotal, union: obUnion } };
+  })).sort((a, b) => b.total - a.total || b.out.total - a.out.total);
 
   const grid = el(`<div class="dest-grid"></div>`);
   const max = Math.max(1, ...cards.flatMap((c) => c.counts));
   for (const c of cards) {
+    if (c.total === 0 && c.out.total === 0) continue; // unreachable via candidate
     const ow = c.total === 0; // outbound space only — nothing round-trippable
     const cabs = cabinLegend().filter(([bit]) => (ow ? c.out.union : c.union) & bit)
       .map(([bit, label]) => `<span class="swatch ${bitClass(bit)}" title="${esc(label)}"></span>`).join("");
     grid.append(el(`<a class="dest-card${ow ? " dc-ow" : ""}" href="/trip/${c.key}${pax > 1 ? `?pax=${pax}` : ""}">
       <span class="dc-head"><span class="dc-code">${c.d}</span>
         <span class="dc-name">${esc(placeName(c.d))}</span>
-        <span class="dc-country">${esc(placeCountry(c.d))}</span></span>
+        <span class="dc-country">${esc(placeCountry(c.d))}</span>
+        ${c.via ? `<span class="dc-badge dc-via">via ${c.via}</span>` : ""}</span>
       <span class="dc-spark" aria-hidden="true">${c.counts.map((n) =>
         `<i style="height:${Math.max(2, Math.round((n / max) * 30))}px"></i>`).join("")}</span>
       <span class="dc-meta">${ow
@@ -4531,6 +4579,11 @@ function renderMap(o) {
   if (!store.bundle) return;
 
   const dests = (store.destsByOrigin.get(o) || []).slice();
+  const vias = viaDestsFrom(o);
+  // Direct dots first, then via dots: later SVG siblings paint on top, and a
+  // nonstop option must never be buried under its one-stop neighbours.
+  const spots = dests.map((d) => ({ d, via: null, both: true }))
+    .concat([...vias].map(([d, { hub, both }]) => ({ d, via: hub, both })));
   mainEl.innerHTML = "";
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
@@ -4538,12 +4591,11 @@ function renderMap(o) {
     <div class="view-toggle" role="group" aria-label="View">
       <a href="/from/${o}">List</a><span class="vt-on" aria-current="page">Map</span>
     </div>
-    <p class="page-sub">Every dot is a destination with bookable round trips
-      (same cabin both ways) — free, no account, data as of ${esc(freshLabel())}.
-      Tap a dot for the route's calendar.</p>
+    <p class="page-sub">Every dot is a destination with bookable round trips —
+      tap one for its calendar.</p>
   </div>`));
 
-  if (!dests.length) {
+  if (!spots.length) {
     mainEl.append(el(`<div class="empty-state">
       <div class="big">No destinations right now.</div>
       <p>No award seats from ${esc(placeName(o))} in the current data.</p></div>`));
@@ -4579,6 +4631,7 @@ function renderMap(o) {
   // Party size: same seed order and, like cabins, a shared map link's pax
   // governs the pages behind its dots via the session pref.
   let pax = activePax();
+  const conn = getConnPref() ?? 1; // via metrics match the calendar behind the dot
   if (store.hasAnySeatData) setPaxPref(pax);
   const controls = el(`<div class="section-pad map-controls">
     <div class="chips" role="group" aria-label="Cabins">${cabinLegend().map(([bit, label]) =>
@@ -4658,8 +4711,9 @@ function renderMap(o) {
     <div class="map-loading"><div class="sk-line" style="height:200px"></div></div>
   </div>`);
   mainEl.append(panel, el(`<p class="map-legend">Dot colour is the best cabin
-    available; dot size is how many days have round trips. Drag to pan, scroll or
-    pinch to zoom.</p>`));
+    available; dot size is how many days have round trips. Hollow dots connect
+    with one overnight stop (the cabin applies to the long legs). Drag to pan,
+    scroll or pinch to zoom.</p>`));
 
   loadWorld().then(() => {
     if (current.page !== "map" || current.params.o !== o) return; // navigated away
@@ -4675,9 +4729,21 @@ function renderMap(o) {
      party size >= 2, a pair without seat data on both legs stays on the map
      at any-party counts with `unverified` set (excluding it would make the
      map lie by omission; including it unmarked, by assertion). */
-  function metric(d) {
-    const known = pax <= 1 || pairSeatsKnown(`${o}-${d}`, `${d}-${o}`);
-    const rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, nights[0], nights[1], known ? pax : 1);
+  function metric(spot) {
+    const d = spot.d;
+    let rt, known;
+    if (spot.via) {
+      // The whole chain must complete: cabins coupled on the long legs, hops
+      // any space, overnight stops at the hub. No hop seat data -> any-party.
+      known = pax <= 1;
+      const fullPath = [o, spot.via, d, spot.via, o];
+      rt = spot.both
+        ? chainBits(fullPath, mask, [[1, conn], [nights[0], nights[1]], [1, conn]], 1, focusLegs(fullPath))
+        : new Uint8Array(store.bundle.days);
+    } else {
+      known = pax <= 1 || pairSeatsKnown(`${o}-${d}`, `${d}-${o}`);
+      rt = roundTripBits(`${o}-${d}`, `${d}-${o}`, mask, nights[0], nights[1], known ? pax : 1);
+    }
     const t0 = Math.max(0, todayIndex());
     const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
     const from = mo ? Math.max(mo.start, t0) : t0;
@@ -4716,33 +4782,40 @@ function renderMap(o) {
     function redraw() {
       let shown = 0, unplaced = 0;
       const parts = [];
+      let originDot = "";
       if (og) {
         const [ox, oy] = projectLL(og[0], og[1]);
-        parts.push(`<circle class="map-origin" cx="${ox}" cy="${oy}" r="${4 / kOf()}"></circle>`);
+        originDot = `<circle class="map-origin" cx="${ox}" cy="${oy}" r="${4 / kOf()}"></circle>`;
       }
-      let unverifiedShown = 0;
-      for (const d of dests) {
+      let unverifiedShown = 0, viaShown = 0;
+      const viaParts = [];
+      for (const spot of spots) {
+        const d = spot.d;
         const g = store.bundle.places[d]?.g;
-        const { days, best, unverified } = metric(d);
+        const { days, best, unverified } = metric(spot);
         if (!days) continue;
         if (!g) { unplaced++; continue; }
         shown++;
         if (unverified) unverifiedShown++;
+        if (spot.via) viaShown++;
         const [x, y] = projectLL(g[0], g[1]);
         // Radius grows with the square root of match-days so area ~ days.
         const r = (2.1 + Math.sqrt(days) * 0.38) / kOf();
-        parts.push(`<circle class="map-dot ${bitClass(best)}${unverified ? " map-dot-unv" : ""}" cx="${x}" cy="${y}" r="${r}"
-          tabindex="0" role="link" data-code="${d}" data-days="${days}" data-best="${best}"${unverified ? ` data-unv="1"` : ""}
-          aria-label="${esc(placeName(d))}: ${days} day${days > 1 ? "s" : ""} with round trips${
+        (spot.via ? viaParts : parts).push(`<circle class="map-dot ${bitClass(best)}${unverified ? " map-dot-unv" : ""}${spot.via ? " map-dot-via" : ""}" cx="${x}" cy="${y}" r="${r}"${spot.via ? ` stroke-width="${1.1 / kOf()}"` : ""}
+          tabindex="0" role="link" data-code="${d}" data-days="${days}" data-best="${best}"${unverified ? ` data-unv="1"` : ""}${spot.via ? ` data-via="${spot.via}"` : ""}
+          aria-label="${esc(placeName(d))}: ${days} day${days > 1 ? "s" : ""} with round trips${spot.via ? ` via ${esc(placeName(spot.via))} (overnight stop)` : ""}${
             pax > 1 ? (unverified ? " — seat counts pending, shown for any party" : ` for ${pax} travelling together`) : ""} — open calendar"></circle>`);
       }
-      dotsG.innerHTML = parts.join("");
+      // Paint order (SVG: later wins): via dots underneath, nonstop dots
+      // above them, the origin marker on top.
+      dotsG.innerHTML = viaParts.join("") + parts.join("") + originDot;
       const monthLabel = monthIdx >= 0 ? ` in ${next12Months()[monthIdx].label}` : "";
       const nightsLabel = nights[0] === NIGHTS_DEFAULT[0] && nights[1] === NIGHTS_DEFAULT[1]
         ? "" : ` of ${nights[0]}–${nights[1]} nights`;
       const paxLabel = pax > 1 ? ` for ${pax} travelling together` : "";
       $(".map-count", controls).textContent =
-        `${shown} of ${dests.length} destinations have round trips${paxLabel}${nightsLabel}${monthLabel} in the cabins you picked` +
+        `${shown} of ${spots.length} destinations have round trips${paxLabel}${nightsLabel}${monthLabel} in the cabins you picked` +
+        (viaShown ? ` — ${viaShown} with an overnight stop` : "") +
         (unverifiedShown ? ` (${unverifiedShown} shown for any party — seat counts pending)` : "") +
         (unplaced ? ` (${unplaced} more can't be placed on the map yet — see the list)` : "") + ".";
     }
@@ -4754,6 +4827,7 @@ function renderMap(o) {
       tip.innerHTML = `<div class="t-date">${esc(placeName(d))} <span class="map-tip-code">${d}</span></div>
         <div class="t-cab"><span class="swatch ${bitClass(best)}"></span>
           ${days} day${days === "1" ? "" : "s"} with round trips${pax > 1 && !dot.dataset.unv ? ` for ${pax}` : ""} · best: ${esc(label)}</div>
+        ${dot.dataset.via ? `<div class="t-note">via ${esc(placeName(dot.dataset.via))} — overnight stop each way</div>` : ""}
         ${dot.dataset.unv ? `<div class="t-note">seat counts not yet available — shown for any party</div>` : ""}`;
       tip.hidden = false;
       const pr = panel.getBoundingClientRect(), dr = dot.getBoundingClientRect();

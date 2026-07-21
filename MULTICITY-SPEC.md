@@ -123,6 +123,12 @@ independent bookings, and the UI should say so.
      wire; no party row — hop routes carry no seat data). Direct routes are
      untouched — the via path only activates where the empty state used to
      be.
+   - "Where can you go" (map + `/from/` list) shows the whole reachable
+     world (`viaDestsFrom`): via destinations render as hollow cabin-colored
+     rings under the solid nonstop dots (and badged cards), counted by the
+     chain engine with the same overnight stops, and click through to the
+     via calendar. chainBits gained the rtCache-style cache this made
+     necessary (the map recounts on every pan frame).
 
    *Level 1.5 (cheap follow-on, not built):* when a direct route exists but
    the filtered view is empty, also offer the via-hub alternative —

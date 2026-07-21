@@ -661,6 +661,12 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }
 /* map: pair lacks seat data at pax >= 2 — shown at any-party, cued hollow-ish */
 .map-dot-unv { fill-opacity: .45; stroke-dasharray: 2 1.4; }
+/* Via (one-stop) destinations: hollow — the fill drops out, the cabin colour
+   moves to the ring, so nonstop dots stay visually primary at any zoom. */
+.map-dot-via { fill-opacity: .18; stroke: currentColor; }
+.map-dot-via.cab-m { color: var(--cab-m); } .map-dot-via.cab-w { color: var(--cab-w); }
+.map-dot-via.cab-c { color: var(--cab-c); } .map-dot-via.cab-f { color: var(--cab-f); }
+.dc-badge.dc-via { color: var(--gold); border-color: var(--gold); }
 
 /* year strip — 12 months at a glance */
 .year-strip { display: grid; grid-template-columns: repeat(12, 1fr); gap: 6px; margin: 18px 0 34px; }
