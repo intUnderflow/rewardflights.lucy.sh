@@ -127,7 +127,8 @@ independent bookings, and the UI should say so.
      world (`viaDestsFrom`): via dots look like every other dot — hovering
      (or focusing) any dot draws its ROUTE as projected great-circle arcs
      (`gcRuns`, antimeridian-safe), one arc nonstop or two with a gold ring
-     at the overnight connection (owner call: a permanent translucent
+     at the overnight connection, while every dot OFF the route dims so the
+     arcs read through dense clusters (owner calls: a permanent translucent
      treatment read as noise; the routing appears when you ask). List cards
      badge "via LON". All counts come from the chain engine with the same
      overnight stops and click through to the via calendar. chainBits

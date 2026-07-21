@@ -4877,6 +4877,14 @@ function renderMap(o) {
       if (!og) return;
       const dg = store.bundle.places[dot.dataset.code]?.g;
       if (!dg) return;
+      // The route owns the map while you ask about it: every dot off the
+      // route dims so the arcs read through dense clusters (the hub dot —
+      // always also a direct destination — stays lit with the hovered one).
+      dotsG.classList.add("routing");
+      dot.classList.add("route-on");
+      if (dot.dataset.via) {
+        dotsG.querySelector(`.map-dot[data-code="${dot.dataset.via}"]`)?.classList.add("route-on");
+      }
       const cab = bitClass(Number(dot.dataset.best));
       const hubG = dot.dataset.via ? store.bundle.places[dot.dataset.via]?.g : null;
       const segs = hubG ? [[og, hubG], [hubG, dg]] : [[og, dg]];
@@ -4893,7 +4901,11 @@ function renderMap(o) {
       }
       pathsG.innerHTML = html;
     }
-    function hidePath() { pathsG.innerHTML = ""; }
+    function hidePath() {
+      pathsG.innerHTML = "";
+      dotsG.classList.remove("routing");
+      for (const d of dotsG.querySelectorAll(".route-on")) d.classList.remove("route-on");
+    }
     dotsG.addEventListener("pointerover", (e) => { const d = e.target.closest(".map-dot"); if (d) { showMapTip(d); showPath(d); } });
     dotsG.addEventListener("pointerout", () => { tip.hidden = true; hidePath(); });
     dotsG.addEventListener("focusin", (e) => { const d = e.target.closest(".map-dot"); if (d) { showMapTip(d); showPath(d); } });

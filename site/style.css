@@ -461,7 +461,11 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .map-svg:active { cursor: grabbing; }
 .map-sea { fill: var(--surface); }
 .map-land { fill: var(--panel-2); stroke: var(--line); stroke-width: .5; }
-.map-dot { stroke: var(--surface); stroke-width: .6; cursor: pointer; }
+.map-dot { stroke: var(--surface); stroke-width: .6; cursor: pointer; transition: fill-opacity .15s ease; }
+/* While a route is shown, dots off it recede so the arcs read through dense
+   clusters; the hovered dot and its hub stay lit (the origin ring is not a
+   .map-dot and never dims). */
+.map-dots.routing .map-dot:not(.route-on) { fill-opacity: .15; }
 .map-dot.cab-m { fill: var(--cab-m); }
 .map-dot.cab-w { fill: var(--cab-w); }
 .map-dot.cab-c { fill: var(--cab-c); }
