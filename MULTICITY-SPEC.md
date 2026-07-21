@@ -79,12 +79,14 @@ every malformed input. `viatest.js` — 30 UI checks (below).
 
 ## Honesty caveat (must surface in the UI)
 
-The data is day-granular. "Same-day connection" (gap 0) means both legs have
-award space on the same calendar day — NOT that the BLL arrival beats the TYO
-departure, and long-haul overnight arrivals shift a day. So the default
-connection window should be **[0, 1]** and the UI must say "award space on both
-legs, timings not checked — verify when booking". This is the same
-point-in-time honesty stance the footer already takes.
+The data is day-granular: it can say two legs have award space on given days,
+never that an arrival beats a departure. **The overnight-stop rule (owner
+decision, 2026-07-21) resolves this:** every hub junction has a hard 1-night
+floor (`conn` = 1..3 nights, default 1; no same-day option anywhere — site,
+engine, or server), because any arrival today makes any departure tomorrow
+bookable. Residual caveat the via note still carries: a long-haul FIRST leg
+can itself land the next calendar day. Same point-in-time honesty stance as
+the footer.
 
 ## Booking reality (investigated 2026-07-21)
 
@@ -107,8 +109,8 @@ independent bookings, and the UI should say so.
    - `/trip/O-D` and `/route/O-D` with no direct route resolve a hub that
      works in the needed direction(s) (`viaHub`) and render the via calendar:
      "via London" badge, honesty note (separate bookings; dates matched on
-     award space, not flight times), connection-window control (same day /
-     ≤1 day / ≤2 days at the hub — `?conn=`, default ≤1), trip-length +
+     award space, not flight times), stop-length control (1 / ≤2 / ≤3
+     nights at the hub — `?conn=`, default 1 night; overnight floor by design), trip-length +
      party controls as on direct pages, cabin chips recounted from the chain
      with the filter on the long-haul legs, unreleased-horizon cards.
    - Day panel: outbound legs as separate rows with per-leg BA deep links
@@ -117,9 +119,10 @@ independent bookings, and the UI should say so.
      (nights measured from the long-haul departure), hop-home dates included,
      and a cabin line naming what's open on both long legs. Picks pin to
      `?out=`/`?ret=` and restore on load, as on direct trips.
-   - No alert bell on via pages (chain alerts are a later phase; the note
-     says so). Direct routes are untouched — the via path only activates
-     where the empty state used to be.
+   - Alert bell on via pages saves chain watches (`via` + `conn` on the
+     wire; no party row — hop routes carry no seat data). Direct routes are
+     untouched — the via path only activates where the empty state used to
+     be.
 
    *Level 1.5 (cheap follow-on, not built):* when a direct route exists but
    the filtered view is empty, also offer the via-hub alternative —
@@ -131,7 +134,8 @@ independent bookings, and the UI should say so.
    The star topology makes it pointless today: every pair is already reachable
    in ≤1 stop through LON.
 
-Alerts on chains are a later phase: the server detection engine evaluates the
-same chain (its leg-gains theorem generalizes — a chain is newly bookable iff
-bookable now AND ≥1 leg gained), watch model grows an optional `path`/`gaps`.
-Not started.
+**Alerts on chains — SHIPPED (2026-07-21).** The watch model grew `via` +
+`conn`, the server detection engine evaluates whole chains (the leg-gains
+theorem generalizes: a chain is newly bookable iff bookable now AND ≥1 leg
+gained — where a hop leg "gains" only on no-space → some-space), and the bell
+is live on via pages. See ALERTS-SPEC "Via (chain) watches".

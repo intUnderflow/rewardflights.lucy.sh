@@ -21,10 +21,14 @@ var cabinNames = map[string]string{
 	"M": "Economy", "W": "Premium Economy", "C": "Business", "F": "First",
 }
 
-// group is one route+kind's worth of news, the unit a message talks about.
+// group is one route+kind(+via)'s worth of news, the unit a message talks
+// about. Via joins the key so direct and chain news on the same endpoints
+// never merge into one misleading line.
 type group struct {
 	route string
 	kind  string
+	via   string
+	conn  int
 	items []item
 }
 
@@ -116,11 +120,11 @@ func cabinRank(cabin string) int {
 func groupItems(items []item) []group {
 	var groups []group
 	for _, it := range items {
-		if n := len(groups); n > 0 && groups[n-1].route == it.Route && groups[n-1].kind == it.Kind {
+		if n := len(groups); n > 0 && groups[n-1].route == it.Route && groups[n-1].kind == it.Kind && groups[n-1].via == it.Via {
 			groups[n-1].items = append(groups[n-1].items, it)
 			continue
 		}
-		groups = append(groups, group{route: it.Route, kind: it.Kind, items: []item{it}})
+		groups = append(groups, group{route: it.Route, kind: it.Kind, via: it.Via, conn: it.Conn, items: []item{it}})
 	}
 	return groups
 }
@@ -139,13 +143,19 @@ func cabinsIn(g group) []string {
 	return out
 }
 
-// routeLabel renders LON ⇄ TYO for round trips, LON → TYO for one-ways.
+// routeLabel renders LON ⇄ TYO for round trips, LON → TYO for one-ways, with
+// the hub named on chain news ("BLL ⇄ TYO via LON") — a via alert that reads
+// like a direct route would promise a flight that doesn't exist.
 func routeLabel(g group) string {
 	orig, dest := g.route[:3], g.route[4:]
+	label := orig + " → " + dest
 	if g.kind == alertstore.KindRT {
-		return orig + " ⇄ " + dest
+		label = orig + " ⇄ " + dest
 	}
-	return orig + " → " + dest
+	if g.via != "" {
+		label += " via " + g.via
+	}
+	return label
 }
 
 func groupTitle(g group) string {
@@ -252,11 +262,19 @@ func digestCount(g group) string {
 // that trip selected — the whole point of the message.
 func groupURL(g group) string {
 	first := g.items[0]
+	// ?conn= only off the default, mirroring the site's own URL canon.
+	conn := ""
+	if g.via != "" && g.conn > 1 {
+		conn = fmt.Sprintf("&conn=%d", g.conn)
+	}
 	if g.kind == alertstore.KindOW {
+		if conn != "" {
+			return siteURL + "/route/" + g.route + "?" + conn[1:]
+		}
 		return siteURL + "/route/" + g.route
 	}
-	return fmt.Sprintf("%s/trip/%s?nights=%d-%d&out=%s&ret=%s",
-		siteURL, g.route, first.NMin, first.NMax, first.Out, first.Ret)
+	return fmt.Sprintf("%s/trip/%s?nights=%d-%d&out=%s&ret=%s%s",
+		siteURL, g.route, first.NMin, first.NMax, first.Out, first.Ret, conn)
 }
 
 // renderItem renders one piece of news: a pair for round trips, a single

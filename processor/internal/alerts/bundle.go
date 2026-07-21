@@ -3,6 +3,7 @@ package alerts
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"time"
 )
 
@@ -23,6 +24,68 @@ type bundleState struct {
 	// this map has no seat data at all: "unknown", which is distinct from a
 	// present route whose codes are 0.
 	seats map[string][]byte
+	// coords: place -> [lat, lon], for deriving a via watch's focus legs the
+	// same way the site does (focusLegs). Places without coords are absent.
+	coords map[string][2]float64
+}
+
+// bitsAt returns a route's merged presence bits for an absolute day (0 when
+// the route or day is unknown).
+func (b *bundleState) bitsAt(route string, day int) byte {
+	bits, ok := b.merged[route]
+	if !ok {
+		return 0
+	}
+	i := day - b.epochDay
+	if i < 0 || i >= len(bits) {
+		return 0
+	}
+	return bits[i]
+}
+
+// legKm is the great-circle length of a route in km (0 when either endpoint
+// has no coordinates).
+func (b *bundleState) legKm(route string) float64 {
+	if len(route) != 7 {
+		return 0
+	}
+	ga, okA := b.coords[route[:3]]
+	gb, okB := b.coords[route[4:]]
+	if !okA || !okB {
+		return 0
+	}
+	const rad = math.Pi / 180
+	s := sq(math.Sin(((gb[0]-ga[0])*rad)/2)) +
+		math.Cos(ga[0]*rad)*math.Cos(gb[0]*rad)*sq(math.Sin(((gb[1]-ga[1])*rad)/2))
+	return 2 * 6371 * math.Asin(math.Sqrt(s))
+}
+
+func sq(x float64) float64 { return x * x }
+
+// focusLegs mirrors the site's rule: the cabin filter targets every leg at
+// least half as long as the longest. No coords anywhere -> every leg (couple
+// everything, the conservative direction).
+func (b *bundleState) focusLegs(legs []string) []int {
+	km := make([]float64, len(legs))
+	maxKm := 0.0
+	for i, leg := range legs {
+		km[i] = b.legKm(leg)
+		if km[i] > maxKm {
+			maxKm = km[i]
+		}
+	}
+	var out []int
+	for i, k := range km {
+		if maxKm > 0 && k >= maxKm/2 {
+			out = append(out, i)
+		}
+	}
+	if len(out) == 0 {
+		for i := range legs {
+			out = append(out, i)
+		}
+	}
+	return out
 }
 
 // seatNeed converts a watch's MinSeats to the threshold code it requires:
@@ -84,6 +147,9 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		Airlines map[string]struct {
 			Width int `json:"width"`
 		} `json:"airlines"`
+		Places map[string]struct {
+			G []float64 `json:"g"`
+		} `json:"places"`
 		Routes map[string]struct {
 			A map[string]string `json:"a"`
 			S map[string]string `json:"s"`
@@ -172,7 +238,14 @@ func parseBundle(raw []byte) (*bundleState, error) {
 			seats[route] = packed
 		}
 	}
-	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen, merged: merged, seats: seats}, nil
+	coords := map[string][2]float64{}
+	for code, p := range b.Places {
+		if len(p.G) == 2 {
+			coords[code] = [2]float64{p.G[0], p.G[1]}
+		}
+	}
+	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen,
+		merged: merged, seats: seats, coords: coords}, nil
 }
 
 // cabinOrder is the canonical M W C F ordering, used everywhere cabins are

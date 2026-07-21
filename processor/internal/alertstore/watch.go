@@ -35,7 +35,16 @@ const (
 
 var (
 	routeRe = regexp.MustCompile(`^[A-Z]{3}-[A-Z]{3}$`)
+	placeRe = regexp.MustCompile(`^[A-Z]{3}$`)
 	dateRe  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+)
+
+// Via-watch stop-length bounds, in nights at the hub (site parseConn parity).
+// The floor is 1 by design: flight times aren't in the data, so a same-day
+// connection can't be promised — an overnight stop can.
+const (
+	MinConn = 1
+	MaxConn = 3
 )
 
 // cabinBit maps a cabin letter to its availability bit; cabinRank gives the
@@ -67,6 +76,14 @@ type Watch struct {
 	Out    *Range   `json:"out,omitempty"`
 	Ret    *Range   `json:"ret,omitempty"` // rt only
 	Nights *Nights  `json:"nights,omitempty"`
+	// Via marks a one-stop chain watch: the Route endpoints have no direct
+	// route and the journey changes at this hub (BLL-TYO via LON = the legs
+	// BLL-LON, LON-TYO[, TYO-LON, LON-BLL]). Cabins then constrain the
+	// long-haul (focus) legs, coupled to one shared cabin; the other legs just
+	// need award space. Conn is the stop length at the hub in nights, 1..3 —
+	// meaningful (and stored) only with Via.
+	Via  string `json:"via,omitempty"`
+	Conn int    `json:"conn,omitempty"`
 	// LeadDays: "I can travel any time, but not sooner than N days from now" —
 	// a ROLLING floor on the outbound date. Stored as a relative offset, never
 	// an absolute date, so it re-anchors to "today" on every detection cycle
@@ -151,6 +168,29 @@ func Normalize(w Watch) (Watch, error) {
 		// "Any time with N days' notice" and "specific outbound dates" are two
 		// ways of saying when you can travel; combining them is contradictory.
 		return Watch{}, errors.New("lead time cannot be combined with specific outbound dates")
+	}
+
+	if w.Via != "" {
+		if !placeRe.MatchString(w.Via) {
+			return Watch{}, fmt.Errorf("via %q must be a 3-letter place code", w.Via)
+		}
+		if o, d := w.Route[:3], w.Route[4:]; w.Via == o || w.Via == d {
+			return Watch{}, errors.New("via hub cannot be one of the route's endpoints")
+		}
+		if w.Conn == 0 {
+			w.Conn = MinConn // canonical spelling of the default stop
+		}
+		if w.Conn < MinConn || w.Conn > MaxConn {
+			return Watch{}, fmt.Errorf("conn must be between %d and %d nights", MinConn, MaxConn)
+		}
+		if w.MinSeats >= 2 {
+			// EC-4 in via clothing: the hop legs carry no seat-count data, and
+			// unknown counts never fire a party watch — so a via party watch is
+			// eternal silence. Reject it now rather than promise it forever.
+			return Watch{}, errors.New("seat-count alerts aren't available for via trips yet")
+		}
+	} else if w.Conn != 0 {
+		return Watch{}, errors.New("conn is only meaningful with a via hub")
 	}
 
 	for name, r := range map[string]*Range{"out": w.Out, "ret": w.Ret} {
@@ -240,6 +280,11 @@ func watchID(w Watch) string {
 	if w.MinSeats >= 2 {
 		fmt.Fprintf(&b, "|S%d", w.MinSeats)
 	}
+	// Same conditional-fold rule for via watches (pinned by TestViaIDStability):
+	// a via-less watch hashes byte-identically to the pre-via formula.
+	if w.Via != "" {
+		fmt.Fprintf(&b, "|V%sC%d", w.Via, w.Conn)
+	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:8]
 }
@@ -273,12 +318,34 @@ func (w Watch) NightsWindow() (int, int) {
 // entitles the watch to horizon-frontier alerts (EC-3).
 func (w Watch) BoundedOut() bool { return w.Out != nil && w.Out.To != "" }
 
+// LegRoutes lists the actual route keys a watch's journey flies, in order.
+// A direct watch is its own single leg (plus the reverse for a round trip);
+// a via watch expands to the chain through its hub.
+func (w Watch) LegRoutes() []string {
+	o, d := w.Route[:3], w.Route[4:]
+	if w.Via == "" {
+		if w.Kind == KindRT {
+			return []string{w.Route, ReverseRoute(w.Route)}
+		}
+		return []string{w.Route}
+	}
+	h := w.Via
+	if w.Kind == KindRT {
+		return []string{o + "-" + h, h + "-" + d, d + "-" + h, h + "-" + o}
+	}
+	return []string{o + "-" + h, h + "-" + d}
+}
+
 // TopicRepresentable reports whether a watch can be expressed as legacy
 // topics: fully unbounded, with the default nights window. Constrained
 // watches are invisible to the legacy API, which is what protects them from
 // a stale client (§2.2).
 func (w Watch) TopicRepresentable() bool {
 	if w.Out != nil || w.Ret != nil {
+		return false
+	}
+	if w.Via != "" {
+		// A stale client cannot express (or safely replace) a chain watch.
 		return false
 	}
 	if w.MinSeats >= 2 {
@@ -338,11 +405,21 @@ func (w Watch) ExpiredSince(today int) int {
 // map means "no bundle yet", so route-dependent states are skipped.
 func (w Watch) Status(today int, routes map[string]bool) string {
 	if routes != nil {
-		if !routes[w.Route] {
-			return StatusUnknownRoute
+		legs := w.LegRoutes()
+		// The first half of the legs is the outbound journey; a missing leg
+		// there is "unknown route", a missing return leg is "no return" —
+		// the same two states a direct watch distinguishes.
+		outLegs := len(legs)
+		if w.Kind == KindRT {
+			outLegs = len(legs) / 2
 		}
-		if w.Kind == KindRT && !routes[ReverseRoute(w.Route)] {
-			return StatusNoReturn
+		for i, leg := range legs {
+			if !routes[leg] {
+				if i < outLegs {
+					return StatusUnknownRoute
+				}
+				return StatusNoReturn
+			}
 		}
 	}
 	if w.Impossible() {

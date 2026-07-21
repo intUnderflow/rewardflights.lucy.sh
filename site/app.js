@@ -296,6 +296,7 @@ function wireWatch(w) {
   if (w.nights) out.nights = { min: w.nights.min, max: w.nights.max };
   if (w.leadDays > 0) out.leadDays = w.leadDays;
   if ((w.minSeats || 0) >= 2) out.minSeats = w.minSeats;
+  if (w.via) { out.via = w.via; out.conn = w.conn || 1; }
   return out;
 }
 
@@ -427,7 +428,8 @@ const idxToIso = (i) => isoOf(dayDate(i));
 function matchesNow(w, { list = false } = {}) {
   const empty = { pairs: 0, perCabin: new Map(), first: null, list: [] };
   const keys = [];
-  if (!store.bundle || !store.bundle.routes[w.route]) return empty;
+  if (!store.bundle) return empty;
+  if (!w.via && !store.bundle.routes[w.route]) return empty;
   const mask = watchMask(w);
   if (!mask) return empty;
 
@@ -453,6 +455,69 @@ function matchesNow(w, { list = false } = {}) {
   const need = (w.minSeats || 0) >= 2 ? w.minSeats : 1;
   const legBits = (key) =>
     need > 1 ? (routeBitsAtLeast(key, need) || new Uint8Array(store.bundle.days)) : routeBits(key);
+
+  // Via watches match CHAINS: the same overnight-stop windows and focus-leg
+  // cabin coupling as the via calendar (and the alert server), so the "N
+  // match right now" line never promises what a push wouldn't deliver.
+  if (w.via) {
+    const [vo, vd] = w.route.split("-");
+    const conn = w.conn || 1;
+    const path = w.kind === "ow" ? [vo, w.via, vd] : [vo, w.via, vd, w.via, vo];
+    const legKeys = [];
+    for (let i = 0; i < path.length - 1; i++) legKeys.push(`${path[i]}-${path[i + 1]}`);
+    if (legKeys.some((k) => !store.bundle.routes[k])) return empty;
+    const legsB = legKeys.map((k) => routeBits(k));
+    const focus = new Set(focusLegs(path));
+    const holds = (i, day, cb) => {
+      const bits = day >= 0 && day <= last ? legsB[i][day] : 0;
+      return focus.has(i) ? (bits & cb) : bits;
+    };
+    const bitsList = cabinLegend().map(([bit]) => bit).filter((b) => mask & b);
+    const perCabin = new Map();
+    let pairs = 0, first = null;
+    const [minN, maxN] = w.nights ? [w.nights.min, w.nights.max] : NIGHTS_ANY;
+    const rFrom = w.ret?.from ? Math.max(t0, isoToIdx(w.ret.from)) : t0;
+    const rTo = w.ret?.to ? Math.min(last, isoToIdx(w.ret.to)) : last;
+    for (let d = oFrom; d <= oTo; d++) {
+      if (w.kind === "ow") {
+        let v = 0;
+        for (const cb of bitsList) {
+          if (!holds(0, d, cb)) continue;
+          for (let n = d + 1; n <= Math.min(d + conn, last); n++) {
+            if (holds(1, n, cb)) { v |= cb; break; }
+          }
+        }
+        if (!v) continue;
+        pairs++;
+        if (!first) first = { out: idxToIso(d), ret: null };
+        if (list) for (const [bit] of cabinLegend()) if (v & bit) keys.push(`${idxToIso(d)}|${bit}`);
+        for (const [bit] of cabinLegend()) if (v & bit) perCabin.set(bit, (perCabin.get(bit) || 0) + 1);
+        continue;
+      }
+      const perR = new Map(); // return long-haul day -> coupled cabins
+      for (const cb of bitsList) {
+        if (!holds(0, d, cb)) continue;
+        for (let n = d + 1; n <= Math.min(d + conn, last); n++) {
+          if (!holds(1, n, cb)) continue;
+          const lo = Math.max(n + minN, rFrom), hi = Math.min(n + maxN, rTo);
+          for (let r = lo; r <= hi; r++) {
+            if ((perR.get(r) & cb) || !holds(2, r, cb)) continue;
+            for (let h = r + 1; h <= Math.min(r + conn, last); h++) {
+              if (holds(3, h, cb)) { perR.set(r, (perR.get(r) || 0) | cb); break; }
+            }
+          }
+        }
+      }
+      for (const r of [...perR.keys()].sort((a, b) => a - b)) {
+        const both = perR.get(r);
+        pairs++;
+        if (!first) first = { out: idxToIso(d), ret: idxToIso(r) };
+        if (list) for (const [bit] of cabinLegend()) if (both & bit) keys.push(`${idxToIso(d)}|${idxToIso(r)}|${bit}`);
+        for (const [bit] of cabinLegend()) if (both & bit) perCabin.set(bit, (perCabin.get(bit) || 0) + 1);
+      }
+    }
+    return { pairs, perCabin, first, list: keys };
+  }
 
   const out = legBits(w.route);
   const perCabin = new Map();
@@ -532,7 +597,15 @@ function markSeen(watches) {
 /* Why a watch can never fire — so we can say so instead of leaving it silent. */
 function watchProblem(w) {
   const t0 = Math.max(0, todayIndex());
-  if (w.kind === "rt" && !store.bundle?.routes?.[reverseRoute(w.route)]) {
+  if (w.via) {
+    const [vo, vd] = w.route.split("-");
+    const path = w.kind === "ow" ? [vo, w.via, vd] : [vo, w.via, vd, w.via, vo];
+    for (let i = 0; i < path.length - 1; i++) {
+      if (!store.bundle?.routes?.[`${path[i]}-${path[i + 1]}`]) {
+        return `The ${path[i]}→${path[i + 1]} leg isn't in the data, so this via journey can't be found.`;
+      }
+    }
+  } else if (w.kind === "rt" && !store.bundle?.routes?.[reverseRoute(w.route)]) {
     return "There's no return route in the data, so a round trip can't be found.";
   }
   // A seat-count watch on a route with no seat data is silently dead forever
@@ -587,6 +660,7 @@ function watchSummary(w) {
     if (w.ret) bits.push(`back ${fmtRange(w.ret.from, w.ret.to)}`);
     if (w.nights) bits.push(`${w.nights.min}–${w.nights.max} nights`);
   }
+  if (w.via) bits.push(`via ${w.via}${(w.conn || 1) > 1 ? ` (≤${w.conn}n stop)` : ""}`);
   // The party constraint is part of what the watch IS — same noun ("N+
   // seats") as the bell control and the push copy, so the three surfaces
   // agree.
@@ -1097,10 +1171,12 @@ function viaHub(o, d, { both = false } = {}) {
   return out.find((h) => back.has(h)) ?? null;
 }
 
-/* Connection window at the hub, in days: 0 = same day only, 1 = same or next
-   day (the default — long-haul arrivals often land the next calendar day),
-   2 = up to two days. URL ?conn= → session pref → 1. */
-function parseConn(s) { return /^[0-2]$/.test(s || "") ? Number(s) : null; }
+/* Stop length at the hub, in nights: the NEXT leg departs 1..conn days after
+   the previous leg. The floor is 1 by design — we don't know flight times, so
+   a same-day connection can't be promised, but any arrival today makes any
+   departure tomorrow bookable. An overnight stop is the guarantee. URL
+   ?conn= → session pref → 1 (exactly one night). */
+function parseConn(s) { return /^[1-3]$/.test(s || "") ? Number(s) : null; }
 function getConnPref() { try { return parseConn(sessionStorage.getItem("rf:conn")); } catch { return null; } }
 function setConnPref(c) { try { sessionStorage.setItem("rf:conn", String(c)); } catch {} }
 function activeConn(params = new URLSearchParams(location.search)) {
@@ -2064,9 +2140,9 @@ function nightsControlEl(getNights, onApply) {
    presets (and the same .np class family deliberately: one visual language
    for "narrow the trip"). */
 function connControlEl(hub, getConn, onApply) {
-  const wrap = el(`<div class="nights-ctl conn-ctl" role="group" aria-label="Connection window at ${esc(placeName(hub))}">
-    <span class="nc-label">Change at ${esc(placeName(hub))}</span>
-    ${[["Same day", 0], ["≤1 day", 1], ["≤2 days", 2]].map(([label, c]) =>
+  const wrap = el(`<div class="nights-ctl conn-ctl" role="group" aria-label="Overnight stop at ${esc(placeName(hub))}">
+    <span class="nc-label">Stop at ${esc(placeName(hub))}</span>
+    ${[["1 night", 1], ["≤2 nights", 2], ["≤3 nights", 3]].map(([label, c]) =>
       `<button type="button" class="np" data-conn="${c}" aria-pressed="false">${label}</button>`).join("")}
   </div>`);
   function sync() {
@@ -2239,7 +2315,7 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       closeBtn,
       el(`<p class="bell-title">${o} <span class="arrow" aria-hidden="true">${arrow}</span> ${d}</p>`),
       el(`<p class="bell-sub">${mine ? "Alerting you" : "Alert me"} when a
-        ${kind === "rt" ? "round trip" : "one-way seat"} opens</p>`));
+        ${kind === "rt" ? "round trip" : "one-way seat"}${ctx.via ? ` via ${esc(placeName(ctx.via))}` : ""} opens</p>`));
 
     /* --- cabins --- */
     const cabs = el(`<div class="bell-sec"><h3>Cabins</h3>
@@ -2475,6 +2551,9 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         .map((r) => CABIN_CODE[Number(r.dataset.bit)]).filter(Boolean);
       if (!cabins.length) return null;
       const w = { route: routeKey, kind, cabins };
+      // A via watch carries its hub + stop length; the cabin list constrains
+      // the long-haul legs (the server couples them, hops just need space).
+      if (ctx.via) { w.via = ctx.via; w.conn = ctx.conn || 1; }
       if (kind === "rt" && nights) w.nights = { min: nights[0], max: nights[1] };
       // Wire canonical form: minSeats present only when >= 2 (0/absent is the
       // one spelling of "one passenger", which keeps content ids stable).
@@ -3539,11 +3618,14 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
 /* ---------------- via trips (one-stop multi-city) ---------------- */
 
 /* Shared honesty line for every via view: the two facts a user must not
-   discover at the BA checkout. */
+   discover at the BA checkout. The overnight stop is a design rule, not an
+   option: flight times aren't in the data, so a same-day connection can't be
+   promised — a night at the hub can. */
 function viaNoteHTML(o, d, hub) {
-  return `<p class="rev-note">No direct route — this journey changes at ${esc(placeName(hub))},
-    as separate award bookings per leg. Dates are matched on award space, not flight
-    times: verify connection timings when booking. Alerts aren't available for via trips yet.</p>`;
+  return `<p class="rev-note">No direct route — this journey stops overnight at
+    ${esc(placeName(hub))}, as separate award bookings per leg. Dates are matched on
+    award space; still verify timings when booking (a long first leg can land the
+    next day).</p>`;
 }
 
 /* Month year-strip for the via calendars — same recounted-from-the-engine
@@ -3602,7 +3684,7 @@ function renderViaTrip(o, d, hub) {
   let conn = activeConn(params);
   const seatsKnown = chainSeatsKnown(fullPath);
   const ep = () => (pax > 1 && seatsKnown ? pax : 1);
-  const gapsFor = (c) => [[0, c], [Math.max(1, nights[0]), nights[1]], [0, c]];
+  const gapsFor = (c) => [[1, c], [Math.max(1, nights[0]), nights[1]], [1, c]];
 
   mainEl.innerHTML = "";
   mainEl.append(el(`<div class="route-head">
@@ -3666,6 +3748,15 @@ function renderViaTrip(o, d, hub) {
   }
   rebuildChips(); // synchronously sets mask + first drawCalendars()
   syncPaxNote();
+  // The same bell as direct trips, carrying the hub + stop length: the server
+  // evaluates the whole chain, so "tell me when a Club trip to Tokyo opens"
+  // works from Billund too.
+  toolbar.append(alertBell(`${o}-${d}`, "rt", mask, {
+    via: hub,
+    get conn() { return conn; },
+    get nights() { return nights.slice(); },
+    get pickedOut() { return params.get("out") || null; },
+  }));
 
   function drawCalendars() {
     const animate = firstDraw;
@@ -3678,7 +3769,7 @@ function renderViaTrip(o, d, hub) {
     const rbAny = n > 1 ? chainBits(fullPath, allMask, gaps, 1, focus) : null;
     // The presence base for dim/empty: can the OUTBOUND journey (both legs)
     // even happen that day, any cabin, any party?
-    const outAny = chainBits(outPath, allMask, [[0, conn]], 1, focusOut);
+    const outAny = chainBits(outPath, allMask, [[1, conn]], 1, focusOut);
     const months = next12Months();
 
     container.append(viaYearStrip(months, rb, mask, legend, Math.max(0, t0), body, animate,
@@ -3773,7 +3864,7 @@ function renderViaTrip(o, d, hub) {
 
   const outIdx = tripDayIndex(params.get("out") || "");
   if (outIdx >= 0) {
-    const outAny = chainBits(outPath, allMask, [[0, conn]], 1, focusOut);
+    const outAny = chainBits(outPath, allMask, [[1, conn]], 1, focusOut);
     if (outAny[outIdx]) {
       const retP = params.get("ret") || "";
       openViaPanel(o, hub, d, outIdx, nights, conn, mask, tripDayIndex(retP) >= 0 ? retP : null, pax);
@@ -3825,7 +3916,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
     for (let r = n + minN; r <= rEnd; r++) {
       if (!r1[r]) continue;
       const home = [];
-      for (let h = r; h <= Math.min(days - 1, r + conn); h++) if (r2[h]) home.push(h);
+      for (let h = r + 1; h <= Math.min(days - 1, r + conn); h++) if (r2[h]) home.push(h);
       if (!home.length) continue;
       rows.push({ r, iso: isoOf(dayDate(r)), bits: r1[r], n: r - n, home,
         shares: (r1[r] & b2[n] & mask) ? 1 : 0 });
@@ -3834,7 +3925,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
     return rows;
   };
   const nOpts = [];
-  for (let n = idx; n <= Math.min(days - 1, idx + conn); n++) {
+  for (let n = idx + 1; n <= Math.min(days - 1, idx + conn); n++) {
     if (!b2[n] || !b1[idx]) continue;
     const rows = rowsFor(n);
     if (rows.length) nOpts.push({ n, rows });
@@ -3843,13 +3934,13 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
   if (!nOpts.length) {
     // Honest dead end: name which junction fails and offer the fix.
     let lhAny = false;
-    for (let n = idx; n <= Math.min(days - 1, idx + conn); n++) if (b2[n]) lhAny = true;
+    for (let n = idx + 1; n <= Math.min(days - 1, idx + conn); n++) if (b2[n]) lhAny = true;
     const alreadyWide = lo === NIGHTS_DEFAULT[0] && hi === NIGHTS_DEFAULT[1];
     const lead = !lhAny
-      ? `No ${hub}→${d} award space within ${conn === 0 ? "the same day" : `${conn} day${conn > 1 ? "s" : ""}`} of this departure.`
+      ? `No ${hub}→${d} award space within your ${conn}-night stop after this departure.`
       : `The outbound journey works, but no return completes within ${lo}–${hi} nights.`;
-    const fixHint = !lhAny && conn < 2
-      ? `<p><button type="button" class="btn" id="vp-conn2">Allow up to 2 days at ${esc(placeName(hub))}</button></p>`
+    const fixHint = !lhAny && conn < 3
+      ? `<p><button type="button" class="btn" id="vp-conn2">Allow up to 3 nights at ${esc(placeName(hub))}</button></p>`
       : lhAny && !alreadyWide
         ? `<p><button type="button" class="btn" id="vp-widen">Widen trip length to ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights</button></p>`
         : "";
@@ -3878,9 +3969,9 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
       route();
     });
     $("#vp-conn2", panelEl)?.addEventListener("click", () => {
-      setConnPref(2);
+      setConnPref(3);
       const u = new URL(location.href);
-      u.searchParams.set("conn", "2");
+      u.searchParams.set("conn", "3");
       history.replaceState(null, "", `${u.pathname}?${u.searchParams.toString()}`);
       route();
     });
@@ -3926,7 +4017,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
     const { n } = nOpts[ni];
     $("#vp-out-legs", panelEl).innerHTML =
       legRow(o, hub, idx, b1[idx]) +
-      legRow(hub, d, n, b2[n], n === idx ? " <small>(same day)</small>" : "");
+      legRow(hub, d, n, b2[n], ` <small>(${n - idx} night${n - idx > 1 ? "s" : ""} in ${esc(placeName(hub))})</small>`);
     const choice = $("#vp-lh-choice", panelEl);
     choice.innerHTML = "";
     if (nOpts.length > 1) {
@@ -3951,7 +4042,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
       `${o}→${d} ${fmtRet.format(dayDate(idx))} · ${d}→${o} ${fmtRet.format(dayDate(r.r))} · ${r.n} night${r.n === 1 ? "" : "s"} in ${placeName(d)}`;
     $("#vp-ret-legs", panelEl).innerHTML =
       legRow(d, hub, r.r, r.bits) +
-      legRow(hub, o, r.home[0], r2[r.home[0]], r.home[0] === r.r ? " <small>(same day)</small>" : "") +
+      legRow(hub, o, r.home[0], r2[r.home[0]]) +
       (r.home.length > 1
         ? `<p class="pp-oneways">or ${hub}→${o} on ${r.home.slice(1).map((h) =>
             `<a target="_blank" rel="noopener noreferrer" href="${baBookingURL(hub, o, isoOf(dayDate(h)), 0, null, pax)}">${esc(fmtRet.format(dayDate(h)))} ↗</a>`).join(" · ")}</p>`
@@ -4068,7 +4159,7 @@ function renderViaRoute(o, d, hub) {
   mainEl.append(toolbar, paxNote, container, body);
 
   let mask = 0, firstDraw = true, chipsEl = null;
-  const gapsFor = (c) => [[0, c]];
+  const gapsFor = (c) => [[1, c]];
 
   function rebuildChips() {
     const rb = chainBits(path, allMask, gapsFor(conn), ep(), focus);
@@ -4100,6 +4191,10 @@ function renderViaRoute(o, d, hub) {
   }
   rebuildChips();
   syncPaxNote();
+  toolbar.append(alertBell(`${o}-${d}`, "ow", mask, {
+    via: hub,
+    get conn() { return conn; },
+  }));
 
   function draw() {
     const animate = firstDraw;
@@ -4194,7 +4289,7 @@ function openViaOWPanel(o, hub, d, idx, conn, pax = 1) {
   panelEl.innerHTML = "";
 
   const lhRows = [];
-  for (let n = idx; n <= Math.min(days - 1, idx + conn); n++)
+  for (let n = idx + 1; n <= Math.min(days - 1, idx + conn); n++)
     if (b2[n]) lhRows.push(n);
 
   const legRow = (from, to, dayIdx, bits, extra = "") => `
@@ -4219,7 +4314,7 @@ function openViaOWPanel(o, hub, d, idx, conn, pax = 1) {
       connection timings before booking:</p>
     <div class="pp-legs">
       ${legRow(o, hub, idx, b1[idx])}
-      ${lhRows.map((n) => legRow(hub, d, n, b2[n], n === idx ? " <small>(same day)</small>" : "")).join("")}
+      ${lhRows.map((n) => legRow(hub, d, n, b2[n], ` <small>(${n - idx} night${n - idx > 1 ? "s" : ""} in ${esc(placeName(hub))})</small>`)).join("")}
     </div>
     <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
       Availability moves fast — verify with British Airways before planning.</p>

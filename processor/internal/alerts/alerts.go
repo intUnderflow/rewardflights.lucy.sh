@@ -136,12 +136,24 @@ type item struct {
 	// LOWEST threshold so the copy never over-promises. omitempty keeps an
 	// old pending batch loading under the current state schema.
 	MinSeats int `json:"ms,omitempty"`
+	// Via/Conn mark chain news (the watch's hub and stop length): they flavour
+	// the copy ("via LON") and the deep link (?conn=), and Via joins dedupeKey
+	// because a direct pair and a via chain on the same endpoints are
+	// different journeys. Absent on direct news, so old pending batches load
+	// unchanged.
+	Via  string `json:"v,omitempty"`
+	Conn int    `json:"cn,omitempty"`
 }
 
 // dedupeKey identifies the NEWS, independent of which watch found it: two
 // overlapping watches that match the same pair must not report it twice.
+// The via fold is conditional so direct-news keys stay byte-identical.
 func (i item) dedupeKey() string {
-	return i.Route + "|" + i.Kind + "|" + i.Cabin + "|" + i.Out + "|" + i.Ret
+	k := i.Route + "|" + i.Kind + "|" + i.Cabin + "|" + i.Out + "|" + i.Ret
+	if i.Via != "" {
+		k += "|via" + i.Via
+	}
+	return k
 }
 
 // watchIndex answers "which watches can be affected by a change on route R?".
@@ -321,6 +333,17 @@ func (w *Watcher) refreshIndex() {
 		subKey := alertstore.SubKey(sub.Endpoint)
 		for _, watch := range sub.Watches {
 			ref := watchRef{subKey: subKey, endpoint: sub.Endpoint, watch: watch}
+			if watch.Via != "" {
+				// A chain watch is affected by a gain on ANY of its legs.
+				seen := map[string]bool{}
+				for _, leg := range watch.LegRoutes() {
+					if !seen[leg] {
+						seen[leg] = true
+						idx.byRoute[leg] = append(idx.byRoute[leg], ref)
+					}
+				}
+				continue
+			}
 			idx.byRoute[watch.Route] = append(idx.byRoute[watch.Route], ref)
 			if watch.Kind == alertstore.KindRT {
 				// A gain on the return leg makes new pairs for this watch.
@@ -429,6 +452,9 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 	watch := ref.watch
 	if watch.Expired(today) || watch.Impossible() {
 		return nil
+	}
+	if watch.Via != "" {
+		return w.evaluateChain(ref, dirty, gains, b, now, today)
 	}
 	out, ok := b.merged[watch.Route]
 	if !ok {
@@ -565,6 +591,197 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 		}
 	}
 	return items
+}
+
+// evaluateChain is evaluate for via watches: the leg-gains theorem holds for
+// N-leg chains exactly as for pairs — a chain is newly bookable iff bookable
+// now AND at least one leg gained this cycle. What "gained" means differs by
+// leg role: a FOCUS leg (long-haul, per the same focusLegs rule the site
+// uses) gains when a watched cabin's bit appears; a non-focus leg (the hop)
+// contributes only "any award space", so its gain is the day going from
+// no-space to some-space — a new cabin appearing next to an existing one
+// changes nothing a hop is asked for. Junction windows are [1, Conn] nights
+// at the hub each way (overnight floor by design: flight times aren't in the
+// data, so a same-day connection can't be promised) and the nights window at
+// the destination. News granularity matches the site's via calendar: OUT is
+// the first-leg departure day, RET the return long-haul day.
+func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]gain, b *bundleState, now int64, today int) []item {
+	watch := ref.watch
+	legs := watch.LegRoutes()
+	for _, leg := range legs {
+		if _, ok := b.merged[leg]; !ok {
+			return nil // a missing leg can never complete the journey
+		}
+	}
+	mask := watch.Mask()
+	conn := watch.Conn
+	nmin, nmax := watch.NightsWindow()
+	isRT := watch.Kind == alertstore.KindRT
+	focus := b.focusLegs(legs)
+	isFocus := make([]bool, len(legs))
+	for _, i := range focus {
+		isFocus[i] = true
+	}
+	outRange := watch.OutDays(today, b.endDay)
+	retRange := watch.RetDays(today, b.endDay) // constrains the return long-haul day
+
+	// Cumulative departure-day offsets of leg i from leg 0, for windowing the
+	// candidate first-leg days around a pinned gain day.
+	minOff := []int{0, 1}
+	maxOff := []int{0, conn}
+	if isRT {
+		minOff = append(minOff, 1+nmin, 2+nmin)
+		maxOff = append(maxOff, conn+nmax, 2*conn+nmax)
+	}
+
+	legHolds := func(i, day int, cb byte) bool {
+		bits := b.bitsAt(legs[i], day)
+		if isFocus[i] {
+			return bits&cb != 0
+		}
+		return bits != 0
+	}
+	flapped := func(days []int, cabin string) bool {
+		fr := make([]string, 0, len(focus))
+		fd := make([]int, 0, len(focus))
+		for _, fi := range focus {
+			fr = append(fr, legs[fi])
+			fd = append(fd, days[fi])
+		}
+		return w.isFlapChain(fr, fd, cabin, now)
+	}
+
+	seen := map[string]bool{}
+	var items []item
+	addItem := func(d0, r int, cabin string) {
+		it := item{
+			Watch: watch.ID, Route: watch.Route, Kind: watch.Kind, Cabin: cabin,
+			Out: dayDate(d0), Via: watch.Via, Conn: conn,
+		}
+		if isRT {
+			it.Ret = dayDate(r)
+			it.NMin, it.NMax = nmin, nmax
+		}
+		items = append(items, it)
+	}
+
+	for p, leg := range legs {
+		if leg != dirty {
+			continue
+		}
+		for _, g := range gains[dirty] {
+			if !w.frontierOK(g.day, watch) {
+				continue
+			}
+			var cabins []string
+			if isFocus[p] {
+				cabins = cabinsOf(g.bits & mask)
+			} else if w.prev.bitsAt(leg, g.day) == 0 && b.bitsAt(leg, g.day) != 0 {
+				// The hop's any-space predicate became newly true; which focus
+				// cabins that completes is decided by feasibility below.
+				cabins = cabinsOf(mask)
+			}
+			if len(cabins) == 0 {
+				continue
+			}
+			d0lo := max(g.day-maxOff[p], outRange.From)
+			d0hi := min(g.day-minOff[p], outRange.To)
+			for d0 := d0lo; d0 <= d0hi; d0++ {
+				if p == 0 && d0 != g.day {
+					continue
+				}
+				for _, cabin := range cabins {
+					cb := bitOfCabin(cabin)
+					if !legHolds(0, d0, cb) {
+						continue
+					}
+					for n := d0 + 1; n <= d0+conn; n++ {
+						if p == 1 && n != g.day {
+							continue
+						}
+						if !legHolds(1, n, cb) {
+							continue
+						}
+						if !isRT {
+							if key := cabin + "|" + dayDate(d0); !seen[key] && !flapped([]int{d0, n}, cabin) {
+								seen[key] = true
+								addItem(d0, 0, cabin)
+							}
+							continue
+						}
+						rLo := max(n+nmin, retRange.From)
+						rHi := min(n+nmax, retRange.To)
+						for r := rLo; r <= rHi; r++ {
+							if p == 2 && r != g.day {
+								continue
+							}
+							key := cabin + "|" + dayDate(d0) + "|" + dayDate(r)
+							if seen[key] || !legHolds(2, r, cb) {
+								continue
+							}
+							for h := r + 1; h <= r+conn; h++ {
+								if p == 3 && h != g.day {
+									continue
+								}
+								if !legHolds(3, h, cb) || flapped([]int{d0, n, r, h}, cabin) {
+									continue
+								}
+								seen[key] = true
+								addItem(d0, r, cabin)
+								break
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+	return items
+}
+
+// isFlapChain generalizes isFlap to N focus legs: the chain's joint run ended
+// at the latest close among them at which every OTHER focus leg was already
+// open (a leg that closed before its partner ever opened ended no joint run).
+// Hop legs are deliberately excluded: their predicate is any-cabin, which the
+// per-cabin ledger cannot express, and hop churn is not the churn the
+// cooldown exists to absorb.
+func (w *Watcher) isFlapChain(routes []string, days []int, cabin string, now int64) bool {
+	keys := make([]string, len(routes))
+	for i := range routes {
+		keys[i] = ledgerKey(routes[i], days[i], cabin, 0)
+	}
+	var end int64
+	found := false
+	for i, k := range keys {
+		closed, ok := w.state.ClosedAt[k]
+		if !ok {
+			continue
+		}
+		joint := true
+		for j, other := range keys {
+			if j == i {
+				continue
+			}
+			if opened, ok := w.state.OpenedAt[other]; ok && opened > closed {
+				joint = false
+				break
+			}
+		}
+		if joint && (!found || closed > end) {
+			end, found = closed, true
+		}
+	}
+	return found && now-end < int64(w.cfg.Cooldown/time.Second)
+}
+
+// bitOfCabin maps a cabin letter to its availability bit.
+func bitOfCabin(cabin string) byte {
+	for _, c := range cabinOrder {
+		if string(c.letter) == cabin {
+			return c.bit
+		}
+	}
+	return 0
 }
 
 // frontierOK implements EC-3: a gain beyond the previous horizon is the

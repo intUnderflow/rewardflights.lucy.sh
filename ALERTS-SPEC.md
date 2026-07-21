@@ -646,6 +646,47 @@ The cases that separate a right implementation from a plausible-looking wrong on
 
 ---
 
+## Via (chain) watches — shipped 2026-07-21
+
+Extends the model to one-stop journeys (MULTICITY-SPEC Level 1): a watch may
+carry `via` (the hub, a 3-letter place ≠ either endpoint) and `conn` (stop
+length at the hub in nights, 1..3, default 1 — the overnight floor is a design
+rule: flight times aren't in the data, so a same-day connection can't be
+promised, and any arrival today makes any departure tomorrow bookable).
+
+- **Model.** `Watch.LegRoutes()` expands `BLL-TYO via LON` to the chain
+  `BLL-LON, LON-TYO[, TYO-LON, LON-BLL]`. Cabins constrain the FOCUS legs
+  (same `focusLegs` half-of-longest rule as the site, from the bundle's place
+  coords), coupled to one shared cabin; other legs need any award space for
+  the party. `minSeats >= 2` with `via` is rejected at Normalize (EC-4: hop
+  routes carry no seat data, so the watch could never fire). The id folds
+  `|V<hub>C<conn>` conditionally — via-less ids are byte-identical to the
+  pre-via formula (TestViaIDStability). Via watches are never
+  topic-representable. Status checks every leg route (missing outbound leg →
+  unknown-route, missing return leg → no-return).
+- **Detection.** The leg-gains theorem generalizes: a chain is newly bookable
+  iff bookable now AND ≥1 leg gained this cycle. A focus leg "gains" when a
+  watched cabin bit appears (the existing per-cabin plane); a hop gains only
+  when its day goes no-space → some-space (a new cabin beside existing space
+  changes nothing the hop is asked for). The index lists a via watch under
+  every leg route. Enumeration pins the gained day at its leg position and
+  walks the junction windows ([1,conn] at the hub each way, nights at the
+  destination); news granularity matches the site's via calendar — `Out` =
+  first-leg departure day, `Ret` = return long-haul day. Frontier (EC-3),
+  cooldown (via `isFlapChain`, the N-leg joint-run generalization over focus
+  legs only — the per-cabin ledger cannot express a hop's any-space run), the
+  EC-13 breaker, batching and caps all apply unchanged.
+- **Copy.** Labels append the hub ("Business round trips open: BLL ⇄ TYO via
+  LON"); items carry `v`/`cn` so the deep link lands on the via calendar with
+  the pair pinned (`?out=&ret=&conn=`). `Via` joins `dedupeKey` and the render
+  group key — direct and chain news on the same endpoints never merge.
+- **Tests.** `chain_test.go` (10 scenarios: long-haul gain, hop gain, hop
+  cabin churn silent, cabin coupling, overnight floor, missing leg, baseline,
+  flap, one-way, frontier bounded-vs-unbounded) and `via_test.go` (id
+  stability, Normalize table, LegRoutes/Status/topics). Client: `viatest.js`
+  §8–9 (bell saves via+conn, /alerts shows the chain, live count via the
+  chain matcher in `matchesNow`).
+
 ## Owner decisions flagged
 
 1. **EC-3 horizon rule** — "bounded watches get frontier alerts" (my pick, no extra state, ≤ daily during the crawl) vs. a one-shot "your dates are loading" (less noise, delays the T-355 release moment).
