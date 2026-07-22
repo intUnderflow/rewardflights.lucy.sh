@@ -1341,8 +1341,9 @@ let pollTimer = null;
 function schedulePoll() {
   clearInterval(pollTimer);
   pollTimer = setInterval(checkForUpdate, MANIFEST_POLL_MS);
+  syncServerClock().then(() => bucketCatchUp());
+  setInterval(syncServerClock, 5 * 60 * 1000);
   scheduleBucketPoll();
-  bucketCatchUp();
   document.addEventListener("visibilitychange", () => {
     if (document.visibilityState === "visible") { checkForUpdate(); bucketCatchUp(4); }
   });
@@ -1417,6 +1418,20 @@ function syncServerTime(dateMs) {
 }
 function serverNowMs() {
   return serverAnchorMs === null ? null : serverAnchorMs + performance.now();
+}
+
+/* Date is NOT a CORS-safelisted response header, so the opportunistic sync in
+   getJSON only works same-origin (dev) — a cross-origin data host (prod)
+   exposes nothing. The authoritative clock therefore comes from OUR OWN
+   origin: a HEAD to the site root (Cloudflare Pages static — unmetered, and
+   its Date is fully readable same-origin). Boot + every 5 minutes;
+   performance.now() carries us between syncs. */
+async function syncServerClock() {
+  try {
+    const res = await fetch("/", { method: "HEAD", cache: "no-store" });
+    const d = res.headers.get("date");
+    if (d) syncServerTime(Date.parse(d));
+  } catch { /* offline — the next sync or a same-origin response covers it */ }
 }
 
 /* Tag-path base: beside the branch ref in production, a /tags/ subtree on a
