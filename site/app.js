@@ -4663,18 +4663,21 @@ function renderFrom(o) {
   const show = new URLSearchParams(location.search).get("show") === "odds" ? "odds" : "now";
   const legendAll = cabinLegend();
   const allMaskF = legendAll.reduce((m, [bit]) => m | bit, 0);
-  let oddsMask = getFilter() ?? allMaskF;
-  oddsMask &= allMaskF; if (!oddsMask) oddsMask = allMaskF;
+  // One cabin mask for BOTH modes (URL -> shared session pref -> all), shown
+  // as a chips row: the list was the last view filtering invisibly.
+  let mask = parseCabins(new URLSearchParams(location.search).get("cabins")) ?? (getFilter() ?? allMaskF);
+  mask &= allMaskF; if (!mask) mask = allMaskF;
+  setFilter(mask); // a shared list link's filter governs the pages behind its cards
   const sinceLabel = _stats
     ? new Date(_stats.since * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "";
   const sub = show === "odds"
-    ? `How often award seats appear${oddsMask !== allMaskF ? ` in ${esc(cabNames(oddsMask))}` : ""}${
+    ? `How often award seats appear${mask !== allMaskF ? ` in ${esc(cabNames(mask))}` : ""}${
         sinceLabel ? ` — observed since ${sinceLabel}` : ""}. Bars show openings by travel month;
       historical patterns don't promise future seats.`
     : `${dests.length + vias.size} destination${dests.length + vias.size === 1 ? "" : "s"} with award seats in the next year${
         vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}${
         !stops && allVias.size ? ` (nonstop only — ${allVias.size} more with one stop)` : ""}.
-      Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).`;
+      Bars show days with round trips per month (${mask === allMaskF ? "any cabin" : esc(cabNames(mask))}, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).`;
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
@@ -4682,6 +4685,10 @@ function renderFrom(o) {
       <span class="vt-on" aria-current="page">List</span><a href="/map/${o}${mapQS ? `?${mapQS}` : ""}">Map</a>
     </div>
     <p class="page-sub">${sub}</p>
+    <div class="chips" role="group" aria-label="Cabins">${legendAll.map(([bit, label]) =>
+      `<button type="button" class="chip" aria-pressed="${!!(mask & bit)}" data-bit="${bit}">
+        <span class="swatch ${bitClass(bit)}"></span>${esc(label)}</button>`).join("")}
+    </div>
     <div class="nights-ctl stops-ctl" role="group" aria-label="Maximum stops">
       <span class="nc-label">Stops</span>
       <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
@@ -4710,6 +4717,27 @@ function renderFrom(o) {
     } else route();
   }));
 
+  mainEl.querySelectorAll('.chips .chip[data-bit]').forEach((chip) => chip.addEventListener("click", () => {
+    const bit = Number(chip.dataset.bit);
+    const next = mask ^ bit;
+    if (!next) return; // at least one cabin stays on
+    setFilter(next);
+    const u = new URL(location.href);
+    if (next === allMaskF) u.searchParams.delete("cabins");
+    else u.searchParams.set("cabins", cabinLetters(next));
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+    route();
+  }));
+  mainEl.querySelectorAll(".stops-ctl .np").forEach((b) => b.addEventListener("click", () => {
+    const u = new URL(location.href);
+    if (Number(b.dataset.stops) === 1) u.searchParams.delete("stops");
+    else u.searchParams.set("stops", "0");
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+    route(); // rebuild the list under the new scope
+  }));
+
   if (show === "odds") {
     if (!_stats) {
       // Deep-linked ?show=odds before the stats ever loaded this session.
@@ -4728,7 +4756,7 @@ function renderFrom(o) {
       let w = 0, n = 0, done = 0, union = 0;
       const surv = [0, 0, 0, 0, 0], byMonth = Array(12).fill(0);
       for (const [bit] of legendAll) {
-        if (!(oddsMask & bit)) continue;
+        if (!(mask & bit)) continue;
         const c = rs["MWCF"[[1, 2, 4, 8].indexOf(bit)]];
         if (!c || !c.n) continue;
         w += c.w; n += c.n; union |= bit;
@@ -4764,14 +4792,6 @@ function renderFrom(o) {
     return;
   }
 
-  mainEl.querySelectorAll(".stops-ctl .np").forEach((b) => b.addEventListener("click", () => {
-    const u = new URL(location.href);
-    if (Number(b.dataset.stops) === 1) u.searchParams.delete("stops");
-    else u.searchParams.set("stops", "0");
-    const q = u.searchParams.toString();
-    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
-    route(); // rebuild the list under the new scope
-  }));
 
   if (!dests.length && !allVias.size) {
     mainEl.append(el(`<div class="empty-state">
@@ -4796,7 +4816,6 @@ function renderFrom(o) {
   // legs, hops any space, overnight stops at the hub). Destinations with
   // outbound space but zero such days keep their card, grayed and badged.
   const t0 = Math.max(0, todayIndex());
-  const allMask = cabinLegend().reduce((m, [bit]) => m | bit, 0);
   const months = next12Months();
   const tally = (rt) => {
     let total = 0, union = 0;
@@ -4814,20 +4833,25 @@ function renderFrom(o) {
     // any-party (never silently vanishing at pax >= 2) and gets a badge.
     const known = pax <= 1 || pairSeatsKnown(key, `${d}-${o}`);
     const cardPax = known ? pax : 1;
-    const rt = roundTripBits(key, `${d}-${o}`, allMask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1], cardPax);
+    const rt = roundTripBits(key, `${d}-${o}`, mask, NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1], cardPax);
     const unverified = pax > 1 && !known;
     // Outbound totals follow the SAME coverage rule as the round-trip
     // numbers: a card badged "shown for any party" must not mix in
     // pax-thresholded outbound swatches or sort rank.
-    return { d, key, via: null, ...tally(rt), unverified, out: routeTotals(key, cardPax) };
+    // Outbound fallback numbers respect the mask too (routeTotals is
+    // any-cabin, so count inline).
+    const ob0 = routeBits(key);
+    let obT = 0, obU = 0;
+    for (let i = t0; i < ob0.length; i++) { const v = ob0[i] & mask; if (v) { obT++; obU |= v; } }
+    return { d, key, via: null, ...tally(rt), unverified, out: { total: obT, union: obU } };
   }).concat([...vias].map(([d, { hub, both }]) => {
     const fullPath = [o, hub, d, hub, o];
     const outPath = [o, hub, d];
     // Hop legs carry no seat data, so via counts are any-party (badged below).
     const rt = both
-      ? chainBits(fullPath, allMask, [[1, conn], [NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]], [1, conn]], 1, focusLegs(fullPath))
+      ? chainBits(fullPath, mask, [[1, conn], [NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1]], [1, conn]], 1, focusLegs(fullPath))
       : new Uint8Array(store.bundle.days);
-    const ob = chainBits(outPath, allMask, [[1, conn]], 1, focusLegs(outPath));
+    const ob = chainBits(outPath, mask, [[1, conn]], 1, focusLegs(outPath));
     let obTotal = 0, obUnion = 0;
     for (let i = t0; i < ob.length; i++) if (ob[i]) { obTotal++; obUnion |= ob[i]; }
     return { d, key: `${o}-${d}`, via: hub, ...tally(rt), unverified: pax > 1,
@@ -4879,12 +4903,18 @@ function loadStats() {
   return _statsLoad;
 }
 
-/* Weighted-median survival phrase from the 5-bucket histogram. */
-function survivalPhrase(surv) {
+/* Weighted-median bucket index of the 5-bucket survival histogram (-1 = no
+   completed runs). The odds map colours by this: warm = act fast. */
+function survMedianIdx(surv) {
   const total = surv.reduce((a, b) => a + b, 0);
-  if (!total) return null;
-  let acc = 0, i = 0;
-  for (; i < surv.length - 1; i++) { acc += surv[i]; if (acc * 2 >= total) break; }
+  if (!total) return -1;
+  let acc = 0;
+  for (let i = 0; i < surv.length - 1; i++) { acc += surv[i]; if (acc * 2 >= total) return i; }
+  return surv.length - 1;
+}
+function survivalPhrase(surv) {
+  const i = survMedianIdx(surv);
+  if (i < 0) return null;
   return ["usually gone within the hour", "usually gone within 6 hours",
     "usually gone within a day", "usually lasts 1–3 days", "usually lasts 3+ days"][i];
 }
@@ -5209,8 +5239,28 @@ function renderMap(o) {
       }
       let unverifiedShown = 0, viaShown = 0;
       const viaParts = [];
-      const poolSize = stops ? spots.length : spots.length - vias.size;
-      for (const spot of spots) {
+      // In odds mode the pool grows destinations that exist only in HISTORY:
+      // a route whose availability fully dried up leaves the bundle but its
+      // climate is still the answer to "how often" (its place may leave the
+      // bundle too — then it counts as unplaced, honestly).
+      let pool = spots;
+      if (mapMode === "odds" && _stats) {
+        const have = new Set(spots.map((sp) => sp.d));
+        const extra = [];
+        const addKey = (key, via) => {
+          const d = key.slice(4);
+          if (d !== o && !have.has(d)) { have.add(d); extra.push({ d, via, both: false, statsOnly: true }); }
+        };
+        for (const key of Object.keys(_stats.routes)) if (key.startsWith(o + "-")) addKey(key, null);
+        if (stops) {
+          for (const h of store.destsByOrigin.get(o) || []) {
+            for (const key of Object.keys(_stats.routes)) if (key.startsWith(h + "-")) addKey(key, h);
+          }
+        }
+        pool = spots.concat(extra);
+      }
+      const poolSize = stops ? pool.length : pool.filter((sp) => !sp.via).length;
+      for (const spot of pool) {
         if (!stops && spot.via) continue;
         const d = spot.d;
         const g = store.bundle.places[d]?.g;
@@ -5224,12 +5274,16 @@ function renderMap(o) {
           const r = (2.1 + Math.sqrt(Math.min(om.rate, 80)) * 0.85) / kOf();
           const openNow = metric(spot).days;
           const phrase = survivalPhrase(om.surv) || "";
+          // Colour = SNAP-UP SPEED (warm = act fast), not cabin: with history
+          // on nearly every cabin, best-cabin colouring just repainted the
+          // availability map. Cabin scope lives in the chips filter.
+          const speed = om.done ? `odds-s${survMedianIdx(om.surv)}` : "odds-su";
           const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
           const freq = mo
             ? `${om.events} opening${om.events === 1 ? "" : "s"} observed for ${mo.label} travel`
             : `≈${om.rate % 1 ? om.rate.toFixed(1) : om.rate} openings a week`;
-          (spot.via ? viaParts : parts).push(`<circle class="map-dot ${bitClass(om.best)}${spot.via ? " map-dot-via" : ""}" cx="${x}" cy="${y}" r="${r}"
-            tabindex="0" role="link" data-code="${d}" data-odds="1" data-freq="${esc(freq)}" data-open="${openNow}" data-best="${om.best}"${
+          (spot.via ? viaParts : parts).push(`<circle class="map-dot ${speed}${spot.via ? " map-dot-via" : ""}" cx="${x}" cy="${y}" r="${r}"
+            tabindex="0" role="link" data-code="${d}" data-odds="1" data-freq="${esc(freq)}" data-open="${openNow}" data-speed="${speed}"${
               phrase ? ` data-phrase="${phrase}"` : ""}${spot.via ? ` data-via="${spot.via}"` : ""}
             aria-label="${esc(placeName(d))}: ${esc(freq)}${phrase ? `, ${esc(phrase)}` : ""}${
               spot.via ? ` (long-haul leg via ${esc(placeName(spot.via))})` : ""} — open calendar"></circle>`);
@@ -5280,7 +5334,7 @@ function renderMap(o) {
       if (dot.dataset.odds) {
         const open = Number(dot.dataset.open);
         tip.innerHTML = `<div class="t-date">${esc(placeName(dot.dataset.code))} <span class="map-tip-code">${dot.dataset.code}</span></div>
-          <div class="t-cab"><span class="swatch ${bitClass(Number(dot.dataset.best))}"></span>${esc(dot.dataset.freq)}</div>
+          <div class="t-cab"><span class="swatch ${esc(dot.dataset.speed)}"></span>${esc(dot.dataset.freq)}</div>
           ${dot.dataset.phrase ? `<div class="t-note">${esc(dot.dataset.phrase)}</div>` : ""}
           <div class="t-note">${open ? `${open} day${open === 1 ? "" : "s"} open right now` : "nothing open right now — worth an alert"}</div>
           ${dot.dataset.via ? `<div class="t-note">long-haul leg via ${esc(placeName(dot.dataset.via))}</div>` : ""}`;
@@ -5513,7 +5567,7 @@ function renderMap(o) {
       const legendEl = $(".map-legend");
       if (legendEl) {
         legendEl.textContent = mapMode === "odds"
-          ? `Dot size is how OFTEN award seats appear in the selected cabins; colour is the best cabin with history. Hover for the typical time-to-vanish. Based on continuous observation — the numbers sharpen as history grows.`
+          ? `Dot size is how OFTEN award seats appear in the selected cabins; colour is how FAST they vanish (red = within the hour, slate = lasts days, grey = not enough data). Based on continuous observation — the numbers sharpen as history grows.`
           : `Dot colour is the best cabin available; dot size is how many days have round trips. Hover a dot to see its route — one-stop journeys show their overnight connection. Drag to pan, scroll or pinch to zoom.`;
       }
       if (mapMode === "odds" && !_stats) {

@@ -670,6 +670,15 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .dp-cab-pax.fits, .pp-row-pax.fits, .pp-cta-pax.fits { color: var(--ink-2); font-weight: 700; }
 /* map: pair lacks seat data at pax >= 2 — shown at any-party, cued hollow-ish */
 .map-dot-unv { fill-opacity: .45; stroke-dasharray: 2 1.4; }
+/* Odds mode: colour is snap-up speed — warm means act fast. Same 5 steps as
+   the survival buckets; grey = no completed runs yet. Swatch variants keep
+   the tooltip chip in the same language. */
+.map-dot.odds-s0, .swatch.odds-s0 { fill: #E5484D; background: #E5484D; }
+.map-dot.odds-s1, .swatch.odds-s1 { fill: #E5731A; background: #E5731A; }
+.map-dot.odds-s2, .swatch.odds-s2 { fill: #D4A017; background: #D4A017; }
+.map-dot.odds-s3, .swatch.odds-s3 { fill: #5B8DB8; background: #5B8DB8; }
+.map-dot.odds-s4, .swatch.odds-s4 { fill: #64748B; background: #64748B; }
+.map-dot.odds-su, .swatch.odds-su { fill: var(--ink-3); background: var(--ink-3); }
 /* Hovered route: great-circle arc(s) in the dot's cabin colour, the overnight
    connection ringed in brand gold. Never interactive — dots own the pointer. */
 .map-path { fill: none; stroke-linecap: round; opacity: .85; pointer-events: none; }
