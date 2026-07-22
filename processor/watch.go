@@ -117,6 +117,16 @@ func runWatch(cfg watchConfig) error {
 		}
 	}
 
+	// Freshness tags ride on push mode: rendezvous points are only meaningful
+	// when the out repo is actually published.
+	if cfg.Push {
+		tg := newTagger(cfg.Out, cfg.TokenCmd, logf)
+		tagStop := make(chan struct{})
+		defer close(tagStop)
+		go tg.run(tagStop)
+		logf("watch: freshness tagger running (%ds buckets, %s retention)", tagBucketSecs, tagRetention)
+	}
+
 	var lastProcessed string
 	tick := time.NewTicker(cfg.Interval)
 	defer tick.Stop()

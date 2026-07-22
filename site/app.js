@@ -726,10 +726,22 @@ function getJSON(url, { timeout = 8000, retries = 2 } = {}) {
     const timer = setTimeout(() => ctl.abort(), timeout);
     try {
       const res = await fetch(url, { signal: ctl.signal });
-      if (!res.ok) throw new Error(`HTTP ${res.status} for ${url}`);
+      // Every response (404s included) carries a Date header from the edge:
+      // the freshness buckets run on THIS clock, never the device's.
+      const d = res.headers.get("date");
+      if (d) syncServerTime(Date.parse(d));
+      if (!res.ok) {
+        // Cancel the unread body or the request stays "in flight" forever —
+        // it pins the connection and never reaches requestfinished (the 404s
+        // the bucket probes produce made this visible; it was always true).
+        try { res.body?.cancel(); } catch { /* already closed */ }
+        const err = new Error(`HTTP ${res.status} for ${url}`);
+        err.status = res.status;
+        throw err;
+      }
       return await res.json();
     } catch (err) {
-      if (left > 0) {
+      if (left > 0 && err.status !== 404) {
         await new Promise((r) => setTimeout(r, 800 + Math.random() * 900));
         return attempt(left - 1);
       }
@@ -1329,41 +1341,139 @@ let pollTimer = null;
 function schedulePoll() {
   clearInterval(pollTimer);
   pollTimer = setInterval(checkForUpdate, MANIFEST_POLL_MS);
+  scheduleBucketPoll();
+  bucketCatchUp();
   document.addEventListener("visibilitychange", () => {
-    if (document.visibilityState === "visible") checkForUpdate();
+    if (document.visibilityState === "visible") { checkForUpdate(); bucketCatchUp(4); }
   });
 }
 
 async function checkForUpdate() {
   if (document.visibilityState !== "visible" || !store.bundle) return;
   try {
-    // Cache-bust the tiny manifest so we see new versions promptly.
+    // The ~5-minute-stale floor: raw's CDN caches this mutable URL for 300s
+    // (the ?ts= busts only the BROWSER cache). It stays as the fallback under
+    // the freshness buckets below, and as the cold-start path.
     const manifest = await getJSON(`${dataBase}/manifest.json?ts=${Math.floor(Date.now() / 60000)}`, { retries: 0 });
-    if (manifest.v && manifest.v !== store.bundle.v) {
-      // New generation: patch forward from the ~2KB changes feed when we can
-      // PROVE equivalence, else fetch the full bundle (versioned URL bypasses
-      // the 5-minute CDN cache either way).
-      const fresh = await deltaOrFullBundle(manifest);
-      // Guard against a stale CDN replica: only adopt when the bundle we got
-      // back actually IS a new version. Otherwise we'd re-adopt the same data
-      // and fire a false "updated" pulse + destructive re-render every poll.
-      if (fresh.v && fresh.v !== store.bundle.v) {
-        const wasRoute = current.page === "route" || current.page === "trip";
-        const scrollY = window.scrollY;
-        adoptBundle(fresh, false);
-        try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(fresh)); } catch {}
-        loadChanges();
-        // Don't yank a half-typed search out from under the user.
-        if (!isTypingInSearch()) {
-          route();
-          if (wasRoute) window.scrollTo({ top: scrollY });
-          pulseFreshness();
-          announce(`Availability updated to ${freshLabel()}.`);
-        }
-      }
-    }
+    await refreshFromManifest(manifest);
     hideBanner();
   } catch { /* silent — next poll retries */ }
+}
+
+/* Adopt a newer generation described by a manifest, fetching content from
+   `base` (the main branch, or an immutable tag path — which is what makes a
+   bucket refresh instantly fresh). The stale-replica guard stays: adopt only
+   when the bundle we got back actually IS a new version, else a stale CDN
+   copy would fire a false "updated" pulse + destructive re-render. */
+async function refreshFromManifest(manifest, base = dataBase) {
+  if (!manifest?.v || manifest.v === store.bundle.v) return false;
+  // MONOTONIC adoption: with two discovery paths at different staleness (the
+  // buckets ~30s, the fallback manifest ~5 min), "different version" is not
+  // enough — after a bucket adopts a fresh generation, the stale fallback
+  // would see the OLD version, refetch, and downgrade. Source time only ever
+  // moves forward.
+  if (Number.isFinite(manifest.t) && Number.isFinite(store.bundle.t) && manifest.t <= store.bundle.t) return false;
+  // New generation: patch forward from the ~2KB changes feed when we can
+  // PROVE equivalence, else fetch the full bundle.
+  const fresh = await deltaOrFullBundle(manifest, base);
+  if (!fresh.v || fresh.v === store.bundle.v) return false;
+  if (Number.isFinite(fresh.t) && Number.isFinite(store.bundle.t) && fresh.t <= store.bundle.t) return false;
+  const wasRoute = current.page === "route" || current.page === "trip";
+  const scrollY = window.scrollY;
+  adoptBundle(fresh, false);
+  try { localStorage.setItem(SNAPSHOT_KEY, JSON.stringify(fresh)); } catch {}
+  loadChanges();
+  // Don't yank a half-typed search out from under the user.
+  if (!isTypingInSearch()) {
+    route();
+    if (wasRoute) window.scrollTo({ top: scrollY });
+    pulseFreshness();
+    announce(`Availability updated to ${freshLabel()}.`);
+  }
+  return true;
+}
+
+/* ---------------- freshness buckets (design-time agreement) ----------------
+
+   The publisher tags the data repo t-<unix/30> at every 30s boundary whose
+   HEAD moved; we poll the JUST-CLOSED bucket's tag URL ~10s after its close.
+   A 200 is fresh by construction (the URL couldn't be requested before the
+   tag existed); a 404 is permanently true (the bucket is over), so the CDN
+   caching either answer for 5 minutes can never lie to anyone. Typical
+   commit-to-painted: ~30s, vs the fallback poll's ~5 minutes.
+
+   The one way to break this is asking EARLY — a premature 404 would be
+   cached at the edge right as the tag lands — so bucket arithmetic runs
+   exclusively on server time learned from Date headers (getJSON syncs on
+   every response), advanced by performance.now() (monotonic: immune to NTP
+   steps and manual clock changes), with a hard guard at fire time. */
+
+const TAG_BUCKET_MS = 30 * 1000;
+const TAG_POLL_DELAY_MS = 10 * 1000; // Δ past close; measured tag visibility ~3s
+
+let serverAnchorMs = null; // serverDate - performance.now() at last sync
+function syncServerTime(dateMs) {
+  if (Number.isFinite(dateMs)) serverAnchorMs = dateMs - performance.now();
+}
+function serverNowMs() {
+  return serverAnchorMs === null ? null : serverAnchorMs + performance.now();
+}
+
+/* Tag-path base: beside the branch ref in production, a /tags/ subtree on a
+   local dev origin. */
+function tagBase(bucket) {
+  if (/\/main$/.test(dataBase)) return dataBase.replace(/\/main$/, `/refs/tags/t-${bucket}`);
+  return `${dataBase}/tags/t-${bucket}`;
+}
+
+let bucketTimer = null;
+let lastPolledBucket = 0;
+
+function scheduleBucketPoll() {
+  clearTimeout(bucketTimer);
+  const now = serverNowMs();
+  if (now === null) { bucketTimer = setTimeout(scheduleBucketPoll, 3000); return; }
+  const bucket = Math.floor(now / TAG_BUCKET_MS); // the currently OPEN bucket
+  const at = (bucket + 1) * TAG_BUCKET_MS + TAG_POLL_DELAY_MS + Math.random() * 3000;
+  bucketTimer = setTimeout(() => { pollBucket(bucket).finally(scheduleBucketPoll); },
+    Math.max(500, at - now));
+}
+
+async function pollBucket(bucket) {
+  if (document.visibilityState !== "visible" || !store.bundle) return;
+  const now = serverNowMs();
+  // The hard premature-poll guard: this bucket must be closed + Δ in SERVER
+  // time (2s tolerance for a Date-header resync between scheduling and
+  // firing). Polling early would poison edges with cached 404s, so when in
+  // doubt we skip — a missed bucket is recovered by the next one (tags point
+  // at HEAD) or by the fallback manifest poll.
+  if (now === null || now < (bucket + 1) * TAG_BUCKET_MS + TAG_POLL_DELAY_MS - 2000) return;
+  if (bucket <= lastPolledBucket) return;
+  lastPolledBucket = bucket;
+  try {
+    const manifest = await getJSON(`${tagBase(bucket)}/manifest.json`, { retries: 0, timeout: 6000 });
+    await refreshFromManifest(manifest, tagBase(bucket));
+  } catch { /* 404 = quiet bucket (permanently true); anything else, the fallback covers */ }
+}
+
+/* Catch-up: probe backward over recently-closed buckets (newest first, first
+   200 wins — tags point at HEAD so one hit is total recovery). Runs at boot
+   and when a tab returns to visibility; closed buckets are frozen, so these
+   probes can never poison anything. The publisher prunes tags after ~10
+   minutes, so probing further back than the window is pointless anyway. */
+async function bucketCatchUp(maxBack = 10) {
+  const now = serverNowMs();
+  if (now === null || !store.bundle) return;
+  const newest = Math.floor((now - TAG_POLL_DELAY_MS) / TAG_BUCKET_MS) - 1;
+  for (let b = newest; b > newest - maxBack; b--) {
+    if (b <= lastPolledBucket) return;
+    try {
+      const manifest = await getJSON(`${tagBase(b)}/manifest.json`, { retries: 0, timeout: 6000 });
+      lastPolledBucket = Math.max(lastPolledBucket, b);
+      await refreshFromManifest(manifest, tagBase(b));
+      return;
+    } catch { /* quiet or pruned bucket — keep probing older */ }
+  }
 }
 
 function isTypingInSearch() {
@@ -1377,8 +1487,8 @@ function isTypingInSearch() {
    The patch is adopted ONLY when provably equivalent: the recount of
    route+date pairs must match the manifest's own counts.routeDates exactly.
    Every unprovable situation falls back to the full fetch. */
-async function deltaOrFullBundle(manifest) {
-  const full = () => getJSON(`${dataBase}/availability.json?v=${encodeURIComponent(manifest.v)}`);
+async function deltaOrFullBundle(manifest, base = dataBase) {
+  const full = () => getJSON(`${base}/availability.json?v=${encodeURIComponent(manifest.v)}`);
   const old = store.bundle;
   try {
     if (typeof manifest.counts?.routeDates !== "number") return full();
@@ -1388,7 +1498,7 @@ async function deltaOrFullBundle(manifest) {
     // grows seat-transition entries.
     if (Object.values(old.routes).some((e) => e.s)) return full();
 
-    const feed = await getJSON(`${dataBase}/changes/recent.json?v=${encodeURIComponent(manifest.v)}`, { retries: 1 });
+    const feed = await getJSON(`${base}/changes/recent.json?v=${encodeURIComponent(manifest.v)}`, { retries: 1 });
     if (feed.schema !== 1 || feed.v !== manifest.v) return full(); // stale CDN replica
     const all = feed.entries || [];
     const entries = all.filter((e) => e.t > old.t);
@@ -4548,7 +4658,9 @@ function renderFrom(o) {
   const grid = el(`<div class="dest-grid"></div>`);
   const max = Math.max(1, ...cards.flatMap((c) => c.counts));
   for (const c of cards) {
-    if (c.total === 0 && c.out.total === 0) continue; // unreachable via candidate
+    // Only a VIA candidate with nothing at all disappears; a direct
+    // destination keeps its card (grayed/badged) per the contract above.
+    if (c.via && c.total === 0 && c.out.total === 0) continue;
     const ow = c.total === 0; // outbound space only — nothing round-trippable
     const cabs = cabinLegend().filter(([bit]) => (ow ? c.out.union : c.union) & bit)
       .map(([bit, label]) => `<span class="swatch ${bitClass(bit)}" title="${esc(label)}"></span>`).join("");

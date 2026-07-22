@@ -304,3 +304,47 @@ with a no-warranty note. Bundled fonts remain under the SIL OFL.
 - Month×cabin summary bundle for shard-era autocomplete/explore
 - Service Worker (localStorage SWR delivers ~90% of the value now)
 - Fallback data origin (second Pages project serving the data repo)
+
+## Freshness: 30-second bucket tags ("design-time agreement")
+
+raw.githubusercontent's CDN caches every URL — 200s AND 404s — for ~300s, so
+any mutable URL is up to 5 minutes stale and cache-busting query strings are
+ignored at the edge (verified empirically; so is the GitHub API's
+"304s-don't-count" rate-limit exemption, which no longer holds, and jsDelivr's
+purge, which refills stale from its own branch-resolution cache). The floor
+for free-at-scale polling of a mutable name is therefore ~5 minutes.
+
+The protocol removes mutable names from the hot path. Time is chopped into
+30s buckets (bucket = unix/30); the processor tags the data repo
+`t-<bucket>` at each boundary whose HEAD moved (processor/tagger.go), and
+clients poll the JUST-CLOSED bucket's tag URL ~10s after its close:
+
+- A 200 is fresh by construction — nobody could request the URL before the
+  tag existed — and immutable, so the CDN caches it correctly forever.
+- A 404 is permanently true — the bucket is over — so a cached 404 is just
+  the right answer served cheaply.
+
+Client and publisher never coordinate at runtime; they agree at design time
+on names computed from the clock. Typical commit-to-painted: ~30s (worst
+~60s), vs ~5 minutes for the fallback manifest poll, which remains
+underneath as the floor and the cold-start path.
+
+Soundness invariants (site/app.js freshness section + tagger.go):
+1. Clients never trust the device clock: bucket arithmetic runs on server
+   time from Date headers (synced on every getJSON response), advanced by
+   performance.now(), with a hard fire-time guard — polling a bucket EARLY
+   would poison edges with cached 404s right as the tag lands.
+2. The tagger is PROMPT OR NEVER: a tag is pushed within 5s of the boundary
+   or not at all (a late tag would race the pollers).
+3. Tags point at HEAD, so a missed/poisoned/skipped bucket is fully
+   recovered by the next successful one; adoption is MONOTONIC on source
+   time t (the stale fallback can never downgrade a bucket-fresh client).
+4. Tags are rendezvous points, not history: pruned after ~10 minutes.
+5. Catch-up probes backward over closed buckets (newest-first, first 200
+   wins) at boot and on tab return — closed buckets are frozen, so these
+   can never poison anything.
+
+Adversarial note: the naming scheme is public, so anyone can pre-fetch
+future bucket URLs to poison edges deliberately. The blast radius of a
+perfect sustained attack is degradation to the fallback's ~5-minute
+latency — never wrongness, never loss.
