@@ -56,12 +56,7 @@ func main() {
 	statsBackfill := flag.Bool("stats-backfill", false, "replay -out's git history through the stats accumulator, then exit")
 	flag.Parse()
 
-	if *src == "" || *out == "" {
-		fmt.Fprintln(os.Stderr, "usage: processor -src <rewardflights checkout> -out <derived repo checkout> [-source-sha SHA] [-source-time UNIX] [-force]")
-		fmt.Fprintln(os.Stderr, "       processor -watch -src <...> -out <...> [-interval 2s] [-push] [-token-cmd '<cmd>']")
-		os.Exit(2)
-	}
-
+	// Backfill needs only -out; it must run before the src+out usage gate.
 	if *statsBackfill {
 		if *out == "" {
 			fatal(errors.New("-stats-backfill needs -out"))
@@ -70,6 +65,12 @@ func main() {
 			fatal(err)
 		}
 		return
+	}
+
+	if *src == "" || *out == "" {
+		fmt.Fprintln(os.Stderr, "usage: processor -src <rewardflights checkout> -out <derived repo checkout> [-source-sha SHA] [-source-time UNIX] [-force]")
+		fmt.Fprintln(os.Stderr, "       processor -watch -src <...> -out <...> [-interval 2s] [-push] [-token-cmd '<cmd>']")
+		os.Exit(2)
 	}
 
 	if *watch {
