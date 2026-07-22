@@ -2082,10 +2082,17 @@ function buildHomeModules(mount) {
     const listEl = $(".card-list", mod);
     for (const g of opened) {
       const [o, d] = g.route.split("-");
-      listEl.append(el(`<a class="route-card" href="/trip/${g.route}">
+      // Openings that have since vanished are marked, never hidden: "already
+      // gone" IS the news that seats move fast. A card whose every opening
+      // vanished dims but stays clickable (the calendar shows what's left).
+      const meta = g.count
+        ? `<span class="chg-opened">+${g.count} date${g.count > 1 ? "s" : ""}</span>${
+            g.gone ? `<span class="chg-gone"> · ${g.gone} gone</span>` : ""}`
+        : `<span class="chg-gone">gone again</span>`;
+      listEl.append(el(`<a class="route-card${g.count ? "" : " rc-gone"}" href="/trip/${g.route}">
         <span class="rc-route">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</span>
         <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
-        <span class="rc-meta"><span class="chg-opened">+${g.count} date${g.count > 1 ? "s" : ""}</span><br><span class="when">${esc(timeAgo(g.t))}</span></span>
+        <span class="rc-meta">${meta}<br><span class="when">${esc(timeAgo(g.t))}</span></span>
       </a>`));
     }
     modules.append(mod);
@@ -2129,6 +2136,17 @@ function recentlyOpened(mask = 15) {
   // "recently" honestly stretches to the last real news — each card carries
   // its own timestamp.
   const src = [...store.changes.entries, ...(store.changes.pinned || [])];
+  const t0 = Math.max(0, todayIndex());
+  // An opening is only news while it's still bookable: check each one against
+  // the CURRENT bundle (ground truth in memory), not the event log. Gone =
+  // the date no longer holds any of the filtered cabins that opened — closed
+  // outright, changed away from them, or rolled into the past.
+  const stillOpen = (e, openedBits) => {
+    const idx = dayIndexOf(e.d);
+    const bits = store.bundle.routes[e.r] ? routeBits(e.r) : null;
+    if (!bits || !Number.isInteger(idx) || idx < t0 || idx >= bits.length) return false;
+    return !!(bits[idx] & openedBits & mask);
+  };
   const byRoute = new Map();
   for (const e of src) {
     if (e.k !== "opened") continue;
@@ -2136,8 +2154,10 @@ function recentlyOpened(mask = 15) {
     // cabin is among what opened.
     const bits = [...(e.c || "")].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
     if (!(bits & mask)) continue;
-    const g = byRoute.get(e.r) || { route: e.r, count: 0, t: 0 };
-    g.count++; g.t = Math.max(g.t, e.t);
+    const g = byRoute.get(e.r) || { route: e.r, count: 0, gone: 0, t: 0 };
+    if (stillOpen(e, bits)) g.count++;
+    else g.gone++;
+    g.t = Math.max(g.t, e.t);
     byRoute.set(e.r, g);
   }
   return [...byRoute.values()]

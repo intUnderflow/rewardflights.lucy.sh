@@ -221,6 +221,9 @@ button.seg-opt { border: 0; background: none; cursor: pointer; }
 /* ---------- home modules ---------- */
 .module-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 46px 0 -28px; }
 .module-empty { margin: 44px 0 0; color: var(--ink-3); font-size: 13.5px; }
+.chg-gone { color: var(--ink-3); font-size: 12px; }
+.rc-gone { opacity: .68; }
+.rc-gone:hover { opacity: 1; }
 .modules { display: grid; grid-template-columns: 1fr 1fr; gap: 22px; margin-top: 46px; }
 @media (max-width: 820px) { .modules { grid-template-columns: 1fr; } }
 .module h2 {
