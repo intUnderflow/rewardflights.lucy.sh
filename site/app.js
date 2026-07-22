@@ -4659,28 +4659,110 @@ function renderFrom(o) {
   const pax = activePax();
   const conn = getConnPref() ?? 1; // the calendar behind a via card reads the same pref
   const mapQS = [pax > 1 ? `pax=${pax}` : "", stops === 0 ? "stops=0" : ""].filter(Boolean).join("&");
+  // Show mode: "now" (availability — the default) or "odds" (the climate).
+  const show = new URLSearchParams(location.search).get("show") === "odds" ? "odds" : "now";
+  const legendAll = cabinLegend();
+  const allMaskF = legendAll.reduce((m, [bit]) => m | bit, 0);
+  let oddsMask = getFilter() ?? allMaskF;
+  oddsMask &= allMaskF; if (!oddsMask) oddsMask = allMaskF;
+  const sinceLabel = _stats
+    ? new Date(_stats.since * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "";
+  const sub = show === "odds"
+    ? `How often award seats appear${oddsMask !== allMaskF ? ` in ${esc(cabNames(oddsMask))}` : ""}${
+        sinceLabel ? ` — observed since ${sinceLabel}` : ""}. Bars show openings by travel month;
+      historical patterns don't promise future seats.`
+    : `${dests.length + vias.size} destination${dests.length + vias.size === 1 ? "" : "s"} with award seats in the next year${
+        vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}${
+        !stops && allVias.size ? ` (nonstop only — ${allVias.size} more with one stop)` : ""}.
+      Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).`;
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
     <div class="view-toggle" role="group" aria-label="View">
       <span class="vt-on" aria-current="page">List</span><a href="/map/${o}${mapQS ? `?${mapQS}` : ""}">Map</a>
     </div>
-    <p class="page-sub">${dests.length + vias.size} destination${dests.length + vias.size === 1 ? "" : "s"} with award seats in the next year${
-      vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}${
-      !stops && allVias.size ? ` (nonstop only — ${allVias.size} more with one stop)` : ""}.
-      Bars show days with round trips per month (any cabin, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).</p>
+    <p class="page-sub">${sub}</p>
     <div class="nights-ctl stops-ctl" role="group" aria-label="Maximum stops">
       <span class="nc-label">Stops</span>
       <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
       <button type="button" class="np" data-stops="1" aria-pressed="${stops === 1}">≤1 stop</button>
     </div>
-    <div class="nights-ctl view-ctl" role="group" aria-label="Map mode">
+    <div class="nights-ctl view-ctl" role="group" aria-label="Show">
       <span class="nc-label">Show</span>
-      <button type="button" class="np" data-view="now" aria-pressed="true">Open now</button>
-      <button type="button" class="np" data-view="odds" aria-pressed="false">How often</button>
+      <button type="button" class="np" data-view="now" aria-pressed="${show === "now"}">Open now</button>
+      <button type="button" class="np" data-view="odds" aria-pressed="${show === "odds"}">How often</button>
     </div>
-    ${pax > 1 ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
+    ${pax > 1 && show === "now" ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
   </div>`));
+
+  // Wire the mode toggle (this control was briefly on this page with no
+  // handler — a dead control is worse than none).
+  mainEl.querySelectorAll(".view-ctl .np").forEach((b) => b.addEventListener("click", () => {
+    const next = b.dataset.view;
+    if (next === show) return;
+    const u = new URL(location.href);
+    if (next === "now") u.searchParams.delete("show"); else u.searchParams.set("show", "odds");
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+    if (next === "odds" && !_stats) {
+      b.textContent = "Loading…";
+      loadStats().then(() => { if (current.page === "from") route(); });
+    } else route();
+  }));
+
+  if (show === "odds") {
+    if (!_stats) {
+      // Deep-linked ?show=odds before the stats ever loaded this session.
+      mainEl.append(el(`<div class="empty-state"><div class="big">Loading availability history…</div></div>`));
+      loadStats().then(() => { if (current.page === "from" && current.params.o === o) route(); });
+      return;
+    }
+    const months = next12Months();
+    const spotList = dests.map((d) => ({ d, via: null }))
+      .concat([...vias].map(([d, { hub }]) => ({ d, via: hub })));
+    const climate = [];
+    for (const spot of spotList) {
+      const key = spot.via ? `${spot.via}-${spot.d}` : `${o}-${spot.d}`;
+      const rs = _stats.routes?.[key];
+      if (!rs) continue;
+      let w = 0, n = 0, done = 0, union = 0;
+      const surv = [0, 0, 0, 0, 0], byMonth = Array(12).fill(0);
+      for (const [bit] of legendAll) {
+        if (!(oddsMask & bit)) continue;
+        const c = rs["MWCF"[[1, 2, 4, 8].indexOf(bit)]];
+        if (!c || !c.n) continue;
+        w += c.w; n += c.n; union |= bit;
+        c.m.forEach((v, i) => { byMonth[i] += v; });
+        if (c.s) { c.s.forEach((v, i) => { surv[i] += v; }); done += c.d || 0; }
+      }
+      if (!n) continue;
+      climate.push({ spot, w, union, surv, counts: months.map((mo) => byMonth[mo.m]) });
+    }
+    climate.sort((a, b) => b.w - a.w);
+    const grid = el(`<div class="dest-grid"></div>`);
+    const maxCount = Math.max(1, ...climate.flatMap((c) => c.counts));
+    for (const c of climate) {
+      const phrase = survivalPhrase(c.surv);
+      const cabs = legendAll.filter(([bit]) => c.union & bit)
+        .map(([bit, label]) => `<span class="swatch ${bitClass(bit)}" title="${esc(label)}"></span>`).join("");
+      grid.append(el(`<a class="dest-card" href="/trip/${o}-${c.spot.d}">
+        <span class="dc-head"><span class="dc-code">${c.spot.d}</span>
+          <span class="dc-name">${esc(placeName(c.spot.d))}</span>
+          <span class="dc-country">${esc(placeCountry(c.spot.d))}</span>
+          ${c.spot.via ? `<span class="dc-badge dc-via">via ${c.spot.via}</span>` : ""}</span>
+        <span class="dc-spark" aria-hidden="true">${c.counts.map((v) =>
+          `<i style="height:${Math.max(2, Math.round((v / maxCount) * 30))}px"></i>`).join("")}</span>
+        <span class="dc-meta"><span>≈${c.w % 1 ? c.w.toFixed(1) : c.w} openings a week${
+          phrase ? ` — ${esc(phrase)}` : ""}</span>
+          <span class="dc-cabs">${cabs}</span></span>
+      </a>`));
+    }
+    if (!climate.length) {
+      mainEl.append(el(`<div class="empty-state"><div class="big">No history for these filters yet.</div>
+        <p>Openings accumulate continuously — check back soon.</p></div>`));
+    } else mainEl.append(grid);
+    return;
+  }
 
   mainEl.querySelectorAll(".stops-ctl .np").forEach((b) => b.addEventListener("click", () => {
     const u = new URL(location.href);
@@ -4953,7 +5035,7 @@ function renderMap(o) {
       <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
       <button type="button" class="np" data-stops="1" aria-pressed="${stops === 1}">≤1 stop</button>
     </div>
-    <div class="nights-ctl view-ctl" role="group" aria-label="Map mode">
+    <div class="nights-ctl view-ctl" role="group" aria-label="Show">
       <span class="nc-label">Show</span>
       <button type="button" class="np" data-view="now" aria-pressed="true">Open now</button>
       <button type="button" class="np" data-view="odds" aria-pressed="false">How often</button>
