@@ -2058,8 +2058,25 @@ function buildHomeModules(mount) {
   const alertsMount = el(`<div id="alerts-mod-mount"></div>`);
   mount.append(alertsMount);
   buildAlertsPanel(alertsMount);   // async; renders itself if there's anything
+  // The modules honour the SHARED cabin filter (rf:filter — the same pref the
+  // maps and calendars read), so "show me Business news" is one row of chips
+  // and the choice rides into every page behind the cards.
+  const legend = cabinLegend();
+  const allMask = legend.reduce((m, [bit]) => m | bit, 0);
+  let mask = getFilter() ?? allMask;
+  mask &= allMask; if (!mask) mask = allMask;
+  const chips = el(`<div class="chips module-chips" role="group" aria-label="Filter the lists below by cabin">${
+    legend.map(([bit, label]) => `<button type="button" class="chip" data-bit="${bit}"
+      aria-pressed="${!!(mask & bit)}"><span class="swatch ${bitClass(bit)}"></span>${esc(label)}</button>`).join("")}
+  </div>`);
+  chips.querySelectorAll(".chip").forEach((c) => c.addEventListener("click", () => {
+    const next = mask ^ Number(c.dataset.bit);
+    if (!next) return; // at least one cabin stays on
+    setFilter(next);
+    refreshHomeModules(); // rebuilds this row + both lists under the new mask
+  }));
   const modules = el(`<div class="modules"></div>`);
-  const opened = recentlyOpened();
+  const opened = recentlyOpened(mask);
   if (opened.length) {
     const mod = el(`<section class="module"><h2><span class="dot" aria-hidden="true"></span>Recently opened</h2><div class="card-list"></div></section>`);
     const listEl = $(".card-list", mod);
@@ -2073,7 +2090,7 @@ function buildHomeModules(mount) {
     }
     modules.append(mod);
   }
-  const top = topRoutes(6);
+  const top = topRoutes(6, mask);
   if (top.length) {
     const mod = el(`<section class="module"><h2>Deepest availability</h2><div class="card-list"></div></section>`);
     const listEl = $(".card-list", mod);
@@ -2087,7 +2104,12 @@ function buildHomeModules(mount) {
     }
     modules.append(mod);
   }
-  if (modules.children.length) mount.append(modules);
+  // The chips outlive their own filtering: if the current mask empties both
+  // lists, the row must stay (with an honest note) or there'd be no way back.
+  if (modules.children.length) mount.append(chips, modules);
+  else if ((store.changes?.entries?.length || Object.keys(store.bundle.routes).length) && mask !== allMask) {
+    mount.append(chips, el(`<p class="module-empty">Nothing to show in the selected cabins — pick another cabin above.</p>`));
+  }
 
   const routeCount = Object.keys(store.bundle.routes).length;
   let dateCount = 0;
@@ -2100,11 +2122,15 @@ function buildHomeModules(mount) {
   </div>`));
 }
 
-function recentlyOpened() {
+function recentlyOpened(mask = 15) {
   if (!store.changes?.entries) return [];
   const byRoute = new Map();
   for (const e of store.changes.entries) {
     if (e.k !== "opened") continue;
+    // The entry's c is the date's new cabin set: it matches when any selected
+    // cabin is among what opened.
+    const bits = [...(e.c || "")].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
+    if (!(bits & mask)) continue;
     const g = byRoute.get(e.r) || { route: e.r, count: 0, t: 0 };
     g.count++; g.t = Math.max(g.t, e.t);
     byRoute.set(e.r, g);
@@ -2114,9 +2140,16 @@ function recentlyOpened() {
     .sort((a, b) => b.t - a.t || b.count - a.count).slice(0, 6);
 }
 
-function topRoutes(n) {
+function topRoutes(n, mask = 15) {
+  const t0 = Math.max(0, todayIndex());
   return Object.keys(store.bundle.routes)
-    .map((key) => ({ key, total: routeTotals(key).total }))
+    .map((key) => {
+      const bits = routeBits(key);
+      let total = 0;
+      for (let i = t0; i < bits.length; i++) if (bits[i] & mask) total++;
+      return { key, total };
+    })
+    .filter((r) => r.total > 0)
     .sort((a, b) => b.total - a.total).slice(0, n);
 }
 
