@@ -119,3 +119,44 @@ func TestPinnedPerCabinCap(t *testing.T) {
 		t.Fatalf("newest not kept first: t=%v", first["t"])
 	}
 }
+
+func TestChangedEntriesEmitGainedCabins(t *testing.T) {
+	// Old: 2026-01-02 = M (1). New: MF (9) — the change GAINED First.
+	old := oldBundleJSON(t, "2026-01-01", map[string]map[string]string{
+		"AAA-BBB": {"BA": "010"},
+	})
+	newBits := map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {day(t, "2026-01-02"): 9}},
+	}
+	entries := buildChanges(old, nil, newBits, day(t, "2026-01-01"), 42)
+	if len(entries) != 1 {
+		t.Fatalf("got %d entries: %v", len(entries), entries)
+	}
+	m := entries[0].(map[string]any)
+	if m["k"] != "changed" || m["c"] != "MF" || m["g"] != "F" {
+		t.Fatalf("entry = %v, want changed c=MF g=F", m)
+	}
+	// A shuffle that gains nothing (MF -> M) carries no g key.
+	shrink := buildChanges(oldBundleJSON(t, "2026-01-01", map[string]map[string]string{
+		"AAA-BBB": {"BA": "090"},
+	}), nil, map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {day(t, "2026-01-02"): 1}},
+	}, day(t, "2026-01-01"), 43)
+	if m := shrink[0].(map[string]any); m["k"] != "changed" || m["g"] != nil {
+		t.Fatalf("no-gain change carries g: %v", m)
+	}
+}
+
+func TestPinnedViaGainedCabin(t *testing.T) {
+	cutoff := day(t, "2026-01-01")
+	// First arrived on an already-open date (changed, g=F): pinnable for F.
+	gained := fe("CCC-DDD", "BA", "2026-04-01", "changed", "MF", 50)
+	gained["g"] = "F"
+	// A cabin shuffle with no gains is never pinnable.
+	shuffle := fe("EEE-FFF", "BA", "2026-04-01", "changed", "MC", 60)
+	old := feedFile(t, []map[string]any{shuffle, gained}, nil)
+	got := pinnedStrings(t, buildPinned(nil, old, cutoff))
+	if len(got) != 1 || got[0] != "changed CCC-DDD 2026-04-01 MF t=50" {
+		t.Fatalf("pinned = %v", got)
+	}
+}

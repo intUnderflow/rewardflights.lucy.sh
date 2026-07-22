@@ -302,6 +302,11 @@ new one and prepends what changed. Entry fields:
   none), `"changed"` (cabin set differs).
 - `c`: the cabin letters concerned, in `MWCF` order — the **new** cabin set
   for `opened`/`changed`, the **last-seen** cabin set for `closed`.
+- `g` (changed entries only, omitted when empty): the cabin letters this
+  change **gained** (`new &^ old`). Rare cabins — First above all — almost
+  never open a date from nothing; they get added to dates other cabins
+  already hold, and `g` is what lets a cabin-filtered "recently opened" see
+  that.
 - `t`: the source timestamp of the generation that observed the change.
 
 Dates that merely rolled into the past are **not** reported as closed.
@@ -323,3 +328,17 @@ This dataset is derived from
 It carries no license of its own. Every file embeds a machine-readable
 `source` block naming that repo, with a no-warranty note: availability facts
 are provided as-is, with no guarantee of accuracy or bookability.
+
+### `changes/recent.json` — the `pinned` array
+
+Alongside the contiguous `entries` window (newest-first, capped at 1000), the
+feed carries `pinned`: per cabin, up to 40 of the newest entries that GAINED
+that cabin (an `"opened"` entry gains its whole `c`; a `"changed"` entry
+gains its `g`) and have rolled off the window. A (route, airline, date) is
+pinned only when its newest known event is itself a gain (never resurrecting
+a re-closed date or one whose latest change merely shuffled cabins), only
+while its travel date lies ahead, and never when the window already carries
+a newer event for it. Same entry shape as `entries`; carried
+forward across generations until displaced. Consumers that patch bundles from
+`entries` ignore `pinned`; the site's cabin-filtered "Recently opened" reads
+both.

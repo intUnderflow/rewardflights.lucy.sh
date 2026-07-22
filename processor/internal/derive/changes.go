@@ -62,9 +62,22 @@ type changeEntry struct {
 	Al string `json:"al"`
 	C  string `json:"c"`
 	D  string `json:"d"`
+	G  string `json:"g,omitempty"`
 	K  string `json:"k"`
 	R  string `json:"r"`
 	T  int64  `json:"t"`
+}
+
+// gainedCabins is what an event newly made available: an opening gains its
+// whole cabin set, a change gains its "g" letters, everything else nothing.
+func gainedCabins(ce changeEntry) string {
+	switch ce.K {
+	case "opened":
+		return ce.C
+	case "changed":
+		return ce.G
+	}
+	return ""
 }
 
 // buildPinned computes the feed's "pinned" array: per cabin, the newest
@@ -123,7 +136,11 @@ func buildPinned(window []any, oldChanges []byte, cutoffDay int) []any {
 
 	var pool []changeEntry
 	for k, ce := range newest {
-		if inWindow[k] || ce.K != "opened" {
+		// The newest event for the identity decides the current story: it must
+		// itself be a gain (an opening, or a change that added cabins) — a date
+		// whose latest event closed it or merely shuffled existing cabins is
+		// not pinnable news.
+		if inWindow[k] || gainedCabins(ce) == "" {
 			continue
 		}
 		if d, err := parseDay(ce.D); err != nil || d < cutoffDay {
@@ -157,17 +174,21 @@ func buildPinned(window []any, oldChanges []byte, cutoffDay int) []any {
 			if kept >= maxPinnedPerCabin {
 				break
 			}
-			if !strings.Contains(ce.C, cabin) {
+			if !strings.Contains(gainedCabins(ce), cabin) {
 				continue
 			}
 			kept++
 			if picked[ident(ce)] {
-				continue // already pinned for another cabin it also opened in
+				continue // already pinned for another cabin it also gained
 			}
 			picked[ident(ce)] = true
-			out = append(out, map[string]any{
+			m := map[string]any{
 				"al": ce.Al, "c": ce.C, "d": ce.D, "k": ce.K, "r": ce.R, "t": ce.T,
-			})
+			}
+			if ce.G != "" {
+				m["g"] = ce.G
+			}
+			out = append(out, m)
 		}
 	}
 	// Re-sort the union newest-first so the array reads like the entries do.
@@ -251,10 +272,20 @@ func diffBundles(oldBundle []byte, newBits map[string]map[string]map[int]int, cu
 			case newB == 0:
 				kind, cabins = "closed", cabinLetters(oldB)
 			}
-			batch = append(batch, map[string]any{
+			entry := map[string]any{
 				"al": pair.airline, "c": cabins, "d": dayDate(day),
 				"k": kind, "r": pair.route, "t": sourceTime,
-			})
+			}
+			// A "changed" event names what it GAINED ("g"): rare cabins (First
+			// above all) almost never open a date from nothing — they get added
+			// to dates other cabins already hold, and without g a cabin-filtered
+			// "Recently opened" would structurally never see them.
+			if kind == "changed" {
+				if gained := cabinLetters(newB &^ oldB); gained != "" {
+					entry["g"] = gained
+				}
+			}
+			batch = append(batch, entry)
 		}
 	}
 	slices.SortFunc(batch, func(a, b map[string]any) int {

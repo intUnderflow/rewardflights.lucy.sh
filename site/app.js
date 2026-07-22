@@ -2149,10 +2149,13 @@ function recentlyOpened(mask = 15) {
   };
   const byRoute = new Map();
   for (const e of src) {
-    if (e.k !== "opened") continue;
-    // The entry's c is the date's new cabin set: it matches when any selected
-    // cabin is among what opened.
-    const bits = [...(e.c || "")].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
+    // What the event GAINED is what counts as an opening: a k="opened" entry
+    // gains its whole cabin set, a k="changed" entry gains its "g" letters.
+    // This is how First news actually arrives — measured live, First almost
+    // never opens a date from nothing; it gets added to dates other cabins
+    // already hold.
+    const gained = e.k === "opened" ? (e.c || "") : e.k === "changed" ? (e.g || "") : "";
+    const bits = [...gained].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
     if (!(bits & mask)) continue;
     const g = byRoute.get(e.r) || { route: e.r, count: 0, gone: 0, t: 0 };
     if (stillOpen(e, bits)) g.count++;
