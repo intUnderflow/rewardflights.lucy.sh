@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"maps"
 	"slices"
+	"strings"
 )
 
 // maxChangeEntries is the rolling cap of changes/recent.json.
@@ -46,6 +47,151 @@ func buildChanges(oldBundle, oldChanges []byte, newBits map[string]map[string]ma
 		entries = entries[:maxChangeEntries]
 	}
 	return entries
+}
+
+// maxPinnedPerCabin is the per-cabin floor of "opened" history the feed
+// guarantees beyond the contiguous window. The 1000-entry window often spans
+// only an hour or two on a busy day, and First openings are rare on that
+// timescale — without a floor, a cabin-filtered "Recently opened" would
+// vanish instead of reaching back to real news.
+const maxPinnedPerCabin = 40
+
+// changeEntry is the typed view of one feed entry (new-batch maps and prior
+// RawMessages both normalize to this).
+type changeEntry struct {
+	Al string `json:"al"`
+	C  string `json:"c"`
+	D  string `json:"d"`
+	K  string `json:"k"`
+	R  string `json:"r"`
+	T  int64  `json:"t"`
+}
+
+// buildPinned computes the feed's "pinned" array: per cabin, the newest
+// openings older than the contiguous window, carried forward from the
+// previous feed (entries + pinned) so they survive roll-off. Truthfulness
+// rules:
+//   - A (route, airline, date) already present in the window is never pinned
+//     — the window's newer event supersedes the old story.
+//   - Only dates whose NEWEST known event is "opened" qualify: a date that
+//     opened and later closed must not be resurrected.
+//   - A travel date before cutoffDay is dead news and is dropped.
+//
+// Deterministic given (window, old feed): re-runs reproduce the array
+// byte-identically (stable sort, canonical map keys).
+func buildPinned(window []any, oldChanges []byte, cutoffDay int) []any {
+	normalize := func(e any) (changeEntry, bool) {
+		b, err := json.Marshal(e)
+		if err != nil {
+			return changeEntry{}, false
+		}
+		var ce changeEntry
+		if json.Unmarshal(b, &ce) != nil || ce.R == "" || ce.D == "" {
+			return changeEntry{}, false
+		}
+		return ce, true
+	}
+	ident := func(ce changeEntry) string { return ce.R + "|" + ce.Al + "|" + ce.D }
+
+	inWindow := map[string]bool{}
+	newest := map[string]changeEntry{}
+	consider := func(ce changeEntry) {
+		k := ident(ce)
+		if cur, ok := newest[k]; !ok || ce.T > cur.T {
+			newest[k] = ce
+		}
+	}
+	for _, e := range window {
+		if ce, ok := normalize(e); ok {
+			inWindow[ident(ce)] = true
+			consider(ce)
+		}
+	}
+	if oldChanges != nil {
+		var prev struct {
+			Entries []json.RawMessage `json:"entries"`
+			Pinned  []json.RawMessage `json:"pinned"`
+		}
+		if json.Unmarshal(oldChanges, &prev) == nil {
+			for _, raw := range append(prev.Entries, prev.Pinned...) {
+				if ce, ok := normalize(raw); ok {
+					consider(ce)
+				}
+			}
+		}
+	}
+
+	var pool []changeEntry
+	for k, ce := range newest {
+		if inWindow[k] || ce.K != "opened" {
+			continue
+		}
+		if d, err := parseDay(ce.D); err != nil || d < cutoffDay {
+			continue // departed (or unparseable) travel date: dead news
+		}
+		pool = append(pool, ce)
+	}
+	slices.SortFunc(pool, func(a, b changeEntry) int {
+		if a.T != b.T {
+			if a.T > b.T {
+				return -1
+			}
+			return 1
+		}
+		for _, pair := range [][2]string{{a.R, b.R}, {a.D, b.D}, {a.Al, b.Al}} {
+			if pair[0] != pair[1] {
+				if pair[0] < pair[1] {
+					return -1
+				}
+				return 1
+			}
+		}
+		return 0
+	})
+
+	picked := map[string]bool{}
+	out := []any{} // non-nil: an empty floor serializes as [], matching entries
+	for _, cabin := range []string{"M", "W", "C", "F"} {
+		kept := 0
+		for _, ce := range pool {
+			if kept >= maxPinnedPerCabin {
+				break
+			}
+			if !strings.Contains(ce.C, cabin) {
+				continue
+			}
+			kept++
+			if picked[ident(ce)] {
+				continue // already pinned for another cabin it also opened in
+			}
+			picked[ident(ce)] = true
+			out = append(out, map[string]any{
+				"al": ce.Al, "c": ce.C, "d": ce.D, "k": ce.K, "r": ce.R, "t": ce.T,
+			})
+		}
+	}
+	// Re-sort the union newest-first so the array reads like the entries do.
+	slices.SortFunc(out, func(a, b any) int {
+		am, bm := a.(map[string]any), b.(map[string]any)
+		at, bt := am["t"].(int64), bm["t"].(int64)
+		if at != bt {
+			if at > bt {
+				return -1
+			}
+			return 1
+		}
+		for _, k := range []string{"r", "d", "al"} {
+			av, bv := am[k].(string), bm[k].(string)
+			if av != bv {
+				if av < bv {
+					return -1
+				}
+				return 1
+			}
+		}
+		return 0
+	})
+	return out
 }
 
 // diffBundles decodes the previous bundle and diffs it against the new

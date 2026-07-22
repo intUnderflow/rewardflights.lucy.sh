@@ -2124,8 +2124,13 @@ function buildHomeModules(mount) {
 
 function recentlyOpened(mask = 15) {
   if (!store.changes?.entries) return [];
+  // The pinned floor reaches back beyond the contiguous window: per cabin,
+  // the newest openings the busy feed has rolled off. With a cabin filter on,
+  // "recently" honestly stretches to the last real news — each card carries
+  // its own timestamp.
+  const src = [...store.changes.entries, ...(store.changes.pinned || [])];
   const byRoute = new Map();
-  for (const e of store.changes.entries) {
+  for (const e of src) {
     if (e.k !== "opened") continue;
     // The entry's c is the date's new cabin set: it matches when any selected
     // cabin is among what opened.

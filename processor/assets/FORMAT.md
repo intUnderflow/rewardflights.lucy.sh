@@ -323,3 +323,15 @@ This dataset is derived from
 It carries no license of its own. Every file embeds a machine-readable
 `source` block naming that repo, with a no-warranty note: availability facts
 are provided as-is, with no guarantee of accuracy or bookability.
+
+### `changes/recent.json` — the `pinned` array
+
+Alongside the contiguous `entries` window (newest-first, capped at 1000), the
+feed carries `pinned`: per cabin, up to 40 of the newest `"opened"` entries
+that have rolled off the window. A (route, airline, date) is pinned only when
+its newest known event is still `"opened"` (never resurrecting a re-closed
+date), only while its travel date lies ahead, and never when the window
+already carries a newer event for it. Same entry shape as `entries`; carried
+forward across generations until displaced. Consumers that patch bundles from
+`entries` ignore `pinned`; the site's cabin-filtered "Recently opened" reads
+both.

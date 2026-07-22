@@ -399,8 +399,11 @@ func Build(in Inputs) (*Output, error) {
 
 	// Rolling changes feed (the only state-dependent output).
 	changes := buildChanges(in.OldBundle, in.OldChanges, routeBits, cutoffDay, in.SourceTime)
+	// Pinned floor: the newest per-cabin openings older than the window (see
+	// buildPinned) — the site's cabin-filtered "Recently opened" reads them.
+	pinned := buildPinned(changes, in.OldChanges, cutoffDay)
 	if err := put("changes/recent.json", map[string]any{
-		"entries": changes, "schema": 1, "t": in.SourceTime, "v": in.SHA,
+		"entries": changes, "pinned": pinned, "schema": 1, "t": in.SourceTime, "v": in.SHA,
 	}); err != nil {
 		return nil, err
 	}
