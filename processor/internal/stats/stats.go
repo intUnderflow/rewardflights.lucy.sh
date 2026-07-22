@@ -67,9 +67,22 @@ type stateData struct {
 // Accumulator ingests bundle generations. Not safe for concurrent use; the
 // watch loop is its only caller.
 type Accumulator struct {
-	state *stateData
-	path  string // state file; empty = memory only (tests)
-	logf  func(format string, args ...any)
+	state     *stateData
+	path      string // state file; empty = memory only (tests)
+	deferSave bool   // backfill: skip per-cycle persistence, Flush at the end
+	logf      func(format string, args ...any)
+}
+
+// DeferSaves suspends per-Cycle state persistence. The backfill replays tens
+// of thousands of generations, and a multi-MB state marshal per cycle
+// dominates the whole run (measured: ~115 gen/min saving vs thousands
+// without). Pair with Flush.
+func (a *Accumulator) DeferSaves() { a.deferSave = true }
+
+// Flush re-enables persistence and writes the state once.
+func (a *Accumulator) Flush() {
+	a.deferSave = false
+	a.save()
 }
 
 func New(statePath string, logf func(string, ...any)) *Accumulator {
@@ -159,7 +172,9 @@ func (a *Accumulator) Cycle(oldRaw, newRaw []byte, sourceTime int64) {
 			delete(a.state.Open, key)
 		}
 	}
-	a.save()
+	if !a.deferSave {
+		a.save()
+	}
 }
 
 // EmitIfDue writes stats.json under outDir at most once per emitEvery.

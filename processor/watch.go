@@ -338,6 +338,8 @@ func logf(format string, args ...any) {
 // with every generation since launch instead of an empty ledger.
 func runStatsBackfill(out, statePath string) error {
 	acc := stats.New(statePath, logf)
+	acc.DeferSaves() // one state write at the end, not 20k along the way
+	defer acc.Flush()
 	log, err := git(out, "log", "--reverse", "--format=%H %ct", "main", "--", "availability.json")
 	if err != nil {
 		return err
