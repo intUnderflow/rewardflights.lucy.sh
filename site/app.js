@@ -2087,9 +2087,13 @@ function buildHomeModules(mount) {
       // vanished dims but stays clickable (the calendar shows what's left).
       const meta = g.count
         ? `<span class="chg-opened">+${g.count} date${g.count > 1 ? "s" : ""}</span>${
-            g.gone ? `<span class="chg-gone"> · ${g.gone} gone</span>` : ""}`
+            g.gone ? `<span class="chg-gone"> · ${g.gone} gone</span>` : ""}${
+            g.rt ? "" : `<span class="chg-gone"> · one-way</span>`}`
         : `<span class="chg-gone">gone again</span>`;
-      listEl.append(el(`<a class="route-card${g.count ? "" : " rc-gone"}" href="/trip/${g.route}">
+      // Live one-way-only news lands on the one-way calendar, where the
+      // gained dates are actually visible under the filter.
+      const href = g.count && !g.rt ? `/route/${g.route}` : `/trip/${g.route}`;
+      listEl.append(el(`<a class="route-card${g.count ? "" : " rc-gone"}" href="${href}">
         <span class="rc-route">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</span>
         <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
         <span class="rc-meta">${meta}<br><span class="when">${esc(timeAgo(g.t))}</span></span>
@@ -2157,9 +2161,21 @@ function recentlyOpened(mask = 15) {
     const gained = e.k === "opened" ? (e.c || "") : e.k === "changed" ? (e.g || "") : "";
     const bits = [...gained].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
     if (!(bits & mask)) continue;
-    const g = byRoute.get(e.r) || { route: e.r, count: 0, gone: 0, t: 0 };
-    if (stillOpen(e, bits)) g.count++;
-    else g.gone++;
+    const g = byRoute.get(e.r) || { route: e.r, count: 0, gone: 0, rt: false, t: 0 };
+    if (stillOpen(e, bits)) {
+      g.count++;
+      // Is THIS gained date part of a same-cabin round trip (default window)?
+      // One-way news must land on the one-way calendar — a gained First seat
+      // with no First return partner can never appear on the trip view the
+      // card would otherwise link (measured live: BGI-LON gained F on a date
+      // whose next F return was 48 nights out).
+      if (!g.rt) {
+        const rt = roundTripBits(e.r, reverseRoute(e.r), bits & mask,
+          NIGHTS_DEFAULT[0], NIGHTS_DEFAULT[1], 1);
+        const idx = dayIndexOf(e.d);
+        if (Number.isInteger(idx) && idx >= 0 && idx < rt.length && rt[idx]) g.rt = true;
+      }
+    } else g.gone++;
     g.t = Math.max(g.t, e.t);
     byRoute.set(e.r, g);
   }
