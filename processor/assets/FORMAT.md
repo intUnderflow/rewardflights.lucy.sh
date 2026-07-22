@@ -342,3 +342,30 @@ a newer event for it. Same entry shape as `entries`; carried
 forward across generations until displaced. Consumers that patch bundles from
 `entries` ignore `pinned`; the site's cabin-filtered "Recently opened" reads
 both.
+
+## `stats.json` — availability climate
+
+Per (route, cabin), how often award seats APPEAR and how quickly they are
+SNAPPED UP, accumulated continuously by the processor (state survives
+restarts; seeded by a one-time replay of this repository's git history).
+Written at most hourly. Shape:
+
+```
+{ "schema": 1, "since": <unix>, "t": <unix>,
+  "routes": { "LON-TYO": { "F": { "w": 2.1, "n": 9, "d": 7,
+                                   "s": [1,4,2,0,0], "m": [0,…] } } } }
+```
+
+- `w`: appearance events per week over the observation window (one decimal).
+- `n`: appearance events observed. An appearance is a cabin bit turning on
+  for a date inside the previously-encoded horizon — churn/reopenings, the
+  same rule as the changes feed. Horizon growth (the ~T-355 release crawl)
+  is not an appearance, but a frontier date's later close DOES complete a
+  survival run measured from its release.
+- `d` / `s`: completed snap-up runs and their lifetime histogram
+  (<1h, 1–6h, 6–24h, 1–3d, 3d+). Runs whose true open time is unknown
+  (process baseline, brand-new route) and dates that roll into the past
+  while open are censored, never counted.
+- `m`: appearance events by TRAVEL month (0 = January) — the month you'd fly.
+
+Cabins and routes with no events are omitted.

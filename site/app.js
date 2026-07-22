@@ -4674,6 +4674,11 @@ function renderFrom(o) {
       <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
       <button type="button" class="np" data-stops="1" aria-pressed="${stops === 1}">≤1 stop</button>
     </div>
+    <div class="nights-ctl view-ctl" role="group" aria-label="Map mode">
+      <span class="nc-label">Show</span>
+      <button type="button" class="np" data-view="now" aria-pressed="true">Open now</button>
+      <button type="button" class="np" data-view="odds" aria-pressed="false">How often</button>
+    </div>
     ${pax > 1 ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
   </div>`));
 
@@ -4775,6 +4780,33 @@ function renderFrom(o) {
 
 /* ---------------- pages: destination map ---------------- */
 
+/* Availability-climate stats (stats.json): per (route, cabin), how often
+   award seats appear and how fast they vanish. Not time-critical (hourly
+   refresh), so it is fetched ONLY when the user first switches the map to
+   "How often" — then cached for the whole session. No cache-buster on
+   purpose: a ≤5-min-stale edge copy of hourly climate data is free CDN
+   absorption, not a staleness problem. */
+let _stats = null, _statsLoad = null;
+function loadStats() {
+  if (_stats) return Promise.resolve(_stats);
+  if (!_statsLoad) {
+    _statsLoad = getJSON(`${dataBase}/stats.json`, { retries: 1 })
+      .then((st) => { _stats = st; return st; })
+      .catch(() => { _statsLoad = null; return null; });
+  }
+  return _statsLoad;
+}
+
+/* Weighted-median survival phrase from the 5-bucket histogram. */
+function survivalPhrase(surv) {
+  const total = surv.reduce((a, b) => a + b, 0);
+  if (!total) return null;
+  let acc = 0, i = 0;
+  for (; i < surv.length - 1; i++) { acc += surv[i]; if (acc * 2 >= total) break; }
+  return ["usually gone within the hour", "usually gone within 6 hours",
+    "usually gone within a day", "usually lasts 1–3 days", "usually lasts 3+ days"][i];
+}
+
 /* The world base (land outline + projection constants) is a 57KB static asset
    used only here, so it loads on first map visit, not at boot. */
 let _worldLoad = null;
@@ -4851,6 +4883,10 @@ function renderMap(o) {
   // URL-borne (no session pref — it's a per-exploration scope, like month)
   // and carried across the List/Map toggle so switching views keeps it.
   let stops = new URLSearchParams(location.search).get("stops") === "0" ? 0 : 1;
+  // Map mode: "now" (availability today — the default) or "odds" (the
+  // climate: how often seats appear, how fast they vanish). Named mapMode:
+  // drawMap's viewBox const is already called `view` and shadows here.
+  let mapMode = "now";
   mainEl.innerHTML = "";
   mainEl.append(el(`<div class="section-pad">
     <p class="crumbs"><a href="/">Search</a></p>
@@ -4916,6 +4952,11 @@ function renderMap(o) {
       <span class="nc-label">Stops</span>
       <button type="button" class="np" data-stops="0" aria-pressed="${stops === 0}">Nonstop</button>
       <button type="button" class="np" data-stops="1" aria-pressed="${stops === 1}">≤1 stop</button>
+    </div>
+    <div class="nights-ctl view-ctl" role="group" aria-label="Map mode">
+      <span class="nc-label">Show</span>
+      <button type="button" class="np" data-view="now" aria-pressed="true">Open now</button>
+      <button type="button" class="np" data-view="odds" aria-pressed="false">How often</button>
     </div>
     <div class="nights-ctl" role="group" aria-label="Trip length in nights">
       <span class="nc-label">Trip length</span>
@@ -5027,6 +5068,30 @@ function renderMap(o) {
     return { days, best, unverified: pax > 1 && !known };
   }
 
+  /* Climate metric for one spot in "How often" mode: appearance rate and
+     survival across the SELECTED cabins, from stats.json. A via destination
+     reads its long-haul leg's stats — the hop is never the scarce resource —
+     and says so in the tooltip. Returns null when no history exists. */
+  function oddsMetric(spot) {
+    const key = spot.via ? `${spot.via}-${spot.d}` : `${o}-${spot.d}`;
+    const rs = _stats?.routes?.[key];
+    if (!rs) return null;
+    const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
+    let rate = 0, events = 0, best = 0, done = 0;
+    const surv = [0, 0, 0, 0, 0];
+    for (const [bit] of cabinLegend()) {
+      if (!(mask & bit)) continue;
+      const c = rs["MWCF"[[1, 2, 4, 8].indexOf(bit)]];
+      if (!c || !c.n) continue;
+      rate += mo ? c.m[mo.m] : c.w;
+      events += mo ? c.m[mo.m] : c.n;
+      if (c.n) best = bit; // legend runs M→F, so the last hit is the highest
+      if (c.s) { c.s.forEach((v, i) => { surv[i] += v; }); done += c.d || 0; }
+    }
+    if (!events && !done) return null;
+    return { rate, events, best, surv, done, statsKey: key };
+  }
+
   function drawMap() {
     const W = window.WORLD1;
     panel.innerHTML = "";
@@ -5067,6 +5132,27 @@ function renderMap(o) {
         if (!stops && spot.via) continue;
         const d = spot.d;
         const g = store.bundle.places[d]?.g;
+        if (mapMode === "odds") {
+          const om = oddsMetric(spot);
+          if (!om || (!om.rate && !om.done)) continue;
+          if (!g) { unplaced++; continue; }
+          shown++;
+          if (spot.via) viaShown++;
+          const [x, y] = projectLL(g[0], g[1]);
+          const r = (2.1 + Math.sqrt(Math.min(om.rate, 80)) * 0.85) / kOf();
+          const openNow = metric(spot).days;
+          const phrase = survivalPhrase(om.surv) || "";
+          const mo = monthIdx >= 0 ? next12Months()[monthIdx] : null;
+          const freq = mo
+            ? `${om.events} opening${om.events === 1 ? "" : "s"} observed for ${mo.label} travel`
+            : `≈${om.rate % 1 ? om.rate.toFixed(1) : om.rate} openings a week`;
+          (spot.via ? viaParts : parts).push(`<circle class="map-dot ${bitClass(om.best)}${spot.via ? " map-dot-via" : ""}" cx="${x}" cy="${y}" r="${r}"
+            tabindex="0" role="link" data-code="${d}" data-odds="1" data-freq="${esc(freq)}" data-open="${openNow}" data-best="${om.best}"${
+              phrase ? ` data-phrase="${phrase}"` : ""}${spot.via ? ` data-via="${spot.via}"` : ""}
+            aria-label="${esc(placeName(d))}: ${esc(freq)}${phrase ? `, ${esc(phrase)}` : ""}${
+              spot.via ? ` (long-haul leg via ${esc(placeName(spot.via))})` : ""} — open calendar"></circle>`);
+          continue;
+        }
         const { days, best, unverified } = metric(spot);
         if (!days) continue;
         if (!g) { unplaced++; continue; }
@@ -5085,6 +5171,16 @@ function renderMap(o) {
       // above them, the origin marker on top.
       dotsG.innerHTML = viaParts.join("") + parts.join("") + originDot;
       pathsG.innerHTML = ""; // hover state doesn't survive a redraw
+      if (mapMode === "odds") {
+        const sinceLabel = _stats
+          ? new Date(_stats.since * 1000).toLocaleDateString("en-GB", { day: "numeric", month: "short" }) : "";
+        $(".map-count", controls).textContent = _stats
+          ? `${shown} of ${poolSize} destinations have award-opening history in the selected cabins` +
+            `${monthIdx >= 0 ? ` for ${next12Months()[monthIdx].label} travel` : ""} (observed since ${sinceLabel})` +
+            (unplaced ? ` (${unplaced} more can't be placed on the map yet)` : "") + "."
+          : "Availability history isn't available right now — the Open now view still works.";
+        return;
+      }
       const monthLabel = monthIdx >= 0 ? ` in ${next12Months()[monthIdx].label}` : "";
       const nightsLabel = nights[0] === NIGHTS_DEFAULT[0] && nights[1] === NIGHTS_DEFAULT[1]
         ? "" : ` of ${nights[0]}–${nights[1]} nights`;
@@ -5099,6 +5195,21 @@ function renderMap(o) {
 
     /* Tooltip follows hover/focus; the dot itself is the link. */
     function showMapTip(dot) {
+      if (dot.dataset.odds) {
+        const open = Number(dot.dataset.open);
+        tip.innerHTML = `<div class="t-date">${esc(placeName(dot.dataset.code))} <span class="map-tip-code">${dot.dataset.code}</span></div>
+          <div class="t-cab"><span class="swatch ${bitClass(Number(dot.dataset.best))}"></span>${esc(dot.dataset.freq)}</div>
+          ${dot.dataset.phrase ? `<div class="t-note">${esc(dot.dataset.phrase)}</div>` : ""}
+          <div class="t-note">${open ? `${open} day${open === 1 ? "" : "s"} open right now` : "nothing open right now — worth an alert"}</div>
+          ${dot.dataset.via ? `<div class="t-note">long-haul leg via ${esc(placeName(dot.dataset.via))}</div>` : ""}`;
+        tip.hidden = false;
+        const pr0 = panel.getBoundingClientRect(), dr0 = dot.getBoundingClientRect();
+        const x0 = Math.min(pr0.width - tip.offsetWidth - 8, Math.max(8, dr0.left - pr0.left + dr0.width / 2 - tip.offsetWidth / 2));
+        const above0 = dr0.top - pr0.top - tip.offsetHeight - 8;
+        tip.style.left = `${x0}px`;
+        tip.style.top = `${above0 > 4 ? above0 : dr0.bottom - pr0.top + 8}px`;
+        return;
+      }
       const d = dot.dataset.code, days = dot.dataset.days, best = Number(dot.dataset.best);
       const label = (cabinLegend().find(([bit]) => bit === best) || [0, ""])[1];
       tip.innerHTML = `<div class="t-date">${esc(placeName(d))} <span class="map-tip-code">${d}</span></div>
@@ -5305,6 +5416,30 @@ function renderMap(o) {
       history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
       redraw();
     });
+    controls.querySelectorAll(".view-ctl .np").forEach((b) => b.addEventListener("click", () => {
+      const next = b.dataset.view;
+      if (next === mapMode) return;
+      mapMode = next;
+      controls.querySelectorAll(".view-ctl .np").forEach((x) =>
+        x.setAttribute("aria-pressed", String(x.dataset.view === mapMode)));
+      // Trip-length and party shape "open now" counts; the climate ignores
+      // them, so their controls hide rather than pretend.
+      const nightsCtl = controls.querySelector(".nights-ctl:not(.conn-ctl):not(.stops-ctl):not(.view-ctl)");
+      if (nightsCtl) nightsCtl.hidden = mapMode === "odds";
+      const paxCtl = controls.querySelector(".pax-ctl");
+      if (paxCtl) paxCtl.hidden = mapMode === "odds";
+      const legendEl = $(".map-legend");
+      if (legendEl) {
+        legendEl.textContent = mapMode === "odds"
+          ? `Dot size is how OFTEN award seats appear in the selected cabins; colour is the best cabin with history. Hover for the typical time-to-vanish. Based on continuous observation — the numbers sharpen as history grows.`
+          : `Dot colour is the best cabin available; dot size is how many days have round trips. Hover a dot to see its route — one-stop journeys show their overnight connection. Drag to pan, scroll or pinch to zoom.`;
+      }
+      if (mapMode === "odds" && !_stats) {
+        $(".map-count", controls).textContent = "Loading availability history…";
+        loadStats().then(() => { if (current.page === "map") redraw(); });
+      }
+      redraw();
+    }));
     controls.querySelectorAll(".stops-ctl .np").forEach((b) => b.addEventListener("click", () => {
       stops = Number(b.dataset.stops);
       controls.querySelectorAll(".stops-ctl .np").forEach((x) =>

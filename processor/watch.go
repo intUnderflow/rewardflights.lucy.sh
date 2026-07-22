@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -17,6 +18,7 @@ import (
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alerts"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/stats"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
 )
 
@@ -29,6 +31,8 @@ type watchConfig struct {
 	Commit   bool          // commit -Out when it changes
 	Push     bool          // push -Out after commit (implies Commit + pre-sync)
 	TokenCmd string        // shell command printing a git token to stdout; empty -> plain git
+
+	StatsState string // availability-climate state file; empty disables stats
 
 	Alerts            alerts.Config // seat alerts; enabled when VapidKeyPath is set
 	AlertsStore       string        // subscription store file
@@ -127,6 +131,15 @@ func runWatch(cfg watchConfig) error {
 		logf("watch: freshness tagger running (%ds buckets, %s retention)", tagBucketSecs, tagRetention)
 	}
 
+	// Availability-climate accumulator (stats.json): fed the old/new bundle
+	// around each regeneration, emitted into the out repo at most hourly so
+	// it rides an existing data commit without adding churn.
+	var climate *stats.Accumulator
+	if cfg.StatsState != "" {
+		climate = stats.New(cfg.StatsState, logf)
+		logf("watch: stats accumulator enabled (state=%s)", cfg.StatsState)
+	}
+
 	var lastProcessed string
 	tick := time.NewTicker(cfg.Interval)
 	defer tick.Stop()
@@ -152,6 +165,13 @@ func runWatch(cfg watchConfig) error {
 			}
 		}
 
+		// The climate diff needs the PREVIOUS generation, which app.Run is
+		// about to overwrite.
+		var oldRaw []byte
+		if climate != nil {
+			oldRaw, _ = os.ReadFile(filepath.Join(cfg.Out, "availability.json"))
+		}
+
 		result, err := app.Run(app.Config{
 			Src: cfg.Src, Out: cfg.Out,
 			SourceSHA: sha, SourceTime: unix,
@@ -163,6 +183,15 @@ func runWatch(cfg watchConfig) error {
 			return // do not advance lastProcessed; retry next tick
 		}
 		logf("watch: %s", result.Summary())
+
+		if climate != nil {
+			if newRaw, err := os.ReadFile(filepath.Join(cfg.Out, "availability.json")); err == nil {
+				climate.Cycle(oldRaw, newRaw, unix)
+				if climate.EmitIfDue(cfg.Out, unix) {
+					logf("watch: stats.json refreshed")
+				}
+			}
+		}
 
 		if cfg.Commit {
 			pushed, err := gitCommitPush(cfg.Out, sha, cfg.Push, cfg.TokenCmd)
@@ -302,4 +331,40 @@ func pushVerb(push bool) string {
 
 func logf(format string, args ...any) {
 	fmt.Fprintf(os.Stderr, "%s "+format+"\n", append([]any{time.Now().UTC().Format(time.RFC3339)}, args...)...)
+}
+
+// runStatsBackfill replays the out repo's git history of availability.json
+// through the climate accumulator — a one-time seeding so stats.json starts
+// with every generation since launch instead of an empty ledger.
+func runStatsBackfill(out, statePath string) error {
+	acc := stats.New(statePath, logf)
+	log, err := git(out, "log", "--reverse", "--format=%H %ct", "main", "--", "availability.json")
+	if err != nil {
+		return err
+	}
+	var prev []byte
+	n := 0
+	for _, line := range strings.Split(log, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 {
+			continue
+		}
+		unix, err := strconv.ParseInt(fields[1], 10, 64)
+		if err != nil {
+			continue
+		}
+		raw, err := git(out, "show", fields[0]+":availability.json")
+		if err != nil {
+			logf("backfill: skipping %s: %v", short(fields[0]), err)
+			continue
+		}
+		acc.Cycle(prev, []byte(raw), unix)
+		prev = []byte(raw)
+		n++
+		if n%200 == 0 {
+			logf("backfill: %d generations ingested", n)
+		}
+	}
+	logf("backfill: done — %d generations", n)
+	return nil
 }

@@ -52,6 +52,8 @@ func main() {
 	alertsTestPerHour := flag.Int("alerts-test-per-hour", 5, "watch mode: POST /test notifications per hour per subscription")
 	alertsCooldown := flag.Duration("alerts-cooldown", 3*time.Hour, "watch mode: minimum off-time before a day re-alerts")
 	alertsBatch := flag.Duration("alerts-batch", time.Hour, "watch mode: minimum interval between publishes per topic")
+	statsState := flag.String("stats-state", defaultAlertsPath("../stats-state.json"), "watch mode: availability-climate state file (empty disables stats.json)")
+	statsBackfill := flag.Bool("stats-backfill", false, "replay -out's git history through the stats accumulator, then exit")
 	flag.Parse()
 
 	if *src == "" || *out == "" {
@@ -60,10 +62,21 @@ func main() {
 		os.Exit(2)
 	}
 
+	if *statsBackfill {
+		if *out == "" {
+			fatal(errors.New("-stats-backfill needs -out"))
+		}
+		if err := runStatsBackfill(*out, *statsState); err != nil {
+			fatal(err)
+		}
+		return
+	}
+
 	if *watch {
 		if err := runWatch(watchConfig{
 			Src: *src, Out: *out, Force: *force,
 			Interval: *interval, Commit: *commit, Push: *push, TokenCmd: *tokenCmd,
+			StatsState: *statsState,
 			Alerts: alerts.Config{
 				VapidKeyPath: *alertsVapidKey,
 				VapidSubject: *alertsVapidSubject,
