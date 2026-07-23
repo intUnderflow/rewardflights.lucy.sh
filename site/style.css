@@ -221,6 +221,12 @@ button.seg-opt { border: 0; background: none; cursor: pointer; }
 /* ---------- home modules ---------- */
 .module-chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 46px 0 -28px; }
 .module-empty { margin: 44px 0 0; color: var(--ink-3); font-size: 13.5px; }
+/* /from/ header: vertical rhythm for the stacked filter rows — the sub line,
+   cabin chips, and the stops/show controls each get their own breath. */
+.from-head .page-sub { margin-bottom: 18px; }
+.from-head .chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 14px; }
+.from-head .nights-ctl { margin: 0 18px 12px 0; }
+.from-head .pax-note { margin-top: 4px; }
 .chg-gone { color: var(--ink-3); font-size: 12px; }
 .rc-gone { opacity: .68; }
 .rc-gone:hover { opacity: 1; }

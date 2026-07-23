@@ -4678,7 +4678,7 @@ function renderFrom(o) {
         vias.size ? ` — ${dests.length} nonstop, ${vias.size} with one overnight stop` : ""}${
         !stops && allVias.size ? ` (nonstop only — ${allVias.size} more with one stop)` : ""}.
       Bars show days with round trips per month (${mask === allMaskF ? "any cabin" : esc(cabNames(mask))}, ${NIGHTS_DEFAULT[0]}–${NIGHTS_DEFAULT[1]} nights${pax > 1 ? `, ${pax} travelling together` : ""}).`;
-  mainEl.append(el(`<div class="section-pad">
+  mainEl.append(el(`<div class="section-pad from-head">
     <p class="crumbs"><a href="/">Search</a></p>
     <h1 class="page-title">Everywhere from ${esc(placeName(o))}</h1>
     <div class="view-toggle" role="group" aria-label="View">
