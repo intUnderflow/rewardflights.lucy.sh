@@ -247,6 +247,15 @@ func diffBundles(oldBundle []byte, newBits map[string]map[string]map[int]int, cu
 	for pair := range pairs {
 		oldDays := oldState[pair.route][pair.airline]
 		newDays := newBits[pair.route][pair.airline]
+		// A (route, airline) pair the old bundle didn't know is BASELINE, not
+		// news: a new route arriving, or a new AIRLINE onboarding onto an
+		// existing route, would otherwise flood the capped feed with one
+		// "opened" entry per day it covers (an airline onboarding = tens of
+		// thousands), evicting all genuine churn. Mirrors the alerts engine's
+		// EC-11. Days the pair genuinely opens LATER are news as usual.
+		if oldState[pair.route] == nil || oldState[pair.route][pair.airline] == nil {
+			continue
+		}
 		days := map[int]bool{}
 		for d := range oldDays {
 			days[d] = true

@@ -693,3 +693,14 @@ promised, and any arrival today makes any departure tomorrow bookable).
 2. **Notification `tag`** — stack (my pick; preserves unread dates) vs. collapse (tidier tray).
 3. **`Cooldown` and `Batch` defaults** — I kept 3h / 1h, but the batch key changed from *topic* to *device*, which is a real behaviour change: a 20-watch user now gets at most 24 pushes/day instead of a possible 480.
 4. **The free win** — the ledger redesign shrinks the existing state file from O(dataset) to O(events in 3h). Worth deploying even if the date-range feature slipped.
+## Airline onboarding (EC-11's airline cousin) — shipped 2026-07-26
+
+A second airline's entire network arriving in one generation must be
+baseline, not news, in every diff engine. `parseBundle` retains per-airline
+bit arrays; `diffBundles` computes the GAINS side by merging only airlines
+the previous bundle already knew on that route (losses keep the full merge —
+an onboarding closes nothing), and the seat-threshold planes skip a route
+for the cycle its airline set grows (codes are MAX-merged and inseparable).
+The changes feed and the stats accumulator apply the same rule at the
+(route, airline)-pair level. Deployed BEFORE the first Aer Lingus data so
+onboarding day is a non-event; EC-13 remains as the backstop.

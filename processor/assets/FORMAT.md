@@ -311,6 +311,13 @@ new one and prepends what changed. Entry fields:
 
 Dates that merely rolled into the past are **not** reported as closed.
 
+A (route, airline) pair absent from the previous generation is **baseline,
+not news**: a brand-new route, or a new airline onboarding onto an existing
+route, emits no entries for the days it arrives already holding — only its
+subsequent genuine changes. (The alerting and climate engines apply the same
+rule, so a second airline's entire network arriving in one generation
+produces no alert storm and no climate spike.)
+
 Seat-threshold (`s`) transitions are **not** reported in this feed: entries
 reflect `a` cabin-bit changes only, so a day going from 2 to 4 seats (bit
 unchanged) emits nothing. A future format revision may add a seat-transition

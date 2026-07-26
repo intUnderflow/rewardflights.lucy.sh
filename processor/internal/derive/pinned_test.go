@@ -160,3 +160,35 @@ func TestPinnedViaGainedCabin(t *testing.T) {
 		t.Fatalf("pinned = %v", got)
 	}
 }
+
+func TestNewPairsAreBaselineNotNews(t *testing.T) {
+	// Old bundle: one route, one airline. New bundle: the same, plus a new
+	// airline onboarding onto the existing route AND a brand-new route —
+	// neither may emit a single entry (a genuine later change still does).
+	old := oldBundleJSON(t, "2026-01-01", map[string]map[string]string{
+		"AAA-BBB": {"BA": "010"},
+	})
+	newBits := map[string]map[string]map[int]int{
+		"AAA-BBB": {
+			"BA": {day(t, "2026-01-02"): 1},                            // unchanged
+			"EI": {day(t, "2026-01-02"): 4, day(t, "2026-01-03"): 4}, // onboarding
+		},
+		"CCC-DDD": {"EI": {day(t, "2026-01-02"): 1}}, // brand-new route
+	}
+	entries := buildChanges(old, nil, newBits, day(t, "2026-01-01"), 42)
+	if len(entries) != 0 {
+		t.Fatalf("onboarding produced %d entries: %v", len(entries), entries)
+	}
+	// Next cycle: the onboarded airline gains a day — that IS news.
+	old2 := oldBundleJSON(t, "2026-01-01", map[string]map[string]string{
+		"AAA-BBB": {"BA": "010", "EI": "044"},
+	})
+	newBits2 := map[string]map[string]map[int]int{
+		"AAA-BBB": {"BA": {day(t, "2026-01-02"): 1},
+			"EI": {day(t, "2026-01-01"): 4, day(t, "2026-01-02"): 4, day(t, "2026-01-03"): 4}},
+	}
+	entries2 := buildChanges(old2, nil, newBits2, day(t, "2026-01-01"), 43)
+	if len(entries2) != 1 || entryString(t, entries2[0]) != "opened AAA-BBB EI 2026-01-01 C t=43" {
+		t.Fatalf("post-onboarding gain not news: %v", entries2)
+	}
+}

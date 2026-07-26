@@ -15,6 +15,11 @@ type bundleState struct {
 	epochDay int               // absolute day of the bundle epoch
 	endDay   int               // one past the last encoded day (the horizon)
 	merged   map[string][]byte // route -> cabin bits per day since epoch
+	// perAirline: route -> airline id -> that airline's bits per day — kept so
+	// diffBundles can restrict GAINS to airlines the previous bundle already
+	// knew on the route (a newly-onboarded airline's entire network arriving
+	// in one generation is baseline, not news).
+	perAirline map[string]map[string][]byte
 	// seats: route -> one packed byte per day since epoch, decoded from the
 	// optional "s" layer (2 hex chars per day; 2-bit monotone threshold code
 	// per cabin, M=bits 0-1, W=2-3, C=4-5, F=6-7; 0 = no evidence of >=2
@@ -163,10 +168,12 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		return nil, fmt.Errorf("bundle epoch: %w", err)
 	}
 	merged := map[string][]byte{}
+	perAirline := map[string]map[string][]byte{}
 	seats := map[string][]byte{}
 	maxLen := 0
 	for route, entry := range b.Routes {
 		var bits []byte
+		byAl := map[string][]byte{}
 		for id, s := range entry.A {
 			if a, ok := b.Airlines[id]; ok && a.Width != 0 && a.Width != 1 {
 				continue // multi-nibble legend: not decodable here (or by the site)
@@ -176,13 +183,17 @@ func parseBundle(raw []byte) (*bundleState, error) {
 				copy(grown, bits)
 				bits = grown
 			}
+			alBits := make([]byte, len(s))
 			for i := 0; i < len(s); i++ {
 				if v := hexBits(s[i]); v > 0 {
 					bits[i] |= byte(v)
+					alBits[i] = byte(v)
 				}
 			}
+			byAl[id] = alBits
 		}
 		merged[route] = bits
+		perAirline[route] = byAl
 		if len(bits) > maxLen {
 			maxLen = len(bits)
 		}
@@ -245,7 +256,7 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		}
 	}
 	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen,
-		merged: merged, seats: seats, coords: coords}, nil
+		merged: merged, perAirline: perAirline, seats: seats, coords: coords}, nil
 }
 
 // cabinOrder is the canonical M W C F ordering, used everywhere cabins are

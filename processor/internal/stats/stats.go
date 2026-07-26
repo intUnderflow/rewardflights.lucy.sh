@@ -97,7 +97,7 @@ func New(statePath string, logf func(string, ...any)) *Accumulator {
 // Cycle ingests one generation transition. oldRaw nil (or unparseable) means
 // no previous state: everything open is baseline-seeded and nothing counts.
 func (a *Accumulator) Cycle(oldRaw, newRaw []byte, sourceTime int64) {
-	nb, _, err := parseBundle(newRaw)
+	nb, nbAl, _, err := parseBundle(newRaw)
 	if err != nil {
 		a.logf("stats: unparseable new bundle: %v", err)
 		return
@@ -108,12 +108,37 @@ func (a *Accumulator) Cycle(oldRaw, newRaw []byte, sourceTime int64) {
 		a.state.Since = sourceTime
 	}
 
-	ob, oldHorizon, oldErr := parseBundle(oldRaw)
+	ob, obAl, oldHorizon, oldErr := parseBundle(oldRaw)
 
 	seen := map[string]bool{}
 	for route, newDays := range nb {
 		oldDays := ob[route]
 		routeKnown := oldErr == nil && oldDays != nil
+		// Airline-onboarding guard: a new airline's contributions on an
+		// EXISTING route are baseline, not appearances — otherwise its whole
+		// network arriving in one generation would inflate rates for the
+		// entire observation window. Gains count from known airlines only.
+		var knownDays map[int]int
+		if routeKnown {
+			grew := false
+			for id := range nbAl[route] {
+				if _, had := obAl[route][id]; !had {
+					grew = true
+					break
+				}
+			}
+			if grew {
+				knownDays = map[int]int{}
+				for id, alDays := range nbAl[route] {
+					if _, had := obAl[route][id]; !had {
+						continue
+					}
+					for day, v := range alDays {
+						knownDays[day] |= v
+					}
+				}
+			}
+		}
 		days := map[int]bool{}
 		for day := range newDays {
 			days[day] = true
@@ -130,10 +155,18 @@ func (a *Accumulator) Cycle(oldRaw, newRaw []byte, sourceTime int64) {
 				key := route + "|" + c.letter + "|" + strconv.Itoa(day)
 				seen[key] = true
 				has, had := newBits&c.bit != 0, oldBits&c.bit != 0
+				hasKnown := has
+				if knownDays != nil {
+					hasKnown = knownDays[day]&c.bit != 0
+				}
 				switch {
 				case has && !had:
 					if !routeKnown {
 						// Baseline / brand-new route: open run with unknown start.
+						a.state.Open[key] = 0
+					} else if !hasKnown {
+						// Only a newly-onboarded airline holds this bit:
+						// baseline it (unknown start, no appearance event).
 						a.state.Open[key] = 0
 					} else if day > oldHorizon {
 						// Frontier: the booking window reaching this date is not
@@ -264,10 +297,11 @@ func monthOfDay(day int) int {
 }
 
 // parseBundle reduces availability.json bytes to route -> day -> merged cabin
-// bits (absolute day numbers), plus the bundle's last encoded day.
-func parseBundle(raw []byte) (map[string]map[int]int, int, error) {
+// bits (absolute day numbers), route -> airline -> day -> bits (for the
+// airline-onboarding guard), plus the bundle's last encoded day.
+func parseBundle(raw []byte) (map[string]map[int]int, map[string]map[string]map[int]int, int, error) {
 	if raw == nil {
-		return nil, 0, fmt.Errorf("no bundle")
+		return nil, nil, 0, fmt.Errorf("no bundle")
 	}
 	var b struct {
 		Epoch  string `json:"epoch"`
@@ -276,30 +310,36 @@ func parseBundle(raw []byte) (map[string]map[int]int, int, error) {
 		} `json:"routes"`
 	}
 	if err := json.Unmarshal(raw, &b); err != nil {
-		return nil, 0, err
+		return nil, nil, 0, err
 	}
 	t, err := time.Parse("2006-01-02", b.Epoch)
 	if err != nil {
-		return nil, 0, fmt.Errorf("bundle epoch: %w", err)
+		return nil, nil, 0, fmt.Errorf("bundle epoch: %w", err)
 	}
 	epochDay := int(t.Unix() / 86400)
 	out := map[string]map[int]int{}
+	perAl := map[string]map[string]map[int]int{}
 	horizon := 0
 	for route, entry := range b.Routes {
 		days := map[int]int{}
-		for _, s := range entry.A {
+		byAl := map[string]map[int]int{}
+		for id, s := range entry.A {
+			alDays := map[int]int{}
 			for i := 0; i < len(s); i++ {
 				if v := hexBits(s[i]); v > 0 {
 					days[epochDay+i] |= v
+					alDays[epochDay+i] = v
 				}
 			}
+			byAl[id] = alDays
 			if h := epochDay + len(s) - 1; h > horizon {
 				horizon = h
 			}
 		}
 		out[route] = days
+		perAl[route] = byAl
 	}
-	return out, horizon, nil
+	return out, perAl, horizon, nil
 }
 
 func hexBits(c byte) int {

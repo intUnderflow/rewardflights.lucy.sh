@@ -160,3 +160,51 @@ func TestRenderAndEmitGate(t *testing.T) {
 		t.Fatal("non-deterministic render")
 	}
 }
+
+// bundleMulti builds availability bytes with per-airline strings.
+func bundleMulti(t *testing.T, routes map[string]map[string]string) []byte {
+	t.Helper()
+	wrapped := map[string]any{}
+	for r, byAl := range routes {
+		wrapped[r] = map[string]any{"a": byAl}
+	}
+	raw, err := json.Marshal(map[string]any{"epoch": "2026-01-01", "routes": wrapped})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+func TestNewAirlineOnboardingIsBaseline(t *testing.T) {
+	a := New("", nil)
+	a.Cycle(nil, bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010"},
+	}), epochUnix)
+	// EI onboards holding F on days BA never had: zero appearances.
+	a.Cycle(bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010"},
+	}), bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010", "EI": "088"},
+	}), epochUnix+1000)
+	if g := aggOf(a, "AAA-BBB|F"); g.Total != 0 {
+		t.Fatalf("onboarding counted as appearances: %+v", g)
+	}
+	// Its onboarded days close later: no survival fabricated (unknown start).
+	a.Cycle(bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010", "EI": "088"},
+	}), bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010", "EI": "080"},
+	}), epochUnix+8000)
+	if g := aggOf(a, "AAA-BBB|F"); g.Done != 0 {
+		t.Fatalf("onboarded close measured a lifetime: %+v", g)
+	}
+	// Once known, EI's genuine gains count normally.
+	a.Cycle(bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010", "EI": "080"},
+	}), bundleMulti(t, map[string]map[string]string{
+		"AAA-BBB": {"BA": "010", "EI": "088"},
+	}), epochUnix+9000)
+	if g := aggOf(a, "AAA-BBB|F"); g.Total != 1 {
+		t.Fatalf("post-onboarding gain not counted: %+v", g)
+	}
+}

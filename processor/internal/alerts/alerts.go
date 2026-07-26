@@ -392,6 +392,32 @@ func diffBundles(prev, b *bundleState, today int) (gains, losses map[string][]ga
 		if !known {
 			continue // EC-11: a brand-new route baselines, it does not alert
 		}
+		// EC-11's airline cousin: an airline NEW to this route contributes
+		// nothing to gains this cycle — its whole network arriving at once is
+		// baseline, not news (and would otherwise trip EC-13, silencing
+		// genuine same-cycle news from established airlines). The gains side
+		// therefore merges only airlines the previous bundle knew here;
+		// losses keep the full merge (an onboarding closes nothing).
+		gainBits := newBits
+		airlineSetGrew := false
+		for id := range b.perAirline[route] {
+			if _, had := prev.perAirline[route][id]; !had {
+				airlineSetGrew = true
+				break
+			}
+		}
+		if airlineSetGrew {
+			knownBits := make([]byte, len(newBits))
+			for id, alBits := range b.perAirline[route] {
+				if _, had := prev.perAirline[route][id]; !had {
+					continue
+				}
+				for i, v := range alBits {
+					knownBits[i] |= v
+				}
+			}
+			gainBits = knownBits
+		}
 		// Threshold transitions are only meaningful when BOTH endpoints are
 		// known. Requiring the layer on both sides (a) keeps 0%-coverage
 		// bundles on the exact pre-seats code path, and (b) makes the seats
@@ -405,14 +431,19 @@ func diffBundles(prev, b *bundleState, today int) (gains, losses map[string][]ga
 		// produces no phantom "loss" events (unknown never means gone).
 		_, seatsNew := b.seats[route]
 		_, seatsOld := prev.seats[route]
-		diffSeats := seatsNew && seatsOld
+		// Seat thresholds are MAX-merged across airlines at parse time, so an
+		// onboarding airline's codes are inseparable this cycle: skip the
+		// threshold planes for the route until its airline set is stable
+		// (same shape as the seats-layer's own onboarding rule).
+		diffSeats := seatsNew && seatsOld && !airlineSetGrew
 		for d := lo; d < b.endDay; d++ {
 			var o byte
 			if d < prev.endDay {
 				o = oldBits[d-prev.epochDay]
 			}
 			n := newBits[d-b.epochDay]
-			g := gain{day: d, bits: n &^ o}
+			gn := gainBits[d-b.epochDay]
+			g := gain{day: d, bits: gn &^ o}
 			var lost gain
 			lost.day = d
 			if d < lossHi {
