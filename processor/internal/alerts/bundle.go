@@ -32,6 +32,24 @@ type bundleState struct {
 	// coords: place -> [lat, lon], for deriving a via watch's focus legs the
 	// same way the site does (focusLegs). Places without coords are absent.
 	coords map[string][2]float64
+	// alNames: airline id -> display name from the bundle legend, so a scoped
+	// push can say "Aer Lingus only" instead of "EI only".
+	alNames map[string]string
+}
+
+// alBitsAt returns ONE airline's presence bits for a route and absolute day
+// (0 when the route, airline, or day is unknown) — the currency of
+// airline-scoped watches.
+func (b *bundleState) alBitsAt(route, al string, day int) byte {
+	bits, ok := b.perAirline[route][al]
+	if !ok {
+		return 0
+	}
+	i := day - b.epochDay
+	if i < 0 || i >= len(bits) {
+		return 0
+	}
+	return bits[i]
 }
 
 // bitsAt returns a route's merged presence bits for an absolute day (0 when
@@ -150,7 +168,8 @@ func parseBundle(raw []byte) (*bundleState, error) {
 		Epoch    string `json:"epoch"`
 		T        int64  `json:"t"`
 		Airlines map[string]struct {
-			Width int `json:"width"`
+			Name  string `json:"name"`
+			Width int    `json:"width"`
 		} `json:"airlines"`
 		Places map[string]struct {
 			G []float64 `json:"g"`
@@ -255,8 +274,15 @@ func parseBundle(raw []byte) (*bundleState, error) {
 			coords[code] = [2]float64{p.G[0], p.G[1]}
 		}
 	}
+	alNames := map[string]string{}
+	for id, a := range b.Airlines {
+		if a.Name != "" {
+			alNames[id] = a.Name
+		}
+	}
 	return &bundleState{t: b.T, epochDay: epochDay, endDay: epochDay + maxLen,
-		merged: merged, perAirline: perAirline, seats: seats, coords: coords}, nil
+		merged: merged, perAirline: perAirline, seats: seats, coords: coords,
+		alNames: alNames}, nil
 }
 
 // cabinOrder is the canonical M W C F ordering, used everywhere cabins are

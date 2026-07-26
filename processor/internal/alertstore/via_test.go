@@ -128,3 +128,37 @@ func TestViaLegRoutesAndStatus(t *testing.T) {
 		t.Error("a via watch must be invisible to the legacy topic API")
 	}
 }
+
+func TestAirlineScope(t *testing.T) {
+	base := Watch{Route: "LON-DUB", Kind: KindRT, Cabins: []string{"C"}}
+	plain, err := Normalize(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	scoped := base
+	scoped.Airline = "EI"
+	ei, err := Normalize(scoped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if ei.ID == plain.ID {
+		t.Error("scoped watch must have a distinct id")
+	}
+	// Unscoped id is byte-identical to the pre-feature formula.
+	if plain.ID != watchID(Watch{Route: "LON-DUB", Kind: KindRT, Cabins: []string{"C"}}) {
+		t.Error("unscoped id drifted")
+	}
+	if ei.TopicRepresentable() {
+		t.Error("scoped watch must be invisible to the legacy topic API")
+	}
+	bad := base
+	bad.Airline = "aer lingus"
+	if _, err := Normalize(bad); err == nil {
+		t.Error("malformed airline accepted")
+	}
+	party := scoped
+	party.MinSeats = 2
+	if _, err := Normalize(party); err == nil {
+		t.Error("airline-scoped party watch accepted (seat codes are merged)")
+	}
+}

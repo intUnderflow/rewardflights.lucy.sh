@@ -29,6 +29,7 @@ type group struct {
 	kind  string
 	via   string
 	conn  int
+	al    string // airline scope code ("" = merged news)
 	items []item
 }
 
@@ -37,7 +38,7 @@ type group struct {
 // The tag is unique per send, so notifications STACK rather than replace. With
 // one push per device per hour, collapsing them would silently destroy dates
 // the user had not acted on yet.
-func render(items []item, overflow int, subKey string, now int64, today int) Publication {
+func render(items []item, overflow int, subKey string, now int64, today int, alNames map[string]string) Publication {
 	items = dedupe(items)
 	sortItems(items)
 	groups := groupItems(items)
@@ -45,7 +46,7 @@ func render(items []item, overflow int, subKey string, now int64, today int) Pub
 	pub := Publication{Tag: fmt.Sprintf("rf_%s_%d", subKey[:min(8, len(subKey))], now)}
 	if len(groups) == 1 {
 		g := groups[0]
-		pub.Title = groupTitle(g)
+		pub.Title = groupTitle(g, alNames)
 		pub.Body = groupBody(g, overflow, today)
 		pub.URL = groupURL(g)
 		return pub
@@ -56,7 +57,7 @@ func render(items []item, overflow int, subKey string, now int64, today int) Pub
 	pub.URL = siteURL + "/alerts"
 	parts := make([]string, 0, maxDigestWatches)
 	for _, g := range groups[:min(len(groups), maxDigestWatches)] {
-		parts = append(parts, fmt.Sprintf("%s: %s", routeLabel(g), digestCount(g)))
+		parts = append(parts, fmt.Sprintf("%s: %s", routeLabel(g, alNames), digestCount(g)))
 	}
 	body := strings.Join(parts, " · ")
 	if extra := len(groups) - maxDigestWatches; extra > 0 {
@@ -120,11 +121,11 @@ func cabinRank(cabin string) int {
 func groupItems(items []item) []group {
 	var groups []group
 	for _, it := range items {
-		if n := len(groups); n > 0 && groups[n-1].route == it.Route && groups[n-1].kind == it.Kind && groups[n-1].via == it.Via {
+		if n := len(groups); n > 0 && groups[n-1].route == it.Route && groups[n-1].kind == it.Kind && groups[n-1].via == it.Via && groups[n-1].al == it.Al {
 			groups[n-1].items = append(groups[n-1].items, it)
 			continue
 		}
-		groups = append(groups, group{route: it.Route, kind: it.Kind, via: it.Via, conn: it.Conn, items: []item{it}})
+		groups = append(groups, group{route: it.Route, kind: it.Kind, via: it.Via, conn: it.Conn, al: it.Al, items: []item{it}})
 	}
 	return groups
 }
@@ -146,7 +147,7 @@ func cabinsIn(g group) []string {
 // routeLabel renders LON ⇄ TYO for round trips, LON → TYO for one-ways, with
 // the hub named on chain news ("BLL ⇄ TYO via LON") — a via alert that reads
 // like a direct route would promise a flight that doesn't exist.
-func routeLabel(g group) string {
+func routeLabel(g group, alNames map[string]string) string {
 	orig, dest := g.route[:3], g.route[4:]
 	label := orig + " → " + dest
 	if g.kind == alertstore.KindRT {
@@ -155,10 +156,17 @@ func routeLabel(g group) string {
 	if g.via != "" {
 		label += " via " + g.via
 	}
+	if g.al != "" {
+		name := alNames[g.al]
+		if name == "" {
+			name = g.al
+		}
+		label += " on " + name
+	}
 	return label
 }
 
-func groupTitle(g group) string {
+func groupTitle(g group, alNames map[string]string) string {
 	cabins := cabinsIn(g)
 	subject := "Award"
 	if len(cabins) == 1 {
@@ -171,14 +179,14 @@ func groupTitle(g group) string {
 	// everyone).
 	if n := groupMinSeats(g); n >= 2 {
 		if g.kind == alertstore.KindRT {
-			return fmt.Sprintf("%s (%d+ seats) round trips open: %s", subject, n, routeLabel(g))
+			return fmt.Sprintf("%s (%d+ seats) round trips open: %s", subject, n, routeLabel(g, alNames))
 		}
-		return fmt.Sprintf("%s (%d+ seats) open: %s", subject, n, routeLabel(g))
+		return fmt.Sprintf("%s (%d+ seats) open: %s", subject, n, routeLabel(g, alNames))
 	}
 	if g.kind == alertstore.KindRT {
-		return fmt.Sprintf("%s round trips open: %s", subject, routeLabel(g))
+		return fmt.Sprintf("%s round trips open: %s", subject, routeLabel(g, alNames))
 	}
-	return fmt.Sprintf("%s seats open: %s", subject, routeLabel(g))
+	return fmt.Sprintf("%s seats open: %s", subject, routeLabel(g, alNames))
 }
 
 // groupMinSeats is the smallest MinSeats across a group's items: >= 2 only

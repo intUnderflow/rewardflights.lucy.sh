@@ -297,6 +297,7 @@ function wireWatch(w) {
   if (w.leadDays > 0) out.leadDays = w.leadDays;
   if ((w.minSeats || 0) >= 2) out.minSeats = w.minSeats;
   if (w.via) { out.via = w.via; out.conn = w.conn || 1; }
+  if (w.airline) out.airline = w.airline;
   return out;
 }
 
@@ -453,8 +454,10 @@ function matchesNow(w, { list = false } = {}) {
   // bits, matching the server); watchProblem explains that dead state before
   // this function is ever consulted.
   const need = (w.minSeats || 0) >= 2 ? w.minSeats : 1;
-  const legBits = (key) =>
-    need > 1 ? (routeBitsAtLeast(key, need) || new Uint8Array(store.bundle.days)) : routeBits(key);
+  const legBits = (key) => {
+    if (w.airline) return routeBitsForAirline(key, w.airline); // scoped ⊕ party: server rejects the combo
+    return need > 1 ? (routeBitsAtLeast(key, need) || new Uint8Array(store.bundle.days)) : routeBits(key);
+  };
 
   // Via watches match CHAINS: the same overnight-stop windows and focus-leg
   // cabin coupling as the via calendar (and the alert server), so the "N
@@ -466,7 +469,7 @@ function matchesNow(w, { list = false } = {}) {
     const legKeys = [];
     for (let i = 0; i < path.length - 1; i++) legKeys.push(`${path[i]}-${path[i + 1]}`);
     if (legKeys.some((k) => !store.bundle.routes[k])) return empty;
-    const legsB = legKeys.map((k) => routeBits(k));
+    const legsB = legKeys.map((k) => (w.airline ? routeBitsForAirline(k, w.airline) : routeBits(k)));
     const focus = new Set(focusLegs(path));
     const holds = (i, day, cb) => {
       const bits = day >= 0 && day <= last ? legsB[i][day] : 0;
@@ -608,6 +611,11 @@ function watchProblem(w) {
   } else if (w.kind === "rt" && !store.bundle?.routes?.[reverseRoute(w.route)]) {
     return "There's no return route in the data, so a round trip can't be found.";
   }
+  // Seat codes are MAX-merged across airlines, so a per-airline threshold
+  // doesn't exist in the data — the server rejects the combination outright.
+  if (w.airline && (w.minSeats || 0) >= 2) {
+    return "Seat-together alerts can't be limited to one airline yet — watch all airlines, or set Travelling as to 1.";
+  }
   // A seat-count watch on a route with no seat data is silently dead forever
   // — the exact failure mode this function exists to prevent. (Matches the
   // server: unknown counts never fire a minSeats >= 2 watch.) The bell keeps
@@ -665,7 +673,27 @@ function watchSummary(w) {
   // seats") as the bell control and the push copy, so the three surfaces
   // agree.
   if ((w.minSeats || 0) >= 2) bits.push(`${w.minSeats}+ seats`);
+  if (w.airline) bits.push(`${store.bundle?.airlines?.[w.airline]?.name || w.airline} only`);
   return bits.join(" · ");
+}
+
+/* Airlines whose data could ever satisfy a watch on this journey: the union
+   over its legs (a scoped chain rides ONE airline, but offering the union is
+   honest — the count line says what matches now). Width-1 legends only,
+   matching every decoder on this page. */
+function watchAirlineChoices(routeKey, kind, via) {
+  const ids = new Set();
+  const [o, d] = routeKey.split("-");
+  const path = via ? (kind === "ow" ? [o, via, d] : [o, via, d, via, o])
+    : (kind === "ow" ? [o, d] : [o, d, o]);
+  for (let i = 0; i < path.length - 1; i++) {
+    const r = store.bundle?.routes?.[`${path[i]}-${path[i + 1]}`];
+    if (!r) continue;
+    for (const id of Object.keys(r.a)) {
+      if ((store.bundle.airlines?.[id]?.width ?? 1) === 1) ids.add(id);
+    }
+  }
+  return [...ids].sort();
 }
 
 /* The current subscription and its watches, or null if this device isn't
@@ -848,6 +876,27 @@ function routeBits(routeKey) {
     }
   }
   return merged;
+}
+
+/* One airline's own bits for a route — the currency of airline-scoped
+   watches. Same Uint8Array shape as routeBits; null when the route is absent
+   (an airline absent from a present route is all-zero, matching the server:
+   the scope means "on this airline", not "if this airline exists"). */
+function routeBitsForAirline(routeKey, al) {
+  const route = store.bundle.routes[routeKey];
+  if (!route) return null;
+  const days = store.bundle.days;
+  const bits = new Uint8Array(days);
+  const str = route.a[al];
+  if (typeof str !== "string") return bits;
+  const width = store.bundle.airlines?.[al]?.width ?? 1;
+  if (width !== 1) return bits;
+  const n = Math.min(str.length, days);
+  for (let i = 0; i < n; i++) {
+    const v = parseInt(str[i], 16);
+    if (v) bits[i] = v;
+  }
+  return bits;
 }
 
 /* Same Uint8Array shape as routeBits, but a bit is set only when there's
@@ -2535,6 +2584,15 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       : store.seatRoutes.has(routeKey);
     const partyRowShown = routeHasSeats || (mine?.minSeats || 0) >= 2;
     let party = mine ? (mine.minSeats || 1) : (routeHasSeats ? activePax() : 1);
+    // Airline scope. The row renders only when there's a real choice (>1
+    // airline on the journey) — or when an existing watch already carries a
+    // scope, so it can always be widened back to "any" (same edit-safety rule
+    // as the party row). A watch scoped to an airline the data no longer
+    // shows still lists it: it's a valid "tell me when they open this route".
+    const alChoices = watchAirlineChoices(routeKey, kind, ctx.via);
+    let airline = mine?.airline || "";
+    if (airline && !alChoices.includes(airline)) alChoices.push(airline);
+    const airlineRowShown = alChoices.length > 1 || !!airline;
 
     pop.innerHTML = "";
     const closeBtn = el(`<button type="button" class="bell-x" aria-label="Close">×</button>`);
@@ -2582,6 +2640,24 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         recount();
       }));
       pop.append(partySec);
+    }
+
+    /* --- airline scope --- */
+    if (airlineRowShown) {
+      const alName = (id) => store.bundle?.airlines?.[id]?.name || id;
+      const alSec = el(`<div class="bell-sec bell-airline"><h3>Airline</h3>
+        <div class="bell-flex" role="group" aria-label="Airline to watch">
+          <button type="button" class="np" data-al="" aria-pressed="${airline === ""}">Any airline</button>
+          ${alChoices.map((id) => `<button type="button" class="np" data-al="${esc(id)}"
+            aria-pressed="${id === airline}">${esc(alName(id))}</button>`).join("")}
+        </div>
+      </div>`);
+      alSec.querySelectorAll(".np").forEach((b) => b.addEventListener("click", () => {
+        airline = b.dataset.al;
+        alSec.querySelectorAll(".np").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+        recount();
+      }));
+      pop.append(alSec);
     }
 
     /* --- when can you travel? --- */
@@ -2786,6 +2862,8 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       // Wire canonical form: minSeats present only when >= 2 (0/absent is the
       // one spelling of "one passenger", which keeps content ids stable).
       if (party >= 2) w.minSeats = party;
+      // Same rule for the airline scope: absent is the one spelling of "any".
+      if (airline) w.airline = airline;
 
       if (mode === "any") {
         if (lead > 0) w.leadDays = lead;   // else fully unbounded ("any time")
@@ -2834,10 +2912,12 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
       // server), so say what it counts.
       const forParty = (w.minSeats || 0) >= 2
         ? ` for ${w.minSeats === 4 ? "4 or more" : w.minSeats} passengers` : "";
+      const onAirline = w.airline
+        ? ` on ${store.bundle?.airlines?.[w.airline]?.name || w.airline}` : "";
       countLine.className = pairs ? "bell-count ok" : "bell-count none";
       countLine.textContent = pairs
-        ? `${pairs} ${what}${pairs > 1 ? "s" : ""} match right now${forParty}`
-        : `Nothing matches right now${forParty} — we'll tell you the moment something opens.`;
+        ? `${pairs} ${what}${pairs > 1 ? "s" : ""} match right now${forParty}${onAirline}`
+        : `Nothing matches right now${forParty}${onAirline} — we'll tell you the moment something opens.`;
     }
 
     async function commit(w, btnEl) {
@@ -2863,7 +2943,8 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
         // content id: re-baseline rf:seen for it (and drop the orphaned old
         // entry) so the next "new since you last looked" diff runs against
         // the edited threshold instead of reporting phantom news.
-        if (w && mine && (mine.minSeats || 0) !== (w.minSeats || 0)) {
+        if (w && mine && ((mine.minSeats || 0) !== (w.minSeats || 0) ||
+            (mine.airline || "") !== (w.airline || ""))) {
           const savedW = saved.find((x) => x.route === routeKey && x.kind === kind);
           if (savedW?.id) {
             const seen = loadSeen();

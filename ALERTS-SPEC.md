@@ -704,3 +704,39 @@ for the cycle its airline set grows (codes are MAX-merged and inseparable).
 The changes feed and the stats accumulator apply the same rule at the
 (route, airline)-pair level. Deployed BEFORE the first Aer Lingus data so
 onboarding day is a non-event; EC-13 remains as the backstop.
+
+## Airline-scoped watches — shipped 2026-07-26
+
+A watch may carry `airline` (IATA id, e.g. `"EI"`). Absent = any airline —
+the only semantics that existed before a second airline did, so every stored
+watch keeps its meaning and its byte-identical id (`|A<code>` folds into the
+content id only when set, the via/minSeats pattern). No migration: EI space
+is Avios-bookable, so merged alerts stay useful; scoping serves the
+airline-specific cases (BA Companion Voucher, 241 redemptions, status runs).
+
+Semantics: every leg of the journey (both directions of a round trip, all
+legs of a via chain) must hold the cabin **on that airline's own bits**.
+The crux the merged planes cannot see: an airline gaining a cabin on a day
+another airline already held is invisible to the merged diff but IS news to
+a scoped watch — so `diffBundles` keeps per-airline gain/loss planes
+(`gain.byAl`), which also skip airlines new to the route (onboarding stays
+baseline for scoped watches too). The flap ledger gets a per-airline key
+plane (`route|cabin|A<al>|date`): a scoped blink is judged on the airline's
+own history, since BA holding the day would otherwise mask every EI
+transition. `item.Al` joins dedupeKey (scoped and merged news of the same
+pair are different promises) and the copy says the scope out loud: "…on
+Aer Lingus" (legend name, falling back to the id), "Aer Lingus only" in
+watch summaries.
+
+Refused combination: `airline` + `minSeats >= 2` — seat codes are
+MAX-merged across airlines in the bundle, so a per-airline threshold does
+not exist in the data. Normalize rejects it; the bell explains it and
+disables save. Scoped watches are not topic-representable (legacy API).
+
+UI: an "Airline" row in the bell (Any / one button per airline on the
+journey's legs, by legend name), shown only when the journey really has
+more than one airline — or when the watch already carries a scope, so it
+can always be widened back (the party-row edit-safety rule). A watch scoped
+to an airline with no current space is valid ("tell me when they open
+this route"); the live count reads the airline's own bits via
+`routeBitsForAirline` so the bell never promises what a push wouldn't send.

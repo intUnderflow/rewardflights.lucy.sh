@@ -34,9 +34,10 @@ const (
 )
 
 var (
-	routeRe = regexp.MustCompile(`^[A-Z]{3}-[A-Z]{3}$`)
-	placeRe = regexp.MustCompile(`^[A-Z]{3}$`)
-	dateRe  = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
+	routeRe   = regexp.MustCompile(`^[A-Z]{3}-[A-Z]{3}$`)
+	placeRe   = regexp.MustCompile(`^[A-Z]{3}$`)
+	airlineRe = regexp.MustCompile(`^[A-Z0-9]{2,3}$`)
+	dateRe    = regexp.MustCompile(`^\d{4}-\d{2}-\d{2}$`)
 )
 
 // Via-watch stop-length bounds, in nights at the hub (site parseConn parity).
@@ -84,6 +85,12 @@ type Watch struct {
 	// meaningful (and stored) only with Via.
 	Via  string `json:"via,omitempty"`
 	Conn int    `json:"conn,omitempty"`
+	// Airline scopes the watch to ONE airline's availability (IATA id, e.g.
+	// "BA", "EI"). Absent = any airline — the only semantics that existed
+	// before a second airline did, so every stored watch keeps its meaning
+	// and its id. Scoped detection requires the cabin on THAT airline's own
+	// bits, partner legs included.
+	Airline string `json:"airline,omitempty"`
 	// LeadDays: "I can travel any time, but not sooner than N days from now" —
 	// a ROLLING floor on the outbound date. Stored as a relative offset, never
 	// an absolute date, so it re-anchors to "today" on every detection cycle
@@ -193,6 +200,17 @@ func Normalize(w Watch) (Watch, error) {
 		return Watch{}, errors.New("conn is only meaningful with a via hub")
 	}
 
+	if w.Airline != "" {
+		if !airlineRe.MatchString(w.Airline) {
+			return Watch{}, fmt.Errorf("airline %q must be an uppercase IATA id like BA", w.Airline)
+		}
+		if w.MinSeats >= 2 {
+			// Seat codes are MAX-merged across airlines in the bundle, so an
+			// airline-scoped party threshold cannot be answered honestly yet.
+			return Watch{}, errors.New("seat-count alerts can't be airline-scoped yet")
+		}
+	}
+
 	for name, r := range map[string]*Range{"out": w.Out, "ret": w.Ret} {
 		if r == nil {
 			continue
@@ -285,6 +303,10 @@ func watchID(w Watch) string {
 	if w.Via != "" {
 		fmt.Fprintf(&b, "|V%sC%d", w.Via, w.Conn)
 	}
+	// ...and for airline scope: unscoped watches keep their pre-feature ids.
+	if w.Airline != "" {
+		fmt.Fprintf(&b, "|A%s", w.Airline)
+	}
 	sum := sha256.Sum256([]byte(b.String()))
 	return hex.EncodeToString(sum[:])[:8]
 }
@@ -347,6 +369,9 @@ func (w Watch) TopicRepresentable() bool {
 	if w.Via != "" {
 		// A stale client cannot express (or safely replace) a chain watch.
 		return false
+	}
+	if w.Airline != "" {
+		return false // same protection for airline-scoped watches
 	}
 	if w.MinSeats >= 2 {
 		// A stale client cannot express a party constraint, so it must not be

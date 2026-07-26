@@ -143,6 +143,11 @@ type item struct {
 	// unchanged.
 	Via  string `json:"v,omitempty"`
 	Conn int    `json:"cn,omitempty"`
+	// Al marks airline-scoped news (the watch's airline). It flavours the copy
+	// ("EI only") and joins dedupeKey: a scoped gain can be invisible on the
+	// merged planes, so scoped and merged news of the same pair are different
+	// promises. Absent on unscoped news, so old pending batches load unchanged.
+	Al string `json:"a,omitempty"`
 }
 
 // dedupeKey identifies the NEWS, independent of which watch found it: two
@@ -152,6 +157,9 @@ func (i item) dedupeKey() string {
 	k := i.Route + "|" + i.Kind + "|" + i.Cabin + "|" + i.Out + "|" + i.Ret
 	if i.Via != "" {
 		k += "|via" + i.Via
+	}
+	if i.Al != "" {
+		k += "|al" + i.Al
 	}
 	return k
 }
@@ -361,6 +369,11 @@ func (w *Watcher) refreshIndex() {
 type gain struct {
 	day  int
 	bits byte
+	// byAl holds per-airline transition bits — an airline gaining a cabin
+	// another airline already held is invisible to the merged bits above,
+	// but is exactly the news an airline-scoped watch exists for. Airlines
+	// new to the route are excluded (the onboarding rule).
+	byAl map[string]byte
 	// tbits[k] holds the cabins whose "a party of k+2 fits" predicate became
 	// newly satisfied this cycle (satisfied = presence bit set AND seat
 	// threshold code >= k+1, per bundleState.satisfiedBits). Newly satisfied
@@ -449,6 +462,31 @@ func diffBundles(prev, b *bundleState, today int) (gains, losses map[string][]ga
 			if d < lossHi {
 				lost.bits = o &^ n
 			}
+			for id, aNew := range b.perAirline[route] {
+				aOld, had := prev.perAirline[route][id]
+				if !had {
+					continue // onboarding: baseline, not news
+				}
+				var ao, an byte
+				if i := d - prev.epochDay; i >= 0 && i < len(aOld) {
+					ao = aOld[i]
+				}
+				if i := d - b.epochDay; i >= 0 && i < len(aNew) {
+					an = aNew[i]
+				}
+				if ga := an &^ ao; ga != 0 {
+					if g.byAl == nil {
+						g.byAl = map[string]byte{}
+					}
+					g.byAl[id] = ga
+				}
+				if la := ao &^ an; la != 0 && d < lossHi {
+					if lost.byAl == nil {
+						lost.byAl = map[string]byte{}
+					}
+					lost.byAl[id] = la
+				}
+			}
 			if diffSeats {
 				for k := 0; k < 3; k++ {
 					oldSat := prev.satisfiedBits(route, d, k+2)
@@ -459,11 +497,11 @@ func diffBundles(prev, b *bundleState, today int) (gains, losses map[string][]ga
 					}
 				}
 			}
-			if g.bits != 0 || g.hasT() {
+			if g.bits != 0 || g.hasT() || len(g.byAl) > 0 {
 				gains[route] = append(gains[route], g)
 				gainDays++
 			}
-			if lost.bits != 0 || lost.hasT() {
+			if lost.bits != 0 || lost.hasT() || len(lost.byAl) > 0 {
 				losses[route] = append(losses[route], lost)
 			}
 		}
@@ -498,8 +536,15 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 	// a presence-bit gain alone is not news to a party of three, and a leg
 	// whose seat counts are unknown NEVER fires (a push is a promise). The
 	// MinSeats <= 1 path below reads exactly the pre-seats bytes.
+	// An airline-scoped watch reads its airline's OWN transition plane —
+	// which sees gains the merged bits cannot (an airline adding a cabin
+	// another already held). Scoped + party is rejected at Normalize.
 	minSeats := watch.MinSeats
+	al := watch.Airline
 	gainedBits := func(g gain) byte {
+		if al != "" {
+			return g.byAl[al] & mask
+		}
 		if minSeats >= 2 {
 			return g.tbits[minSeats-2] & mask
 		}
@@ -516,10 +561,10 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 				continue
 			}
 			for _, cabin := range cabinsOf(gainedBits(g)) {
-				if !w.isFlap(watch.Route, g.day, "", 0, cabin, minSeats, now) {
+				if !w.isFlap(watch.Route, g.day, "", 0, cabin, minSeats, al, now) {
 					items = append(items, item{
 						Watch: watch.ID, Route: watch.Route, Kind: watch.Kind,
-						Cabin: cabin, Out: dayDate(g.day), MinSeats: minSeats,
+						Cabin: cabin, Out: dayDate(g.day), MinSeats: minSeats, Al: al,
 					})
 				}
 			}
@@ -543,12 +588,18 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 	// seat threshold in the same cabin (unknown counts satisfy nothing); the
 	// single-passenger path reads the raw presence byte, exactly as before.
 	partnerRet := func(r int) byte {
+		if al != "" {
+			return b.alBitsAt(rev, al, r) // both legs on the scoped airline
+		}
 		if minSeats >= 2 {
 			return b.satisfiedBits(rev, r, minSeats)
 		}
 		return ret[r-b.epochDay]
 	}
 	partnerOut := func(d int) byte {
+		if al != "" {
+			return b.alBitsAt(watch.Route, al, d)
+		}
 		if minSeats >= 2 {
 			return b.satisfiedBits(watch.Route, d, minSeats)
 		}
@@ -556,12 +607,12 @@ func (w *Watcher) evaluate(ref watchRef, dirty string, gains map[string][]gain, 
 	}
 
 	add := func(d, r int, cabin string) {
-		if w.isFlap(watch.Route, d, rev, r, cabin, minSeats, now) {
+		if w.isFlap(watch.Route, d, rev, r, cabin, minSeats, al, now) {
 			return
 		}
 		it := item{
 			Watch: watch.ID, Route: watch.Route, Kind: watch.Kind, Cabin: cabin,
-			Out: dayDate(d), Ret: dayDate(r), NMin: nmin, NMax: nmax, MinSeats: minSeats,
+			Out: dayDate(d), Ret: dayDate(r), NMin: nmin, NMax: nmax, MinSeats: minSeats, Al: al,
 		}
 		// A pair whose BOTH legs gained is found by loop (a) and loop (b).
 		if k := it.dedupeKey(); !seen[k] {
@@ -645,6 +696,7 @@ func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]g
 		}
 	}
 	mask := watch.Mask()
+	al := watch.Airline
 	conn := watch.Conn
 	nmin, nmax := watch.NightsWindow()
 	isRT := watch.Kind == alertstore.KindRT
@@ -666,7 +718,12 @@ func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]g
 	}
 
 	legHolds := func(i, day int, cb byte) bool {
-		bits := b.bitsAt(legs[i], day)
+		var bits byte
+		if al != "" {
+			bits = b.alBitsAt(legs[i], al, day) // the whole chain on one airline
+		} else {
+			bits = b.bitsAt(legs[i], day)
+		}
 		if isFocus[i] {
 			return bits&cb != 0
 		}
@@ -679,7 +736,7 @@ func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]g
 			fr = append(fr, legs[fi])
 			fd = append(fd, days[fi])
 		}
-		return w.isFlapChain(fr, fd, cabin, now)
+		return w.isFlapChain(fr, fd, cabin, al, now)
 	}
 
 	seen := map[string]bool{}
@@ -687,7 +744,7 @@ func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]g
 	addItem := func(d0, r int, cabin string) {
 		it := item{
 			Watch: watch.ID, Route: watch.Route, Kind: watch.Kind, Cabin: cabin,
-			Out: dayDate(d0), Via: watch.Via, Conn: conn,
+			Out: dayDate(d0), Via: watch.Via, Conn: conn, Al: al,
 		}
 		if isRT {
 			it.Ret = dayDate(r)
@@ -704,10 +761,16 @@ func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]g
 			if !w.frontierOK(g.day, watch) {
 				continue
 			}
+			gBits := g.bits
+			hopNew := w.prev.bitsAt(leg, g.day) == 0 && b.bitsAt(leg, g.day) != 0
+			if al != "" {
+				gBits = g.byAl[al]
+				hopNew = w.prev.alBitsAt(leg, al, g.day) == 0 && b.alBitsAt(leg, al, g.day) != 0
+			}
 			var cabins []string
 			if isFocus[p] {
-				cabins = cabinsOf(g.bits & mask)
-			} else if w.prev.bitsAt(leg, g.day) == 0 && b.bitsAt(leg, g.day) != 0 {
+				cabins = cabinsOf(gBits & mask)
+			} else if hopNew {
 				// The hop's any-space predicate became newly true; which focus
 				// cabins that completes is decided by feasibility below.
 				cabins = cabinsOf(mask)
@@ -776,10 +839,14 @@ func (w *Watcher) evaluateChain(ref watchRef, dirty string, gains map[string][]g
 // Hop legs are deliberately excluded: their predicate is any-cabin, which the
 // per-cabin ledger cannot express, and hop churn is not the churn the
 // cooldown exists to absorb.
-func (w *Watcher) isFlapChain(routes []string, days []int, cabin string, now int64) bool {
+func (w *Watcher) isFlapChain(routes []string, days []int, cabin, al string, now int64) bool {
 	keys := make([]string, len(routes))
 	for i := range routes {
-		keys[i] = ledgerKey(routes[i], days[i], cabin, 0)
+		if al != "" {
+			keys[i] = alLedgerKey(routes[i], days[i], cabin, al)
+		} else {
+			keys[i] = ledgerKey(routes[i], days[i], cabin, 0)
+		}
 	}
 	var end int64
 	found := false
@@ -854,6 +921,14 @@ func ledgerKey(route string, day int, cabin string, minSeats int) string {
 	return route + "|" + cabin + "|" + dayDate(day)
 }
 
+// alLedgerKey is the airline-scoped run plane: an airline's own copy of a day
+// can blink while the merged bit holds steady, so scoped flap suppression
+// needs its own keys. Ends in the date, like every ledger key (prune parses
+// that).
+func alLedgerKey(route string, day int, cabin, al string) string {
+	return route + "|" + cabin + "|A" + al + "|" + dayDate(day)
+}
+
 // eachLedgerCabin visits every (cabin, minSeats) plane recorded in a
 // transition: the presence bits as minSeats 0, and each threshold plane k as
 // minSeats k+2.
@@ -877,6 +952,14 @@ func (w *Watcher) applyLosses(losses map[string][]gain, now int64) {
 				delete(w.state.OpenedAt, k)
 				w.dirty = true
 			})
+			for id, bits := range l.byAl {
+				for _, cabin := range cabinsOf(bits) {
+					k := alLedgerKey(route, l.day, cabin, id)
+					w.state.ClosedAt[k] = now
+					delete(w.state.OpenedAt, k)
+					w.dirty = true
+				}
+			}
 		}
 	}
 }
@@ -888,6 +971,12 @@ func (w *Watcher) applyGains(gains map[string][]gain, now int64) {
 				w.state.OpenedAt[ledgerKey(route, g.day, cabin, minSeats)] = now
 				w.dirty = true
 			})
+			for id, bits := range g.byAl {
+				for _, cabin := range cabinsOf(bits) {
+					w.state.OpenedAt[alLedgerKey(route, g.day, cabin, id)] = now
+					w.dirty = true
+				}
+			}
 		}
 	}
 }
@@ -899,11 +988,17 @@ func (w *Watcher) applyGains(gains map[string][]gain, now int64) {
 // gets catastrophically wrong — is the partner check. If a leg closed at t1
 // but its partner only OPENED after t1, then no joint run ended at t1: the
 // pair has never been announced, and suppressing it would silence it forever.
-func (w *Watcher) isFlap(outRoute string, d int, retRoute string, r int, cabin string, minSeats int, now int64) bool {
-	l1 := ledgerKey(outRoute, d, cabin, minSeats)
+func (w *Watcher) isFlap(outRoute string, d int, retRoute string, r int, cabin string, minSeats int, al string, now int64) bool {
+	key := func(route string, day int) string {
+		if al != "" {
+			return alLedgerKey(route, day, cabin, al)
+		}
+		return ledgerKey(route, day, cabin, minSeats)
+	}
+	l1 := key(outRoute, d)
 	l2 := ""
 	if retRoute != "" {
-		l2 = ledgerKey(retRoute, r, cabin, minSeats)
+		l2 = key(retRoute, r)
 	}
 
 	var end int64
@@ -1050,7 +1145,11 @@ func (w *Watcher) flush(now int64, today int) {
 			continue
 		}
 
-		pub := render(items, pending.Overflow, subKey, now, today)
+		var alNames map[string]string
+		if w.prev != nil {
+			alNames = w.prev.alNames
+		}
+		pub := render(items, pending.Overflow, subKey, now, today, alNames)
 		if err := w.cfg.Publish(sub, pub); err != nil {
 			w.cfg.Logf("WARN alert-publish-failed %s: %v", sub.Endpoint, err)
 			continue // keep pending; the ledger still advanced (today's contract)
