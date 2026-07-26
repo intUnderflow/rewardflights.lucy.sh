@@ -127,6 +127,49 @@ function baBookingURL(origin, dest, outIso, bit, returnIso, pax = 1) {
    selling airline; AerClub's search isn't reliably deep-linkable, so it's
    the airline's front door. */
 const EI_BOOK_URL = "https://www.aerlingus.com/";
+
+/* Airlines whose OWN bits hold `bit` (any cabin when 0) on this day — and on
+   the return day too when retKey/retIdx are given. The booking layer's unit
+   of truth: one CTA per selling airline, so the user picks where to book
+   when more than one offers the space. */
+function airlinesHoldingDay(key, idx, bit, retKey = null, retIdx = 0) {
+  const route = store.bundle?.routes?.[key];
+  if (!route) return [];
+  const holds = (k, i, al) => {
+    const bits = routeBitsForAirline(k, al);
+    const v = bits && i >= 0 && i < bits.length ? bits[i] : 0;
+    return bit ? (v & bit) : v;
+  };
+  return Object.keys(route.a)
+    .filter((al) => (store.bundle.airlines?.[al]?.width ?? 1) === 1)
+    .filter((al) => holds(key, idx, al) && (!retKey || holds(retKey, retIdx, al)))
+    .sort();
+}
+function airlineName(al) { return store.bundle?.airlines?.[al]?.name || al; }
+
+/* One airline's booking link. BA deep-links its redemption search; any other
+   airline gets its front door (today: Aer Lingus). */
+function airlineBookURL(al, o, d, outIso, bit, retIso, pax) {
+  return al === "BA" ? baBookingURL(o, d, outIso, bit, retIso, pax) : EI_BOOK_URL;
+}
+
+/* Booking links for one any-cabin leg-day (via-trip hops and one-way lists):
+   one compact link per selling airline. */
+function legBookLinks(from, to, dayIdx, pax) {
+  const iso = isoOf(dayDate(dayIdx));
+  const holders = airlinesHoldingDay(`${from}-${to}`, dayIdx, 0);
+  if (holders.length > 1) {
+    return holders.map((al) =>
+      `<a class="pp-leg-go" target="_blank" rel="noopener noreferrer" title="Book on ${esc(airlineName(al))}"
+         href="${airlineBookURL(al, from, to, iso, 0, null, pax)}">${esc(al)} ↗</a>`).join(" ");
+  }
+  const href = holders.length
+    ? airlineBookURL(holders[0], from, to, iso, 0, null, pax)
+    : bookingURL(from, to, iso, 0, null, pax);
+  return `<a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
+     href="${href}">${href === EI_BOOK_URL ? "Book Aer Lingus" : "Book"} ↗</a>`;
+}
+
 function bookingURL(origin, dest, outIso, bit, returnIso, pax = 1) {
   const holds = (key, iso) => {
     const bits = store.bundle ? routeBitsForAirline(key, "BA") : null;
@@ -931,14 +974,15 @@ function routeBitsForAirline(routeKey, al) {
    single-passenger semantics). Returns null when the route (or its seats
    layer) is absent, so callers can render an honest presence fallback
    instead of silently filtering to zero. */
-function routeBitsAtLeast(routeKey, n) {
-  if (!n || n <= 1) return routeBits(routeKey);
+function routeBitsAtLeast(routeKey, n, al = null) {
+  if (!n || n <= 1) return al ? routeBitsForAirline(routeKey, al) : routeBits(routeKey);
   const route = store.bundle.routes[routeKey];
   if (!route || !store.seatRoutes.has(routeKey)) return null;
   const days = store.bundle.days;
   const need = n - 1; // party of n fits iff code >= n-1
   const merged = new Uint8Array(days);
   for (const [airlineId, str] of Object.entries(route.s)) {
+    if (al && airlineId !== al) continue; // one airline's own evidence only
     // The seats layer rides the same day window as "a"; airlines whose "a"
     // we don't decode (width !== 1) contribute no presence, so their seat
     // codes must not light anything either.
@@ -958,7 +1002,7 @@ function routeBitsAtLeast(routeKey, n) {
   }
   // "a" is the sole presence authority: never light a day/cabin the presence
   // layer doesn't show, whatever a (malformed) seats string claims.
-  const pres = routeBits(routeKey);
+  const pres = al ? routeBitsForAirline(routeKey, al) : routeBits(routeKey);
   for (let i = 0; i < days; i++) merged[i] &= pres[i];
   return merged;
 }
@@ -966,11 +1010,12 @@ function routeBitsAtLeast(routeKey, n) {
 /* Per-cabin threshold codes for one day of a route (MAX across airlines):
    {bit: 0..3}, or null when the route carries no seats layer. Code 0 means
    "no sign of >=2 seats" (unknown OR known-1) — never "0 seats". */
-function seatCodes(routeKey, idx) {
+function seatCodes(routeKey, idx, al = null) {
   const route = store.bundle.routes[routeKey];
   if (!route || !store.seatRoutes.has(routeKey)) return null;
   const codes = { 1: 0, 2: 0, 4: 0, 8: 0 };
   for (const [airlineId, str] of Object.entries(route.s)) {
+    if (al && airlineId !== al) continue;
     const width = store.bundle.airlines?.[airlineId]?.width ?? 1;
     if (width !== 1) continue;
     if (2 * idx + 2 > str.length || idx < 0) continue;
@@ -1020,14 +1065,14 @@ function cabinLegend() {
    active must say so in their aria/title rather than pass the counts off as
    party counts. */
 function monthCounts(kind, key) {
-  const ck = `${kind}|${key}`;
+  const ck = `${kind}|${key}|${viewAirline() || "*"}`;
   if (store.monthCache.has(ck)) return store.monthCache.get(ck);
   const months = next12Months();
   const counts = new Array(12).fill(0);
   const routes = kind === "route" ? [key]
     : Object.keys(store.bundle.routes).filter((r) => r.startsWith(key + "-"));
   for (const rk of routes) {
-    const bits = routeBits(rk);
+    const bits = viewBits(rk);
     if (!bits) continue;
     for (let mi = 0; mi < 12; mi++) {
       const { start, end } = months[mi];
@@ -1075,8 +1120,8 @@ function monthISO(mo) {
    the seats layer falls back to presence (callers gate the honest note). */
 function routeTotals(routeKey, pax = 1) {
   const bits = pax > 1
-    ? (routeBitsAtLeast(routeKey, pax) ?? routeBits(routeKey))
-    : routeBits(routeKey);
+    ? (viewBitsAtLeast(routeKey, pax) ?? viewBits(routeKey))
+    : viewBits(routeKey);
   if (!bits) return { total: 0, perCabin: new Map(), union: 0 };
   const t0 = Math.max(0, todayIndex());
   let total = 0, union = 0;
@@ -1104,14 +1149,15 @@ function roundTripBits(outKey, retKey, mask, minNights, maxNights, pax = 1) {
   const t0 = Math.max(0, todayIndex());
   // pax MUST be in the key: rtCache only resets on adoptBundle, so omitting
   // it would serve party-of-1 arrays to party-of-4 views (and vice versa).
-  const ck = `${outKey}|${retKey}|${mask}|${minNights}|${maxNights}|${pax}|${t0}`;
+  // The airline lens joins the key: the cache outlives filter clicks.
+  const ck = `${outKey}|${retKey}|${mask}|${minNights}|${maxNights}|${pax}|${t0}|${viewAirline() || "*"}`;
   if (store.rtCache.has(ck)) return store.rtCache.get(ck);
   // pax > 1 thresholds BOTH legs; a leg without the seats layer falls back to
   // presence bits (callers show the honest per-route note — never an
   // silently-empty view).
   const legBits = (k) => pax > 1
-    ? (routeBitsAtLeast(k, pax) ?? routeBits(k))
-    : routeBits(k);
+    ? (viewBitsAtLeast(k, pax) ?? viewBits(k))
+    : viewBits(k);
   const out = legBits(outKey);
   const ret = store.bundle.routes[retKey] ? legBits(retKey) : null;
   const round = new Uint8Array(out ? out.length : store.bundle.days);
@@ -1208,9 +1254,9 @@ function chainBits(path, mask, gaps, pax = 1, focus = null) {
   if (focus !== null && !(Array.isArray(focus) && focus.length &&
       focus.every((f) => Number.isInteger(f) && f >= 0 && f < nLegs))) return empty();
   const t0 = Math.max(0, todayIndex());
-  const ck = `${path.join(".")}|${mask}|${gaps.map((g) => g.join("-")).join(".")}|${pax}|${focus ? focus.join(".") : "*"}|${t0}`;
+  const ck = `${path.join(".")}|${mask}|${gaps.map((g) => g.join("-")).join(".")}|${pax}|${focus ? focus.join(".") : "*"}|${t0}|${viewAirline() || "*"}`;
   if (store.chainCache.has(ck)) return store.chainCache.get(ck);
-  const legBits = (k) => (pax > 1 ? (routeBitsAtLeast(k, pax) ?? routeBits(k)) : routeBits(k));
+  const legBits = (k) => (pax > 1 ? (viewBitsAtLeast(k, pax) ?? viewBits(k)) : viewBits(k));
   const legs = [];
   for (let i = 0; i < nLegs; i++) {
     const key = `${path[i]}-${path[i + 1]}`;
@@ -2144,6 +2190,7 @@ function buildHomeModules(mount) {
     setFilter(next);
     refreshHomeModules(); // rebuilds this row + both lists under the new mask
   }));
+  { const alc = airlineControl(() => refreshHomeModules()); if (alc) chips.append(alc); }
   const modules = el(`<div class="modules"></div>`);
   const opened = recentlyOpened(mask);
   if (opened.length) {
@@ -2216,12 +2263,14 @@ function recentlyOpened(mask = 15) {
   // outright, changed away from them, or rolled into the past.
   const stillOpen = (e, openedBits) => {
     const idx = dayIndexOf(e.d);
-    const bits = store.bundle.routes[e.r] ? routeBits(e.r) : null;
+    const bits = store.bundle.routes[e.r] ? viewBits(e.r) : null;
     if (!bits || !Number.isInteger(idx) || idx < t0 || idx >= bits.length) return false;
     return !!(bits[idx] & openedBits & mask);
   };
+  const lens = viewAirline();
   const byRoute = new Map();
   for (const e of src) {
+    if (lens && e.al !== lens) continue; // news belongs to its airline
     // What the event GAINED is what counts as an opening: a k="opened" entry
     // gains its whole cabin set, a k="changed" entry gains its "g" letters.
     // This is how First news actually arrives — measured live, First almost
@@ -2257,7 +2306,7 @@ function topRoutes(n, mask = 15) {
   const t0 = Math.max(0, todayIndex());
   return Object.keys(store.bundle.routes)
     .map((key) => {
-      const bits = routeBits(key);
+      const bits = viewBits(key);
       let total = 0;
       for (let i = t0; i < bits.length; i++) if (bits[i] & mask) total++;
       return { key, total };
@@ -2360,6 +2409,64 @@ function mirrorPaxURL(n) {
   else u.searchParams.delete("pax");
   const q = u.searchParams.toString();
   history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+}
+
+/* ---------------- airline lens (shared, sticky per session) ----------------
+   A VIEW filter: calendars, maps, lists, home modules and day panels show one
+   airline's own availability. Alert watches never read it — a watch carries
+   its own explicit scope (the bell merely seeds from it). Inert (null) while
+   the bundle has fewer than two airlines, so the control never renders in a
+   single-airline world and a stale pref can't dim anything. */
+function parseAirlineId(s) {
+  return s && store.bundle?.airlines?.[s] ? s : null;
+}
+function getAirlinePref() {
+  try { return sessionStorage.getItem("rf:airline") || null; } catch { return null; }
+}
+function setAirlinePref(id) {
+  try { id ? sessionStorage.setItem("rf:airline", id) : sessionStorage.removeItem("rf:airline"); } catch {}
+}
+function viewAirline(params = new URLSearchParams(location.search)) {
+  if (Object.keys(store.bundle?.airlines || {}).length < 2) return null;
+  return parseAirlineId(params.get("airline")) ?? parseAirlineId(getAirlinePref());
+}
+function mirrorAirlineURL(id) {
+  const u = new URL(location.href);
+  if (id) u.searchParams.set("airline", id);
+  else u.searchParams.delete("airline");
+  const q = u.searchParams.toString();
+  history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+}
+
+/* Presence bits under the lens. */
+function viewBits(routeKey) {
+  const al = viewAirline();
+  return al ? routeBitsForAirline(routeKey, al) : routeBits(routeKey);
+}
+function viewBitsAtLeast(routeKey, n) {
+  return routeBitsAtLeast(routeKey, n, viewAirline());
+}
+
+/* The airline row itself: single-select (All + one per airline), same shape
+   as the party control. Rendered only in a multi-airline bundle. */
+function airlineControl(onChange) {
+  const ids = Object.keys(store.bundle.airlines).sort();
+  if (ids.length < 2) return null;
+  const cur = viewAirline() || "";
+  const name = (id) => store.bundle.airlines[id]?.name || id;
+  const wrap = el(`<div class="pax-ctl al-ctl" role="group" aria-label="Airline">
+    <span class="nc-label">Airline</span>
+    <button type="button" class="alp" data-al="" aria-pressed="${cur === ""}">All</button>
+    ${ids.map((id) => `<button type="button" class="alp" data-al="${esc(id)}"
+      aria-pressed="${id === cur}">${esc(name(id))}</button>`).join("")}
+  </div>`);
+  wrap.querySelectorAll(".alp").forEach((b) => b.addEventListener("click", () => {
+    wrap.querySelectorAll(".alp").forEach((x) => x.setAttribute("aria-pressed", String(x === b)));
+    setAirlinePref(b.dataset.al || null);
+    mirrorAirlineURL(b.dataset.al || null);
+    onChange(b.dataset.al || null);
+  }));
+  return wrap;
 }
 
 /* Compact party-size chip row (1 · 2 · 3 · 4+). Rendered ONLY when the
@@ -2610,7 +2717,11 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     // as the party row). A watch scoped to an airline the data no longer
     // shows still lists it: it's a valid "tell me when they open this route".
     const alChoices = watchAirlineChoices(routeKey, kind, ctx.via);
-    let airline = mine?.airline || "";
+    // A fresh watch inherits the page's airline lens (principle 1: inherit,
+    // don't ask) — but never into a dead combo: a party seed wins, and a lens
+    // airline that doesn't fly this journey seeds nothing.
+    let airline = mine ? (mine.airline || "")
+      : (party >= 2 ? "" : (alChoices.includes(viewAirline()) ? viewAirline() : ""));
     if (airline && !alChoices.includes(airline)) alChoices.push(airline);
     const airlineRowShown = alChoices.length > 1 || !!airline;
 
@@ -3096,7 +3207,7 @@ function renderRoute(o, d) {
   // without the layer keeps exact presence rendering (plus the honest note).
   const effPax = () => (pax > 1 && hasSeats ? pax : 1);
 
-  const bits = routeBits(key); // presence — stays authoritative for dim/empty
+  const bits = viewBits(key); // presence — stays authoritative for dim/empty
   const container = el(`<div></div>`);
   const toolbar = el(`<div class="route-toolbar"></div>`);
   const paxNote = el(`<p class="pax-note" hidden>${esc(SEAT_NOTE)}</p>`);
@@ -3128,6 +3239,7 @@ function renderRoute(o, d) {
       rebuildChips(); // chips' onChange redraws the calendars
     }));
   }
+  { const alc = airlineControl(() => rebuildChips()); if (alc) toolbar.append(alc); }
   toolbar.append(alertBell(key, "ow", mask));
 
   function drawCalendars() {
@@ -3387,7 +3499,7 @@ function renderTrip(o, d) {
   const pairKnown = pairSeatsKnown(key, revKey);
   const ep = () => (pax > 1 && pairKnown ? pax : 1);
 
-  const outBits = routeBits(key);
+  const outBits = viewBits(key);
   const t0 = todayIndex();
   const legend = cabinLegend();
   const allMask = legend.reduce((m, [bit]) => m | bit, 0);
@@ -3437,6 +3549,7 @@ function renderTrip(o, d) {
       rebuildChips(); // recounts chips; chips' onChange redraws the calendars
     }));
   }
+  { const alc = airlineControl(() => rebuildChips()); if (alc) toolbar.append(alc); }
   rebuildChips(); // synchronously sets mask + first drawCalendars()
   syncPaxNote();
   // The prize: "tell me when a Business round trip opens on this pair". The
@@ -3646,14 +3759,14 @@ let panelCloseHook = null;
 function openDayPanel(routeKey, idx, pax = 1) {
   const [o, d] = routeKey.split("-");
   const iso = isoOf(dayDate(idx));
-  const bits = routeBits(routeKey);
+  const bits = viewBits(routeKey);
   panelReturnFocus = document.activeElement;
   panelCloseHook = null;
 
   // At a party size >= 2, annotate each cabin row with whether the seats
   // layer shows the party fitting on one flight (threshold codes, no extra
   // fetching); a route without the layer gets one honest caveat line.
-  const codes = pax > 1 ? seatCodes(routeKey, idx) : null;
+  const codes = pax > 1 ? seatCodes(routeKey, idx, viewAirline()) : null;
   const paxMark = (bit) => {
     if (pax <= 1) return "";
     if (!codes) return "";
@@ -3675,10 +3788,24 @@ function openDayPanel(routeKey, idx, pax = 1) {
       </div>
       ${stackHTML(bits[idx], { size: "row" })}
     </div>
-    <p class="dp-lead">Award space seen in this snapshot — search British Airways to book:</p>
+    <p class="dp-lead">Award space seen in this snapshot — search the airline to book:</p>
     ${pax > 1 && !codes ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
     <div class="dp-cabs">${legend.map(([bit, label]) => {
-      const href = bookingURL(o, d, iso, bit, null, pax);
+      const holders = airlinesHoldingDay(routeKey, idx, bit);
+      if (holders.length > 1) {
+        // More than one airline sells this cabin today: the user picks.
+        return `
+      <div class="dp-cab" data-bit="${bit}">
+        <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
+        <span class="dp-cab-label">${esc(label)}${paxMark(bit)}</span>
+        <span class="dp-cab-links">${holders.map((al) =>
+          `<a class="dp-cab-go" target="_blank" rel="noopener noreferrer"
+             href="${airlineBookURL(al, o, d, iso, bit, null, pax)}">${esc(airlineName(al))} ↗</a>`).join("")}</span>
+      </div>`;
+      }
+      const href = holders.length
+        ? airlineBookURL(holders[0], o, d, iso, bit, null, pax)
+        : bookingURL(o, d, iso, bit, null, pax);
       return `
       <a class="dp-cab" data-bit="${bit}" target="_blank" rel="noopener noreferrer"
          href="${href}">
@@ -3706,15 +3833,15 @@ function openDayPanel(routeKey, idx, pax = 1) {
    missing on either leg (no empty-BA-result deep links, ever). */
 function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
   const key = `${o}-${d}`, revKey = `${d}-${o}`;
-  const outBitsAll = routeBits(key);
+  const outBitsAll = viewBits(key);
   const vOut = outBitsAll[idx];
   const [lo, hi] = nights;
   const outIso = isoOf(dayDate(idx));
   // Party-size annotation inputs (threshold codes from the bundle, no extra
   // fetching): null when either leg lacks the seats layer — then rows keep
   // today's presence rendering plus one honest caveat line.
-  const outTh = pax > 1 ? routeBitsAtLeast(key, pax) : null;
-  const revTh = pax > 1 ? routeBitsAtLeast(revKey, pax) : null;
+  const outTh = pax > 1 ? viewBitsAtLeast(key, pax) : null;
+  const revTh = pax > 1 ? viewBitsAtLeast(revKey, pax) : null;
   const paxKnown = !!(outTh && revTh);
   const vOutTh = paxKnown ? outTh[idx] : 0;
   panelReturnFocus = document.activeElement;
@@ -3732,7 +3859,7 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
     history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
   };
 
-  const revBits = store.bundle.routes[revKey] ? routeBits(revKey) : null;
+  const revBits = store.bundle.routes[revKey] ? viewBits(revKey) : null;
   const rows = [];
   if (revBits) {
     const rEnd = Math.min(revBits.length - 1, idx + hi);
@@ -3782,7 +3909,20 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
       ${pax > 1 && !paxKnown ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
       <p class="dp-lead">Search the outbound one way:</p>
       <div class="dp-cabs">${legend.map(([bit, label]) => {
-        const href = bookingURL(o, d, outIso, bit, null, pax);
+        const holders = airlinesHoldingDay(key, idx, bit);
+        if (holders.length > 1) {
+          return `
+        <div class="dp-cab">
+          <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
+          <span class="dp-cab-label">${esc(label)}</span>
+          <span class="dp-cab-links">${holders.map((al) =>
+            `<a class="dp-cab-go" target="_blank" rel="noopener noreferrer"
+               href="${airlineBookURL(al, o, d, outIso, bit, null, pax)}">${esc(airlineName(al))} ↗</a>`).join("")}</span>
+        </div>`;
+        }
+        const href = holders.length
+          ? airlineBookURL(holders[0], o, d, outIso, bit, null, pax)
+          : bookingURL(o, d, outIso, bit, null, pax);
         return `
         <a class="dp-cab" target="_blank" rel="noopener noreferrer"
            href="${href}">
@@ -3876,6 +4016,7 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
       `${o}→${d} ${fmtRet.format(dayDate(idx))} · ${d}→${o} ${fmtRet.format(dayDate(r.idx))} · ${r.n} night${r.n === 1 ? "" : "s"}`;
     const ctas = $("#pp-ctas", panelEl);
     ctas.innerHTML = "";
+    let anyCTA = false;
     if (shared) {
       for (const [bit, label] of cabinLegend()) {
         if (!(shared & bit)) continue;
@@ -3885,15 +4026,26 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
           ? `<span class="pp-cta-pax${(r.fit & bit) ? " fits" : ""}">${
               (r.fit & bit) ? `fits ${pax}` : `no sign of ${pax} seats`}</span>`
           : "";
-        const href = bookingURL(o, d, outIso, bit, r.iso, pax);
-        ctas.append(el(`<a class="pp-cta" target="_blank" rel="noopener noreferrer"
-            href="${href}">
-          <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
-          Search ${esc(label)} round trip${href === EI_BOOK_URL ? " on Aer Lingus" : ""}${fitNote}
-          <span class="pp-cta-go" aria-hidden="true">↗</span></a>`));
+        // One CTA per airline that holds this cabin on BOTH legs: a round
+        // trip rides one airline's search, never a merged fiction.
+        const holders = airlinesHoldingDay(key, idx, bit, revKey, r.idx);
+        for (const al of holders) {
+          anyCTA = true;
+          const href = airlineBookURL(al, o, d, outIso, bit, r.iso, pax);
+          const suffix = holders.length > 1 ? ` — ${esc(airlineName(al))}`
+            : href === EI_BOOK_URL ? ` on ${esc(airlineName(al))}` : "";
+          ctas.append(el(`<a class="pp-cta" target="_blank" rel="noopener noreferrer"
+              href="${href}">
+            <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
+            Search ${esc(label)} round trip${suffix}${fitNote}
+            <span class="pp-cta-go" aria-hidden="true">↗</span></a>`));
+        }
       }
-    } else {
-      ctas.append(el(`<p class="pp-none">No single cabin is open both ways on these dates — book two one-ways:</p>`));
+    }
+    if (!anyCTA) {
+      ctas.append(el(`<p class="pp-none">${shared
+        ? "No single airline has that cabin both ways on these dates — book two one-ways:"
+        : "No single cabin is open both ways on these dates — book two one-ways:"}</p>`));
     }
     $("#pp-oneways", panelEl).innerHTML =
       `${shared ? "or " : ""}book each leg one-way:
@@ -4080,6 +4232,7 @@ function renderViaTrip(o, d, hub) {
       rebuildChips();
     }));
   }
+  { const alc = airlineControl(() => rebuildChips()); if (alc) toolbar.append(alc); }
   rebuildChips(); // synchronously sets mask + first drawCalendars()
   syncPaxNote();
   // The same bell as direct trips, carrying the hub + stop length: the server
@@ -4212,7 +4365,7 @@ function renderViaTrip(o, d, hub) {
    long-haul day that completes the trip is a radio row. */
 function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1) {
   const kOut1 = `${o}-${hub}`, kOut2 = `${hub}-${d}`, kRet1 = `${d}-${hub}`, kRet2 = `${hub}-${o}`;
-  const b1 = routeBits(kOut1), b2 = routeBits(kOut2), r1 = routeBits(kRet1), r2 = routeBits(kRet2);
+  const b1 = viewBits(kOut1), b2 = viewBits(kOut2), r1 = viewBits(kRet1), r2 = viewBits(kRet2);
   const days = store.bundle.days;
   const [lo, hi] = nights;
   const minN = Math.max(1, lo);
@@ -4230,11 +4383,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
     history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
   };
 
-  const legLink = (from, to, dayIdx) => {
-    const href = bookingURL(from, to, isoOf(dayDate(dayIdx)), 0, null, pax);
-    return `<a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
-       href="${href}">${href === EI_BOOK_URL ? "Book Aer Lingus" : "Book"} ↗</a>`;
-  };
+  const legLink = (from, to, dayIdx) => legBookLinks(from, to, dayIdx, pax);
   const legRow = (from, to, dayIdx, bits, extra = "") => `
     <div class="pp-leg">
       <span class="pp-leg-route">${from}→${to}</span>
@@ -4525,6 +4674,7 @@ function renderViaRoute(o, d, hub) {
       rebuildChips();
     }));
   }
+  { const alc = airlineControl(() => rebuildChips()); if (alc) toolbar.append(alc); }
   rebuildChips();
   syncPaxNote();
   toolbar.append(alertBell(`${o}-${d}`, "ow", mask, {
@@ -4615,7 +4765,7 @@ function renderViaRoute(o, d, hub) {
 /* One-way via day panel: both legs with their feasible dates, each its own
    booking link. */
 function openViaOWPanel(o, hub, d, idx, conn, pax = 1) {
-  const b1 = routeBits(`${o}-${hub}`), b2 = routeBits(`${hub}-${d}`);
+  const b1 = viewBits(`${o}-${hub}`), b2 = viewBits(`${hub}-${d}`);
   const days = store.bundle.days;
   panelReturnFocus = document.activeElement;
   panelCloseHook = null;
@@ -4633,8 +4783,7 @@ function openViaOWPanel(o, hub, d, idx, conn, pax = 1) {
       <span class="pp-leg-route">${from}→${to}</span>
       <span class="pp-leg-date">${esc(fmtRet.format(dayDate(dayIdx)))}${extra}</span>
       ${stackHTML(bits, { size: "row" })}
-      <a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
-         href="${baBookingURL(from, to, isoOf(dayDate(dayIdx)), 0, null, pax)}">Book ↗</a>
+      ${legBookLinks(from, to, dayIdx, pax)}
     </div>`;
 
   panelEl.append(el(`<div>
@@ -4810,7 +4959,9 @@ function renderFrom(o) {
       <button type="button" class="np" data-view="odds" aria-pressed="${show === "odds"}">How often</button>
     </div>
     ${pax > 1 && show === "now" ? `<p class="pax-note">Routes without seat counts in the data yet are shown for any party size.</p>` : ""}
+    ${show === "odds" && viewAirline() ? `<p class="pax-note">"How often" patterns cover all airlines together — per-airline history isn't tracked yet.</p>` : ""}
   </div>`));
+  { const alc = airlineControl(() => route()); if (alc) $(".view-ctl", mainEl).after(alc); }
 
   // Wire the mode toggle (this control was briefly on this page with no
   // handler — a dead control is worse than none).
@@ -4950,7 +5101,7 @@ function renderFrom(o) {
     // pax-thresholded outbound swatches or sort rank.
     // Outbound fallback numbers respect the mask too (routeTotals is
     // any-cabin, so count inline).
-    const ob0 = routeBits(key);
+    const ob0 = viewBits(key);
     let obT = 0, obU = 0;
     for (let i = t0; i < ob0.length; i++) { const v = ob0[i] & mask; if (v) { obT++; obU |= v; } }
     return { d, key, via: null, ...tally(rt), unverified, out: { total: obT, union: obU } };
@@ -5205,6 +5356,7 @@ function renderMap(o) {
       onPaxChange();
     }));
   }
+  { const alc = airlineControl(() => onPaxChange()); if (alc) $(".map-count", controls).before(alc); }
   mainEl.append(controls);
 
   /* Same behavior as the trip page's control: presets + clamped custom
