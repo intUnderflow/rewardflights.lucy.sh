@@ -119,6 +119,26 @@ function baBookingURL(origin, dest, outIso, bit, returnIso, pax = 1) {
     params.map(([k, v]) => `${k}=${v}`).join("&");
 }
 
+/* Airline-aware booking link. BA's redemption search is deep-linkable, so it
+   stays the CTA whenever BA's OWN bits hold the space being offered (`bit`,
+   or any cabin when bit=0) on that day — for a round trip, on both legs.
+   Space only Aer Lingus's data shows must not deep-link a likely-empty BA
+   result (the no-empty-deep-links invariant), so those CTAs go to the
+   selling airline; AerClub's search isn't reliably deep-linkable, so it's
+   the airline's front door. */
+const EI_BOOK_URL = "https://www.aerlingus.com/";
+function bookingURL(origin, dest, outIso, bit, returnIso, pax = 1) {
+  const holds = (key, iso) => {
+    const bits = store.bundle ? routeBitsForAirline(key, "BA") : null;
+    const i = isoToIdx(iso);
+    const v = bits && i >= 0 && i < bits.length ? bits[i] : 0;
+    return bit ? (v & bit) : v;
+  };
+  const ba = holds(`${origin}-${dest}`, outIso) &&
+    (!returnIso || holds(`${dest}-${origin}`, returnIso));
+  return ba ? baBookingURL(origin, dest, outIso, bit, returnIso, pax) : EI_BOOK_URL;
+}
+
 /* ---------------- alerts (Web Push) ---------------- */
 
 const PUSH_API = "https://alerts-rewardflights.lucy.sh";
@@ -1846,7 +1866,7 @@ function renderHome() {
   mainEl.innerHTML = "";
   const hero = el(`<section class="hero">
     <h1 class="hero-title">Find award seats<br>before they're gone.</h1>
-    <p class="hero-sub">A live calendar of British Airways reward-flight availability on every route — built on free, open data.</p>
+    <p class="hero-sub">A live calendar of British Airways and Aer Lingus reward-flight availability on every route — built on free, open data.</p>
     <div class="search-card">
       <div class="sc-top">
         <div class="seg" role="group" aria-label="Trip type">
@@ -3191,8 +3211,8 @@ function unreleasedMonthCard(mo, first) {
       aria-label="${fmtMonth.format(first)} — not released yet">
     <h3>${fmtMonth.format(first)}</h3>
     <p class="month-unrel">Not released yet</p>
-    <p class="month-unrel-sub">British Airways opens award seats about 355 days before departure.
-      Set an alert and we'll tell you when these dates go on sale.</p>
+    <p class="month-unrel-sub">Airlines open award seats about a year before departure (British
+      Airways: ~355 days). Set an alert and we'll tell you when these dates go on sale.</p>
   </section>`);
 }
 function unreleasedDayCell(dnum, idx) {
@@ -3657,18 +3677,20 @@ function openDayPanel(routeKey, idx, pax = 1) {
     </div>
     <p class="dp-lead">Award space seen in this snapshot — search British Airways to book:</p>
     ${pax > 1 && !codes ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
-    <div class="dp-cabs">${legend.map(([bit, label]) => `
+    <div class="dp-cabs">${legend.map(([bit, label]) => {
+      const href = bookingURL(o, d, iso, bit, null, pax);
+      return `
       <a class="dp-cab" data-bit="${bit}" target="_blank" rel="noopener noreferrer"
-         href="${baBookingURL(o, d, iso, bit, null, pax)}">
+         href="${href}">
         <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
         <span class="dp-cab-label">${esc(label)}${paxMark(bit)}</span>
-        <span class="dp-cab-go">Search one way ↗</span>
-      </a>`).join("")}
+        <span class="dp-cab-go">${href === EI_BOOK_URL ? "Search Aer Lingus" : "Search one way"} ↗</span>
+      </a>`; }).join("")}
     </div>
     <p class="dp-trip-link">Planning a round trip?
       <a href="/trip/${o}-${d}">${o} ⇄ ${d} round-trip calendar →</a></p>
     <div class="dp-flights" id="dp-flights"></div>
-    <p class="dp-note">Links open BA's Avios redemption search for the whole city pair.
+    <p class="dp-note">Links open the selling airline's Avios redemption search for the whole city pair.
       Seen in data as of ${esc(freshLabel())}. Availability moves fast — verify before planning.</p>
   </div>`));
   showPanelChrome();
@@ -3759,16 +3781,18 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
       ${fixHint}
       ${pax > 1 && !paxKnown ? `<p class="pax-note">${esc(SEAT_NOTE)}</p>` : ""}
       <p class="dp-lead">Search the outbound one way:</p>
-      <div class="dp-cabs">${legend.map(([bit, label]) => `
+      <div class="dp-cabs">${legend.map(([bit, label]) => {
+        const href = bookingURL(o, d, outIso, bit, null, pax);
+        return `
         <a class="dp-cab" target="_blank" rel="noopener noreferrer"
-           href="${baBookingURL(o, d, outIso, bit, null, pax)}">
+           href="${href}">
           <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
           <span class="dp-cab-label">${esc(label)}</span>
-          <span class="dp-cab-go">Search one way ↗</span>
-        </a>`).join("")}
+          <span class="dp-cab-go">${href === EI_BOOK_URL ? "Search Aer Lingus" : "Search one way"} ↗</span>
+        </a>`; }).join("")}
       </div>
       <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
-        Availability moves fast — verify with British Airways before planning.</p>
+        Availability moves fast — verify with the airline before planning.</p>
     </div>`));
     showPanelChrome();
     $("#pp-widen", panelEl)?.addEventListener("click", () => {
@@ -3814,7 +3838,7 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
     </div>
     <div class="dp-flights" id="dp-flights"></div>
     <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
-      Availability moves fast — verify with British Airways before planning.</p>
+      Availability moves fast — verify with the airline before planning.</p>
   </div>`));
 
   const rowsWrap = $(".pp-rows", panelEl);
@@ -3861,10 +3885,11 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
           ? `<span class="pp-cta-pax${(r.fit & bit) ? " fits" : ""}">${
               (r.fit & bit) ? `fits ${pax}` : `no sign of ${pax} seats`}</span>`
           : "";
+        const href = bookingURL(o, d, outIso, bit, r.iso, pax);
         ctas.append(el(`<a class="pp-cta" target="_blank" rel="noopener noreferrer"
-            href="${baBookingURL(o, d, outIso, bit, r.iso, pax)}">
+            href="${href}">
           <span class="swatch ${bitClass(bit)}" aria-hidden="true"></span>
-          Search ${esc(label)} round trip${fitNote}
+          Search ${esc(label)} round trip${href === EI_BOOK_URL ? " on Aer Lingus" : ""}${fitNote}
           <span class="pp-cta-go" aria-hidden="true">↗</span></a>`));
       }
     } else {
@@ -3872,8 +3897,8 @@ function openPairPanel(o, d, idx, nights, mask, retIso = null, pax = 1) {
     }
     $("#pp-oneways", panelEl).innerHTML =
       `${shared ? "or " : ""}book each leg one-way:
-       <a href="${baBookingURL(o, d, outIso, 0, null, pax)}" target="_blank" rel="noopener noreferrer">${o}→${d} ${esc(fmtRet.format(dayDate(idx)))} ↗</a> ·
-       <a href="${baBookingURL(d, o, r.iso, 0, null, pax)}" target="_blank" rel="noopener noreferrer">${d}→${o} ${esc(fmtRet.format(dayDate(r.idx)))} ↗</a>`;
+       <a href="${bookingURL(o, d, outIso, 0, null, pax)}" target="_blank" rel="noopener noreferrer">${o}→${d} ${esc(fmtRet.format(dayDate(idx)))} ↗</a> ·
+       <a href="${bookingURL(d, o, r.iso, 0, null, pax)}" target="_blank" rel="noopener noreferrer">${d}→${o} ${esc(fmtRet.format(dayDate(r.idx)))} ↗</a>`;
   }
 
   function reveal() { // mobile step 3: selecting a return uncovers the booking summary
@@ -4205,9 +4230,11 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
     history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
   };
 
-  const legLink = (from, to, dayIdx) =>
-    `<a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
-       href="${baBookingURL(from, to, isoOf(dayDate(dayIdx)), 0, null, pax)}">Book ↗</a>`;
+  const legLink = (from, to, dayIdx) => {
+    const href = bookingURL(from, to, isoOf(dayDate(dayIdx)), 0, null, pax);
+    return `<a class="pp-leg-go" target="_blank" rel="noopener noreferrer"
+       href="${href}">${href === EI_BOOK_URL ? "Book Aer Lingus" : "Book"} ↗</a>`;
+  };
   const legRow = (from, to, dayIdx, bits, extra = "") => `
     <div class="pp-leg">
       <span class="pp-leg-route">${from}→${to}</span>
@@ -4267,7 +4294,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
       <p class="dp-lead">Book what's open one way:</p>
       <div class="pp-legs">${legRow(o, hub, idx, b1[idx])}</div>
       <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
-        Availability moves fast — verify with British Airways before planning.</p>
+        Availability moves fast — verify with the airline before planning.</p>
     </div>`));
     showPanelChrome();
     $("#vp-widen", panelEl)?.addEventListener("click", () => {
@@ -4354,7 +4381,7 @@ function openViaPanel(o, hub, d, idx, nights, conn, mask, retIso = null, pax = 1
       legRow(hub, o, r.home[0], r2[r.home[0]]) +
       (r.home.length > 1
         ? `<p class="pp-oneways">or ${hub}→${o} on ${r.home.slice(1).map((h) =>
-            `<a target="_blank" rel="noopener noreferrer" href="${baBookingURL(hub, o, isoOf(dayDate(h)), 0, null, pax)}">${esc(fmtRet.format(dayDate(h)))} ↗</a>`).join(" · ")}</p>`
+            `<a target="_blank" rel="noopener noreferrer" href="${bookingURL(hub, o, isoOf(dayDate(h)), 0, null, pax)}">${esc(fmtRet.format(dayDate(h)))} ↗</a>`).join(" · ")}</p>`
         : "");
     const shared = b2[n] & r.bits & mask;
     const sharedAll = b2[n] & r.bits;
@@ -4626,7 +4653,7 @@ function openViaOWPanel(o, hub, d, idx, conn, pax = 1) {
       ${lhRows.map((n) => legRow(hub, d, n, b2[n], ` <small>(${n - idx} night${n - idx > 1 ? "s" : ""} in ${esc(placeName(hub))})</small>`)).join("")}
     </div>
     <p class="dp-note">Award space seen in this snapshot (as of ${esc(freshLabel())}).
-      Availability moves fast — verify with British Airways before planning.</p>
+      Availability moves fast — verify with the airline before planning.</p>
   </div>`));
   showPanelChrome();
 }
@@ -4673,6 +4700,8 @@ async function loadFlightDetail(o, d, iso) {
         <div class="fl-tags">
           ${f.peak ? `<span class="tag${f.peak === "peak" ? " peak" : ""}">${esc(f.peak)}</span>` : ""}
           ${f.rfs ? `<span class="tag">Reward Flight Saver</span>` : ""}
+          ${f.avios ? Object.entries(f.avios).map(([code, v]) =>
+            `<span class="tag">${esc(code)}: ${Number(v).toLocaleString("en-GB")} Avios</span>`).join("") : ""}
         </div>
       </div>`));
     }

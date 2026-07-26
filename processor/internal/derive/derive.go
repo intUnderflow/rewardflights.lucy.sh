@@ -456,11 +456,30 @@ func flightJSON(f source.Flight, srcPath string, log *warnings.Log) map[string]a
 	if f.Peak != nil {
 		peak = *f.Peak
 	}
-	return map[string]any{
+	out := map[string]any{
 		"arr": f.Arrive, "car": orEmpty(f.Carriers), "dep": f.Depart,
 		"fn": orEmpty(f.FlightNumbers), "peak": peak, "rfs": f.RewardFlightSaver,
 		"seats": seats, "via": orEmpty(f.Via),
 	}
+	// Award price per cabin (Aer Lingus publishes one; others don't). The key
+	// is emitted only when a valid price exists, so airlines without prices
+	// keep byte-identical output.
+	avios := map[string]any{}
+	for _, cabin := range slices.Sorted(maps.Keys(f.Avios)) {
+		if _, ok := CabinBits[cabin]; !ok {
+			log.Warn("unknown-cabin", cabin, srcPath)
+			continue
+		}
+		if f.Avios[cabin] <= 0 {
+			log.Warn("bad-avios", cabin, srcPath)
+			continue
+		}
+		avios[cabin] = f.Avios[cabin]
+	}
+	if len(avios) > 0 {
+		out["avios"] = avios
+	}
+	return out
 }
 
 // orEmpty keeps absent string lists as [] rather than null in the output.

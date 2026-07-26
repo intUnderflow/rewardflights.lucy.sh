@@ -36,6 +36,9 @@ type Flight struct {
 	Peak              *string        `json:"peak"` // "peak" | "off-peak" | null (unknown)
 	RewardFlightSaver bool           `json:"rewardFlightSaver"`
 	Seats             map[string]int `json:"seats"`
+	// Avios is the award price per person per cabin — currently published by
+	// Aer Lingus only; absent everywhere else.
+	Avios map[string]int `json:"avios"`
 }
 
 // DateEntry is one parsed <route>/<date>.json source file.

@@ -1,12 +1,21 @@
 {
+  "aer-lingus": {
+    "cabins": {
+      "1": "Economy",
+      "2": "Premium Economy",
+      "4": "Business"
+    },
+    "id": "EI",
+    "name": "Aer Lingus"
+  },
   "british-airways": {
-    "id": "BA",
-    "name": "British Airways",
     "cabins": {
       "1": "Economy",
       "2": "Premium Economy",
       "4": "Business",
       "8": "First"
-    }
+    },
+    "id": "BA",
+    "name": "British Airways"
   }
 }

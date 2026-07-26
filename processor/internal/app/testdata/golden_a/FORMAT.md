@@ -278,6 +278,7 @@ files above never grow when detail ships.
 | `peak` | Airline pricing band for the date: `"peak"`, `"off-peak"`, or `null` (unknown). |
 | `rfs` | `true` if the flight offers Reward Flight Saver (reduced cash surcharge). |
 | `seats` | Cabin code → award seats available. Cabins with zero seats are omitted. |
+| `avios` | Cabin code → award price per person, in Avios (for a connecting itinerary, the journey total). **Optional** — emitted only when the source publishes a price (currently Aer Lingus only); absent elsewhere. |
 
 ## `changes/recent.json`
 
