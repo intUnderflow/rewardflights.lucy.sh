@@ -1153,6 +1153,14 @@
     ],
     "name": "Munich"
   },
+  "NAP": {
+    "country": "Italy",
+    "g": [
+      40.886,
+      14.291
+    ],
+    "name": "Naples"
+  },
   "NAS": {
     "country": "Bahamas",
     "g": [
@@ -1185,6 +1193,14 @@
     ],
     "name": "Newcastle"
   },
+  "NOC": {
+    "country": "Ireland",
+    "g": [
+      53.91,
+      -8.819
+    ],
+    "name": "Knock"
+  },
   "NQY": {
     "country": "United Kingdom",
     "g": [
@@ -1192,6 +1208,14 @@
       -5.001
     ],
     "name": "Newquay"
+  },
+  "NTE": {
+    "country": "France",
+    "g": [
+      47.153,
+      -1.611
+    ],
+    "name": "Nantes"
   },
   "NYC": {
     "country": "United States",
@@ -1498,6 +1522,14 @@
       -70.786
     ],
     "name": "Santiago"
+  },
+  "SCQ": {
+    "country": "Spain",
+    "g": [
+      42.896,
+      -8.415
+    ],
+    "name": "Santiago de Compostela"
   },
   "SEA": {
     "country": "United States",
