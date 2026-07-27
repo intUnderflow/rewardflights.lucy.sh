@@ -882,6 +882,14 @@
     ],
     "name": "Kingston"
   },
+  "KIR": {
+    "country": "Ireland",
+    "g": [
+      52.181,
+      -9.524
+    ],
+    "name": "Kerry"
+  },
   "KLX": {
     "country": "Greece",
     "g": [
@@ -1656,6 +1664,14 @@
       "Bromma",
       "BMA"
     ]
+  },
+  "STR": {
+    "country": "Germany",
+    "g": [
+      48.69,
+      9.222
+    ],
+    "name": "Stuttgart"
   },
   "SVQ": {
     "country": "Spain",
