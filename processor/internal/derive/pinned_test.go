@@ -192,3 +192,28 @@ func TestNewPairsAreBaselineNotNews(t *testing.T) {
 		t.Fatalf("post-onboarding gain not news: %v", entries2)
 	}
 }
+
+// TestPinnedFloorIsPerAirline: one airline's churn must not starve another's
+// floor. BA fills a cabin's bucket with newer openings; EI's older rolled-off
+// opening in the SAME cabin must still be pinned, or an airline-lens
+// "Recently opened" goes permanently blank.
+func TestPinnedFloorIsPerAirline(t *testing.T) {
+	cutoff := day(t, "2026-01-01")
+	window := []any{fe("AAA-BBB", "BA", "2026-03-01", "opened", "M", 1000)}
+	var old []map[string]any
+	// More BA Economy openings than one bucket holds, all newer than EI's.
+	for i := 0; i < maxPinnedPerCabin+3; i++ {
+		old = append(old, fe(fmt.Sprintf("BA%d-CCC", i), "BA", "2026-04-02", "opened", "M", int64(500+i)))
+	}
+	old = append(old, fe("DUB-BOS", "EI", "2026-04-01", "opened", "M", 100))
+	got := pinnedStrings(t, buildPinned(window, feedFile(t, old, nil), cutoff))
+	found := false
+	for _, s := range got {
+		if s == "opened DUB-BOS 2026-04-01 M t=100" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("EI opening starved out of the floor: %v", got)
+	}
+}

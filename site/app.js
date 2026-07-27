@@ -2193,6 +2193,13 @@ function buildHomeModules(mount) {
   { const alc = airlineControl(() => refreshHomeModules()); if (alc) chips.append(alc); }
   const modules = el(`<div class="modules"></div>`);
   const opened = recentlyOpened(mask);
+  if (!opened.length && viewAirline()) {
+    // The lens found no surviving openings: say so rather than silently
+    // dropping the module (the feed pins each airline's newest openings, so
+    // this clears itself as soon as that airline's availability moves).
+    modules.append(el(`<section class="module"><h2><span class="dot" aria-hidden="true"></span>Recently opened</h2>
+      <p class="module-empty">No recent ${esc(airlineName(viewAirline()))} openings on record — they'll appear here the moment award space moves.</p></section>`));
+  }
   if (opened.length) {
     const mod = el(`<section class="module"><h2><span class="dot" aria-hidden="true"></span>Recently opened</h2><div class="card-list"></div></section>`);
     const listEl = $(".card-list", mod);

@@ -80,7 +80,7 @@ func gainedCabins(ce changeEntry) string {
 	return ""
 }
 
-// buildPinned computes the feed's "pinned" array: per cabin, the newest
+// buildPinned computes the feed's "pinned" array: per airline × cabin, the newest
 // openings older than the contiguous window, carried forward from the
 // previous feed (entries + pinned) so they survive roll-off. Truthfulness
 // rules:
@@ -166,29 +166,47 @@ func buildPinned(window []any, oldChanges []byte, cutoffDay int) []any {
 		return 0
 	})
 
+	// Buckets are per AIRLINE × cabin: one busy airline's churn must not
+	// starve another's floor, or an airline-lens "Recently opened" goes
+	// permanently blank (the exact roll-off problem the floor exists to fix).
+	// With one airline this is byte-identical to the old per-cabin floor.
+	airlines := []string{}
+	seenAl := map[string]bool{}
+	for _, ce := range pool {
+		if !seenAl[ce.Al] {
+			seenAl[ce.Al] = true
+			airlines = append(airlines, ce.Al)
+		}
+	}
+	slices.Sort(airlines)
 	picked := map[string]bool{}
 	out := []any{} // non-nil: an empty floor serializes as [], matching entries
-	for _, cabin := range []string{"M", "W", "C", "F"} {
-		kept := 0
-		for _, ce := range pool {
-			if kept >= maxPinnedPerCabin {
-				break
+	for _, al := range airlines {
+		for _, cabin := range []string{"M", "W", "C", "F"} {
+			kept := 0
+			for _, ce := range pool {
+				if ce.Al != al {
+					continue
+				}
+				if kept >= maxPinnedPerCabin {
+					break
+				}
+				if !strings.Contains(gainedCabins(ce), cabin) {
+					continue
+				}
+				kept++
+				if picked[ident(ce)] {
+					continue // already pinned for another cabin it also gained
+				}
+				picked[ident(ce)] = true
+				m := map[string]any{
+					"al": ce.Al, "c": ce.C, "d": ce.D, "k": ce.K, "r": ce.R, "t": ce.T,
+				}
+				if ce.G != "" {
+					m["g"] = ce.G
+				}
+				out = append(out, m)
 			}
-			if !strings.Contains(gainedCabins(ce), cabin) {
-				continue
-			}
-			kept++
-			if picked[ident(ce)] {
-				continue // already pinned for another cabin it also gained
-			}
-			picked[ident(ce)] = true
-			m := map[string]any{
-				"al": ce.Al, "c": ce.C, "d": ce.D, "k": ce.K, "r": ce.R, "t": ce.T,
-			}
-			if ce.G != "" {
-				m["g"] = ce.G
-			}
-			out = append(out, m)
 		}
 	}
 	// Re-sort the union newest-first so the array reads like the entries do.
