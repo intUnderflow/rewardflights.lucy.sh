@@ -56,6 +56,13 @@ func buildChanges(oldBundle, oldChanges []byte, newBits map[string]map[string]ma
 // vanish instead of reaching back to real news.
 const maxPinnedPerCabin = 40
 
+// maxPinnedPerOrigin bounds the origin pass: per (origin, airline, cabin),
+// the newest gain survives even when the global cabin buckets are full of a
+// busier origin's churn — an origin-filtered "Recently opened" must reach
+// back to that origin's last real news, however long ago. One per bucket:
+// "the last time First opened from Dublin" is the story; its history isn't.
+const maxPinnedPerOrigin = 1
+
 // changeEntry is the typed view of one feed entry (new-batch maps and prior
 // RawMessages both normalize to this).
 type changeEntry struct {
@@ -181,6 +188,19 @@ func buildPinned(window []any, oldChanges []byte, cutoffDay int) []any {
 	slices.Sort(airlines)
 	picked := map[string]bool{}
 	out := []any{} // non-nil: an empty floor serializes as [], matching entries
+	emit := func(ce changeEntry) {
+		if picked[ident(ce)] {
+			return // already pinned under another bucket
+		}
+		picked[ident(ce)] = true
+		m := map[string]any{
+			"al": ce.Al, "c": ce.C, "d": ce.D, "k": ce.K, "r": ce.R, "t": ce.T,
+		}
+		if ce.G != "" {
+			m["g"] = ce.G
+		}
+		out = append(out, m)
+	}
 	for _, al := range airlines {
 		for _, cabin := range []string{"M", "W", "C", "F"} {
 			kept := 0
@@ -195,18 +215,28 @@ func buildPinned(window []any, oldChanges []byte, cutoffDay int) []any {
 					continue
 				}
 				kept++
-				if picked[ident(ce)] {
-					continue // already pinned for another cabin it also gained
-				}
-				picked[ident(ce)] = true
-				m := map[string]any{
-					"al": ce.Al, "c": ce.C, "d": ce.D, "k": ce.K, "r": ce.R, "t": ce.T,
-				}
-				if ce.G != "" {
-					m["g"] = ce.G
-				}
-				out = append(out, m)
+				emit(ce)
 			}
+		}
+	}
+	// Origin pass: the global buckets above are dominated by the busiest
+	// origins, so additionally keep each (origin, airline, cabin)'s newest
+	// gain. The pool is newest-first, so the first hit per bucket wins.
+	originKept := map[string]int{}
+	for _, ce := range pool {
+		if len(ce.R) < 3 {
+			continue
+		}
+		for _, cabin := range []string{"M", "W", "C", "F"} {
+			if !strings.Contains(gainedCabins(ce), cabin) {
+				continue
+			}
+			bk := ce.R[:3] + "|" + ce.Al + "|" + cabin
+			if originKept[bk] >= maxPinnedPerOrigin {
+				continue
+			}
+			originKept[bk]++
+			emit(ce)
 		}
 	}
 	// Re-sort the union newest-first so the array reads like the entries do.

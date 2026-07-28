@@ -340,7 +340,7 @@ are provided as-is, with no guarantee of accuracy or bookability.
 ### `changes/recent.json` — the `pinned` array
 
 Alongside the contiguous `entries` window (newest-first, capped at 1000), the
-feed carries `pinned`: per cabin, up to 40 of the newest entries that GAINED
+feed carries `pinned`: per airline × cabin, up to 40 of the newest entries that GAINED
 that cabin (an `"opened"` entry gains its whole `c`; a `"changed"` entry
 gains its `g`) and have rolled off the window. A (route, airline, date) is
 pinned only when its newest known event is itself a gain (never resurrecting
@@ -348,6 +348,9 @@ a re-closed date or one whose latest change merely shuffled cabins), only
 while its travel date lies ahead, and never when the window already carries
 a newer event for it. Same entry shape as `entries`; carried
 forward across generations until displaced. Consumers that patch bundles from
+Additionally, each (origin, airline, cabin)'s single newest gain is kept, so
+an origin-filtered view reaches back to that origin's last real news even when
+the global buckets are full of a busier origin's churn.
 `entries` ignore `pinned`; the site's cabin-filtered "Recently opened" reads
 both.
 

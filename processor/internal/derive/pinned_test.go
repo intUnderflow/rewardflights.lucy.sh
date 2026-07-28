@@ -105,9 +105,11 @@ func TestPinnedCarriesForwardAcrossCycles(t *testing.T) {
 
 func TestPinnedPerCabinCap(t *testing.T) {
 	cutoff := day(t, "2026-01-01")
+	// One origin flooding one cabin: the global bucket caps it, and the origin
+	// pass adds nothing new (its newest is already pinned).
 	var entries []map[string]any
 	for i := 0; i < maxPinnedPerCabin+5; i++ {
-		entries = append(entries, fe(fmt.Sprintf("A%02d-BBB", i), "BA", "2026-04-01", "opened", "F", int64(1000+i)))
+		entries = append(entries, fe(fmt.Sprintf("AAA-B%02d", i), "BA", "2026-04-01", "opened", "F", int64(1000+i)))
 	}
 	got := buildPinned(nil, feedFile(t, entries, nil), cutoff)
 	if len(got) != maxPinnedPerCabin {
@@ -117,6 +119,31 @@ func TestPinnedPerCabinCap(t *testing.T) {
 	first := got[0].(map[string]any)
 	if first["t"].(int64) != int64(1000+maxPinnedPerCabin+4) {
 		t.Fatalf("newest not kept first: t=%v", first["t"])
+	}
+}
+
+// TestPinnedFloorKeepsPerOrigin: one busy origin's churn fills the global
+// cabin bucket; a quieter origin's older gain in the same cabin must still be
+// pinned (its newest per cabin), or an origin-filtered "Recently opened"
+// runs dry.
+func TestPinnedFloorKeepsPerOrigin(t *testing.T) {
+	cutoff := day(t, "2026-01-01")
+	var entries []map[string]any
+	for i := 0; i < maxPinnedPerCabin+5; i++ {
+		entries = append(entries, fe(fmt.Sprintf("LON-B%02d", i), "BA", "2026-04-01", "opened", "C", int64(1000+i)))
+	}
+	entries = append(entries,
+		fe("DUB-LON", "BA", "2026-04-02", "opened", "C", 400), // newest DUB C
+		fe("DUB-LON", "BA", "2026-04-03", "opened", "C", 300)) // older: not kept
+	got := pinnedStrings(t, buildPinned(nil, feedFile(t, entries, nil), cutoff))
+	var dub []string
+	for _, s := range got {
+		if len(s) > 7 && s[7:10] == "DUB" {
+			dub = append(dub, s)
+		}
+	}
+	if len(dub) != 1 || dub[0] != "opened DUB-LON 2026-04-02 C t=400" {
+		t.Fatalf("origin floor wrong: %v", dub)
 	}
 }
 
