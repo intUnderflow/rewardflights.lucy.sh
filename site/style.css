@@ -950,3 +950,11 @@ a.arrow-swap:focus-visible { outline: 2px solid var(--focus); outline-offset: 3p
 .dp-cab-links { display: flex; gap: 12px; margin-left: auto; }
 a.dp-cab-go:hover, a.pp-leg-go:hover { text-decoration: underline; }
 
+
+/* Home origin filter: compact autocomplete beside the module chips. */
+.home-from { display: inline-flex; align-items: center; gap: 7px; }
+.home-from input { width: 150px; padding: 5px 11px; border: 1px solid var(--line-2); border-radius: 999px; background: var(--panel); color: var(--ink); font: 700 12.5px var(--font-body); }
+.home-from input::placeholder { color: var(--ink-3); font-weight: 400; }
+.home-from .suggest { min-width: 230px; }
+.hf-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 16px; padding: 0 2px; }
+.hf-clear:hover { color: var(--ink); }

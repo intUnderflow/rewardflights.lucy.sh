@@ -2191,14 +2191,49 @@ function buildHomeModules(mount) {
     refreshHomeModules(); // rebuilds this row + both lists under the new mask
   }));
   { const alc = airlineControl(() => refreshHomeModules()); if (alc) chips.append(alc); }
+
+  // Origin filter: "only routes departing here", sticky for the session and
+  // mirrored to ?from= so a filtered home is shareable. Invalid codes (a
+  // place that lost its routes) silently mean "anywhere".
+  const validFrom = (c) => (c && store.bundle.places[c] && store.destsByOrigin.has(c)) ? c : "";
+  let homeFrom = validFrom(new URLSearchParams(location.search).get("from"));
+  if (!homeFrom) { try { homeFrom = validFrom(sessionStorage.getItem("rf:homefrom")); } catch {} }
+  const setHomeFrom = (code) => {
+    try { code ? sessionStorage.setItem("rf:homefrom", code) : sessionStorage.removeItem("rf:homefrom"); } catch {}
+    const u = new URL(location.href);
+    if (code) u.searchParams.set("from", code); else u.searchParams.delete("from");
+    const q = u.searchParams.toString();
+    history.replaceState(null, "", u.pathname + (q ? `?${q}` : ""));
+    refreshHomeModules();
+  };
+  const fromWrap = el(`<span class="field home-from">
+    <span class="nc-label">From</span>
+    <input id="home-from-in" type="text" placeholder="Anywhere"
+      aria-label="Only routes departing this place" value="${homeFrom ? esc(placeName(homeFrom)) : ""}">
+    ${homeFrom ? `<button type="button" class="hf-clear" aria-label="Show all origins">×</button>` : ""}
+  </span>`);
+  const fromIn = $("#home-from-in", fromWrap);
+  attachAutocomplete(fromIn, {
+    getRestrict: () => new Set(store.destsByOrigin.keys()),
+    onPick: (p) => setHomeFrom(p.code),
+  });
+  fromIn.addEventListener("blur", () => setTimeout(() => {
+    if (current.page === "home") fromIn.value = homeFrom ? placeName(homeFrom) : "";
+  }, 150));
+  $(".hf-clear", fromWrap)?.addEventListener("click", () => setHomeFrom(""));
+  chips.append(fromWrap);
+
+  const multiAl = Object.keys(store.bundle.airlines).length > 1;
   const modules = el(`<div class="modules"></div>`);
-  const opened = recentlyOpened(mask);
-  if (!opened.length && viewAirline()) {
-    // The lens found no surviving openings: say so rather than silently
+  const opened = recentlyOpened(mask, homeFrom);
+  if (!opened.length && (viewAirline() || homeFrom)) {
+    // The filters found no surviving openings: say so rather than silently
     // dropping the module (the feed pins each airline's newest openings, so
     // this clears itself as soon as that airline's availability moves).
+    const scope = [homeFrom ? `from ${esc(placeName(homeFrom))}` : "",
+      viewAirline() ? `on ${esc(airlineName(viewAirline()))}` : ""].filter(Boolean).join(" ");
     modules.append(el(`<section class="module"><h2><span class="dot" aria-hidden="true"></span>Recently opened</h2>
-      <p class="module-empty">No recent ${esc(airlineName(viewAirline()))} openings on record — they'll appear here the moment award space moves.</p></section>`));
+      <p class="module-empty">No recent openings ${scope} on record — they'll appear here the moment award space moves.</p></section>`));
   }
   if (opened.length) {
     const mod = el(`<section class="module"><h2><span class="dot" aria-hidden="true"></span>Recently opened</h2><div class="card-list"></div></section>`);
@@ -2219,21 +2254,23 @@ function buildHomeModules(mount) {
       listEl.append(el(`<a class="route-card${g.count ? "" : " rc-gone"}" href="${href}">
         <span class="rc-route">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</span>
         <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
-        <span class="rc-meta">${meta}<br><span class="when">${esc(timeAgo(g.t))}</span></span>
+        <span class="rc-meta">${meta}<br><span class="when">${esc(timeAgo(g.t))}${
+          multiAl && g.al ? ` · ${esc(airlineName(g.al))}` : ""}</span></span>
       </a>`));
     }
     modules.append(mod);
   }
-  const top = topRoutes(6, mask);
+  const top = topRoutes(6, mask, homeFrom);
   if (top.length) {
     const mod = el(`<section class="module"><h2>Deepest availability</h2><div class="card-list"></div></section>`);
     const listEl = $(".card-list", mod);
-    for (const { key, total } of top) {
+    for (const { key, total, als } of top) {
       const [o, d] = key.split("-");
       listEl.append(el(`<a class="route-card" href="/trip/${key}">
         <span class="rc-route">${o} <span class="arrow" aria-hidden="true">→</span> ${d}</span>
         <span class="rc-cities">${esc(placeName(o))} to ${esc(placeName(d))}</span>
-        <span class="rc-meta"><b>${total}</b> days<br><span class="when">next 12 months</span></span>
+        <span class="rc-meta"><b>${total}</b> days<br><span class="when">next 12 months${
+          multiAl && als?.length ? ` · ${als.map((a) => esc(airlineName(a))).join(" + ")}` : ""}</span></span>
       </a>`));
     }
     modules.append(mod);
@@ -2241,8 +2278,9 @@ function buildHomeModules(mount) {
   // The chips outlive their own filtering: if the current mask empties both
   // lists, the row must stay (with an honest note) or there'd be no way back.
   if (modules.children.length) mount.append(chips, modules);
-  else if ((store.changes?.entries?.length || Object.keys(store.bundle.routes).length) && mask !== allMask) {
-    mount.append(chips, el(`<p class="module-empty">Nothing to show in the selected cabins — pick another cabin above.</p>`));
+  else if ((store.changes?.entries?.length || Object.keys(store.bundle.routes).length) &&
+      (mask !== allMask || viewAirline() || homeFrom)) {
+    mount.append(chips, el(`<p class="module-empty">Nothing to show under these filters — widen them above.</p>`));
   }
 
   const routeCount = Object.keys(store.bundle.routes).length;
@@ -2256,7 +2294,7 @@ function buildHomeModules(mount) {
   </div>`));
 }
 
-function recentlyOpened(mask = 15) {
+function recentlyOpened(mask = 15, from = "") {
   if (!store.changes?.entries) return [];
   // The pinned floor reaches back beyond the contiguous window: per cabin,
   // the newest openings the busy feed has rolled off. With a cabin filter on,
@@ -2278,6 +2316,7 @@ function recentlyOpened(mask = 15) {
   const byRoute = new Map();
   for (const e of src) {
     if (lens && e.al !== lens) continue; // news belongs to its airline
+    if (from && !e.r.startsWith(from + "-")) continue; // origin filter
     // What the event GAINED is what counts as an opening: a k="opened" entry
     // gains its whole cabin set, a k="changed" entry gains its "g" letters.
     // This is how First news actually arrives — measured live, First almost
@@ -2286,7 +2325,10 @@ function recentlyOpened(mask = 15) {
     const gained = e.k === "opened" ? (e.c || "") : e.k === "changed" ? (e.g || "") : "";
     const bits = [...gained].reduce((m, ch) => m | (CABIN_BIT[ch] || 0), 0);
     if (!(bits & mask)) continue;
-    const g = byRoute.get(e.r) || { route: e.r, count: 0, gone: 0, rt: false, t: 0 };
+    // Cards are per (route, airline): BA news and EI news on the same pair
+    // are different promises, and each card can name its airline.
+    const gk = e.r + "|" + (e.al || "");
+    const g = byRoute.get(gk) || { route: e.r, al: e.al || "", count: 0, gone: 0, rt: false, t: 0 };
     if (stillOpen(e, bits)) {
       g.count++;
       // Is THIS gained date part of a same-cabin round trip (default window)?
@@ -2302,16 +2344,18 @@ function recentlyOpened(mask = 15) {
       }
     } else g.gone++;
     g.t = Math.max(g.t, e.t);
-    byRoute.set(e.r, g);
+    byRoute.set(gk, g);
   }
   return [...byRoute.values()]
     .filter((g) => store.bundle.routes[g.route])
     .sort((a, b) => b.t - a.t || b.count - a.count).slice(0, 6);
 }
 
-function topRoutes(n, mask = 15) {
+function topRoutes(n, mask = 15, from = "") {
   const t0 = Math.max(0, todayIndex());
+  const lens = viewAirline();
   return Object.keys(store.bundle.routes)
+    .filter((key) => !from || key.startsWith(from + "-"))
     .map((key) => {
       const bits = viewBits(key);
       let total = 0;
@@ -2319,7 +2363,15 @@ function topRoutes(n, mask = 15) {
       return { key, total };
     })
     .filter((r) => r.total > 0)
-    .sort((a, b) => b.total - a.total).slice(0, n);
+    .sort((a, b) => b.total - a.total).slice(0, n)
+    // Which airlines the counted days belong to, for the card label. Under a
+    // lens it's that airline by construction.
+    .map((r) => ({ ...r, als: lens ? [lens] : Object.keys(store.bundle.routes[r.key].a)
+      .filter((al) => {
+        const b = routeBitsForAirline(r.key, al);
+        for (let i = t0; i < b.length; i++) if (b[i] & mask) return true;
+        return false;
+      }).sort() }));
 }
 
 /* ---------------- cabin filter (shared, sticky per session) ---------------- */
