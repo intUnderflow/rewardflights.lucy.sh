@@ -3371,42 +3371,104 @@ function daysInMonth(mo) { return mo.end - mo.start; }
    (same shape as bits) when a party size >= 2 is active on a route with seat
    data. `bits` stays the PRESENCE array: a day with seats but fewer than the
    party must render dim (with honest copy), never as empty. */
-/* Beyond the data horizon (the furthest day BA has loaded, ~355 days out)
-   there is no data at all — so a blank there means "not on sale yet", not
-   "sold out". These render that distinctly on the calendar itself, replacing
-   the old blanket note below it. A whole month past the horizon becomes a
-   "Not released yet" card; the boundary month keeps its grid with the beyond-
-   horizon days hatched. Both are 0-availability by construction (no data). */
-function unreleasedMonthCard(mo, first) {
+/* Beyond a journey's release horizon there is no data at all — so a blank
+   there means "not on sale yet", not "sold out". These render that distinctly
+   on the calendar itself. A whole month past the horizon becomes a "Not
+   released yet" card; the boundary month keeps its grid with the beyond-
+   horizon days hatched. Both are 0-availability by construction (no data).
+   The horizon is per JOURNEY, not per bundle: each airline reaches only as
+   far as its own observable release frontier (BA ~355 days; Aer Lingus much
+   nearer), so an Aer Lingus route hatches where its dates genuinely aren't
+   out yet instead of reading as sold out for months. */
+
+/* The furthest day (exclusive) an airline has ANY availability, network-wide
+   — its observable release frontier. Cached per bundle. */
+function airlineFrontier(al) {
+  if (store._frontier?.bundle !== store.bundle) store._frontier = { bundle: store.bundle, m: new Map() };
+  const c = store._frontier.m;
+  if (c.has(al)) return c.get(al);
+  let max = 0;
+  for (const r of Object.values(store.bundle.routes)) {
+    const str = r.a[al];
+    if (typeof str !== "string") continue;
+    for (let i = str.length - 1; i >= max; i--) {
+      if (str[i] !== "0") { max = i + 1; break; }
+    }
+  }
+  c.set(al, max);
+  return max;
+}
+
+/* Where "not released yet" starts for a journey: each route reaches as far
+   as its airlines' (under the lens) furthest frontier; a multi-leg journey
+   ends at its shortest leg. Falls back to the bundle horizon when the lens
+   airline doesn't fly a leg at all — an all-hatched calendar would claim
+   "not released" where the truth is "doesn't fly it". */
+function routeHorizon(...keys) {
+  const lens = viewAirline();
+  let h = Infinity;
+  for (const k of keys) {
+    const route = store.bundle.routes[k];
+    if (!route) continue;
+    let rh = 0;
+    for (const al of Object.keys(route.a)) {
+      if (lens && al !== lens) continue;
+      rh = Math.max(rh, airlineFrontier(al));
+    }
+    if (rh > 0) h = Math.min(h, rh);
+  }
+  return Number.isFinite(h) ? h : store.bundle.days;
+}
+
+/* One clause explaining the boundary. BA's ~355-day policy is public and
+   worth stating; other airlines get their observed frontier, claimed as
+   observation ("so far"), never as policy. */
+function horizonNote(keys, horizon) {
+  const lens = viewAirline();
+  const als = new Set();
+  for (const k of keys) {
+    for (const al of Object.keys(store.bundle.routes[k]?.a || {})) {
+      if (!lens || al === lens) als.add(al);
+    }
+  }
+  if (als.has("BA")) return "British Airways opens award seats about 355 days ahead";
+  const names = [...als].sort().map(airlineName);
+  if (!names.length) return "airlines release award seats in batches";
+  const d = dayDate(horizon - 1);
+  return `${names.join(" and ")} ${names.length > 1 ? "have" : "has"} released award dates up to ${d.getUTCDate()} ${fmtMonthShort.format(d)} so far`;
+}
+
+const UNREL_NOTE_DEFAULT = "Airlines open award seats up to about a year ahead";
+function unreleasedMonthCard(mo, first, note = UNREL_NOTE_DEFAULT) {
   return el(`<section class="month month-unreleased" id="month-${mo.y}-${mo.m}"
       aria-label="${fmtMonth.format(first)} — not released yet">
     <h3>${fmtMonth.format(first)}</h3>
     <p class="month-unrel">Not released yet</p>
-    <p class="month-unrel-sub">Airlines open award seats about a year before departure (British
-      Airways: ~355 days). Set an alert and we'll tell you when these dates go on sale.</p>
+    <p class="month-unrel-sub">${esc(note)}. Set an alert and we'll tell you when these dates go on sale.</p>
   </section>`);
 }
-function unreleasedDayCell(dnum, idx) {
+function unreleasedDayCell(dnum, idx, note = UNREL_NOTE_DEFAULT) {
   return el(`<span class="day unreleased"
       aria-label="${esc(fmtDate.format(dayDate(idx)))} — not released yet"
-      title="Not released yet — BA opens award seats about 355 days ahead">
+      title="Not released yet — ${esc(note)}">
     <span class="num">${dnum}</span></span>`);
 }
 /* Caption for a month that STRADDLES the horizon: it renders a grid (so the
    hatched cells alone would have no explanation on this, the last month), so
    spell it out. idx is the first unreleased day of the month. */
-function unreleasedCaptionEl(idx) {
+function unreleasedCaptionEl(idx, note = UNREL_NOTE_DEFAULT) {
   const d = dayDate(idx);
   return el(`<p class="month-unrel-inline">Dates from ${d.getUTCDate()} ${fmtMonthShort.format(d)}
-    aren't released yet — BA opens award seats about 355 days ahead. Set an alert to hear when they open.</p>`);
+    aren't released yet — ${esc(note)}. Set an alert to hear when they open.</p>`);
 }
 
 function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
   const first = utcDate(mo.y, mo.m, 1);
   const tbits = paxCtx ? paxCtx.tbits : bits;
   const pax = paxCtx ? paxCtx.pax : 1;
-  const horizon = bits.length; // last released day; beyond it = not on sale yet
-  if (mo.start >= horizon) return unreleasedMonthCard(mo, first);
+  const horizon = routeHorizon(routeKey); // last released day; beyond it = not on sale yet
+  const unrelNote = horizonNote([routeKey], horizon);
+  if (mo.start >= horizon) return unreleasedMonthCard(mo, first, unrelNote);
 
   // Months with nothing to show collapse to a compact card — a full grid of
   // empty cells is noise when the answer is simply "no". The collapse check
@@ -3437,7 +3499,7 @@ function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
   const nDays = daysInMonth(mo);
   for (let dnum = 1; dnum <= nDays; dnum++) {
     const idx = mo.start + dnum - 1;
-    if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx)); continue; }
+    if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx, unrelNote)); continue; }
     const v = (idx >= 0 && idx < bits.length) ? bits[idx] : 0;
     const tv = (idx >= 0 && idx < tbits.length) ? tbits[idx] : 0;
     const shown = tv & mask;
@@ -3473,7 +3535,7 @@ function monthCal(routeKey, bits, mo, mask, t0, paxCtx = null) {
     grid.append(cell);
   }
   $(".mc", box).textContent = `${monthDays}d`;
-  if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
+  if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon, unrelNote));
   return box;
 }
 
@@ -3693,8 +3755,9 @@ function renderTrip(o, d) {
      when the truth is "not enough seats". */
   function monthCalTrip(mo, rb, rbAll, rbAny, n) {
     const first = utcDate(mo.y, mo.m, 1);
-    const horizon = outBits.length; // beyond it = not released yet, not sold out
-    if (mo.start >= horizon) return unreleasedMonthCard(mo, first);
+    const horizon = routeHorizon(`${o}-${d}`, `${d}-${o}`); // beyond it = not released yet, not sold out
+    const unrelNote = horizonNote([`${o}-${d}`, `${d}-${o}`], horizon);
+    if (mo.start >= horizon) return unreleasedMonthCard(mo, first, unrelNote);
     let anyOut = false;
     for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, outBits.length); i++) {
       if (outBits[i]) { anyOut = true; break; }
@@ -3719,7 +3782,7 @@ function renderTrip(o, d) {
     const nDays = daysInMonth(mo);
     for (let dnum = 1; dnum <= nDays; dnum++) {
       const idx = mo.start + dnum - 1;
-      if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx)); continue; }
+      if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx, unrelNote)); continue; }
       const vOut = (idx >= 0 && idx < outBits.length) ? outBits[idx] : 0;
       const v = (idx >= 0 && idx < rb.length) ? rb[idx] : 0;
       const isPast = idx < t0;
@@ -3758,7 +3821,7 @@ function renderTrip(o, d) {
       grid.append(cell);
     }
     $(".mc", box).textContent = `${monthDays}d`;
-    if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
+    if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon, unrelNote));
     return box;
   }
 
@@ -4332,8 +4395,10 @@ function renderViaTrip(o, d, hub) {
      direct trip calendar. */
   function monthCalVia(mo, rb, rbAll, rbAny, outAny, n) {
     const first = utcDate(mo.y, mo.m, 1);
-    const horizon = outAny.length;
-    if (mo.start >= horizon) return unreleasedMonthCard(mo, first);
+    const viaLegs = [`${o}-${hub}`, `${hub}-${d}`, `${d}-${hub}`, `${hub}-${o}`];
+    const horizon = routeHorizon(...viaLegs);
+    const unrelNote = horizonNote(viaLegs, horizon);
+    if (mo.start >= horizon) return unreleasedMonthCard(mo, first, unrelNote);
     let anyOut = false;
     for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, outAny.length); i++) {
       if (outAny[i]) { anyOut = true; break; }
@@ -4358,7 +4423,7 @@ function renderViaTrip(o, d, hub) {
     const nDays = daysInMonth(mo);
     for (let dnum = 1; dnum <= nDays; dnum++) {
       const idx = mo.start + dnum - 1;
-      if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx)); continue; }
+      if (idx >= horizon) { grid.append(unreleasedDayCell(dnum, idx, unrelNote)); continue; }
       const vOut = (idx >= 0 && idx < outAny.length) ? outAny[idx] : 0;
       const v = (idx >= 0 && idx < rb.length) ? rb[idx] : 0;
       const isPast = idx < Math.max(0, t0);
@@ -4395,7 +4460,7 @@ function renderViaTrip(o, d, hub) {
       grid.append(cell);
     }
     $(".mc", box).textContent = `${monthDays}d`;
-    if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
+    if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon, unrelNote));
     return box;
   }
 
@@ -4758,8 +4823,9 @@ function renderViaRoute(o, d, hub) {
     const grid = el(`<div class="months"></div>`);
     for (const mo of months) {
       const first = utcDate(mo.y, mo.m, 1);
-      const horizon = rb.length;
-      if (mo.start >= horizon) { grid.append(unreleasedMonthCard(mo, first)); continue; }
+      const horizon = routeHorizon(`${o}-${hub}`, `${hub}-${d}`);
+      const unrelNote = horizonNote([`${o}-${hub}`, `${hub}-${d}`], horizon);
+      if (mo.start >= horizon) { grid.append(unreleasedMonthCard(mo, first, unrelNote)); continue; }
       let any = false;
       for (let i = Math.max(mo.start, t0); i < Math.min(mo.end, reachable.length); i++)
         if (reachable[i]) { any = true; break; }
@@ -4782,7 +4848,7 @@ function renderViaRoute(o, d, hub) {
       const nDays = daysInMonth(mo);
       for (let dnum = 1; dnum <= nDays; dnum++) {
         const idx = mo.start + dnum - 1;
-        if (idx >= horizon) { g.append(unreleasedDayCell(dnum, idx)); continue; }
+        if (idx >= horizon) { g.append(unreleasedDayCell(dnum, idx, unrelNote)); continue; }
         const can = (idx >= 0 && idx < reachable.length) ? reachable[idx] : 0;
         const v = (idx >= 0 && idx < rb.length) ? rb[idx] : 0;
         const isPast = idx < t0;
@@ -4814,7 +4880,7 @@ function renderViaRoute(o, d, hub) {
         g.append(cell);
       }
       $(".mc", box).textContent = `${monthDays}d`;
-      if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon));
+      if (mo.end > horizon) box.append(unreleasedCaptionEl(horizon, unrelNote));
       grid.append(box);
     }
     body.append(grid);
