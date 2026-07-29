@@ -57,6 +57,12 @@ type Config struct {
 	Cooldown     time.Duration     // min off-time before a pair re-alerts (default 3h)
 	Batch        time.Duration     // min interval between pushes per DEVICE (default 1h)
 	Publish      PublishFunc       // injected in tests; nil builds the Web Push publisher
+	// TelegramSend delivers one publication to a Telegram chat (nil while no
+	// bot is configured). gone=true means the chat is unreachable for good
+	// (blocked/deleted) — the subscription is dropped, exactly like a push
+	// 410. Detection, batching, caps and copy are all shared; this is purely
+	// a second transport.
+	TelegramSend func(chatID int64, p Publication) (gone bool, err error)
 	Logf         func(format string, args ...any)
 }
 
@@ -197,7 +203,7 @@ func NewWatcher(cfg Config) (*Watcher, error) {
 		if err != nil {
 			return nil, fmt.Errorf("alerts: %w", err)
 		}
-		cfg.Publish = storePublisher(cfg.Store, vapid, cfg.Logf)
+		cfg.Publish = storePublisher(cfg.Store, vapid, cfg.TelegramSend, cfg.Logf)
 	}
 	return &Watcher{cfg: cfg, state: loadState(cfg.StatePath, cfg.Logf)}, nil
 }
@@ -1270,9 +1276,29 @@ var pushSender = &http.Client{Timeout: webpush.SendTimeout}
 // storePublisher returns the real Web Push publish func. A dead subscription
 // (404/410) is removed from the store; any other failure is reported so the
 // batch is retried.
-func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, logf func(string, ...any)) PublishFunc {
+func storePublisher(store *alertstore.Store, vapid *webpush.Vapid, tgSend func(int64, Publication) (bool, error), logf func(string, ...any)) PublishFunc {
 	sender := &webpush.Sender{Client: pushSender, Vapid: vapid}
 	return func(sub webpush.Subscription, p Publication) error {
+		if chatID, isTG := alertstore.TelegramChatID(sub.Endpoint); isTG {
+			if tgSend == nil {
+				return fmt.Errorf("telegram subscription but no bot configured")
+			}
+			gone, err := tgSend(chatID, p)
+			if gone {
+				logf("alert-telegram-gone %s, removing: %v", sub.Endpoint, err)
+				store.Remove(sub.Endpoint)
+				return nil // unreachable for good: nothing to retry
+			}
+			if err != nil {
+				return err
+			}
+			// A 200 from sendMessage IS delivery to Telegram's cloud — push
+			// and ack in one breath, so telegram subs always read reachable.
+			now := time.Now().Unix()
+			store.MarkPushed(sub.Endpoint, now)
+			store.MarkAcked(sub.Endpoint, now)
+			return nil
+		}
 		payload, err := json.Marshal(map[string]string{
 			"title": p.Title, "body": p.Body, "url": p.URL, "tag": p.Tag,
 		})

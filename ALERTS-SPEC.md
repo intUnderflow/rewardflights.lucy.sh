@@ -740,3 +740,33 @@ can always be widened back (the party-row edit-safety rule). A watch scoped
 to an airline with no current space is valid ("tell me when they open
 this route"); the live count reads the airline's own bits via
 `routeBitsForAirline` so the bell never promises what a push wouldn't send.
+
+## Telegram delivery — shipped 2026-07-29
+
+A second transport on the same pipeline: detection, the Watch model,
+batching (≤1 message/chat/hour), daily caps, flap cooldowns and the render
+copy are all shared. @RewardFlightsBot long-polls from the watcher process —
+no webhook, no inbound port, no new tunnel.
+
+Linking is site-first: the bell's "Get alerts in Telegram" POSTs the
+configured watch list to `/telegram/link`, which mints a single-use,
+10-minute code (in-memory only) and returns `t.me/<bot>?start=<code>`.
+Tapping Start redeems it — the /start message itself proves chat ownership,
+which is the ONLY way a chat id ever enters the store. Each redemption
+MERGES watches into the chat (dedupe by content id), unlike the push flow's
+replace-the-list.
+
+Storage: a subscription with the synthetic endpoint `telegram:<chatID>`,
+riding every existing per-subscription mechanism (subKey, pending batches,
+caps). Because a chat id is a small guessable integer — not an unguessable
+push URL — the public API refuses telegram endpoints on every
+endpoint-keyed route (/watches, /ack, /test, /unsubscribe, /subscribe);
+chats are managed from the chat itself (/list, /stop), same ownership
+proof. A blocked bot (403 on send) drops the subscription exactly like a
+push 410; a successful sendMessage stamps push+ack in one breath, so
+telegram subs always read reachable.
+
+The bot answers exactly four commands (/start, /list, /stop, /help) and
+stays quiet on unknown text in groups. No command grammar for creating
+watches: the site is the configuration surface, the chat is delivery and
+off-switches. Broadcast channels are explicitly out of scope for v1.

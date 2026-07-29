@@ -17,6 +17,8 @@ import (
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertapi"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alerts"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/telegram"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/tglink"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/app"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/stats"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
@@ -39,6 +41,7 @@ type watchConfig struct {
 	AlertsMaxSubs     int
 	AlertsMaxBytes    int64  // subscription cap
 	AlertsListen      string // subscription API listen address; empty -> no API
+	TelegramKeyPath   string // Telegram bot token file; missing file disables the bot
 	AlertsRate        int    // API requests/min per client IP
 	AlertsBurst       int    // API rate-limit burst
 	AlertsTestPerHour int    // POST /test sends per hour per subscription
@@ -84,6 +87,33 @@ func runWatch(cfg watchConfig) error {
 
 		cfg.Alerts.Store = store
 		cfg.Alerts.Logf = logf
+
+		// Telegram delivery: a second transport on the same pipeline. The bot
+		// long-polls (no webhook, no inbound port); a missing key file simply
+		// means "not configured yet". Wired BEFORE NewWatcher so the built
+		// publisher can dispatch telegram endpoints.
+		var tgPending *tglink.Pending
+		var tgBotUser string
+		if raw, err := os.ReadFile(cfg.TelegramKeyPath); err == nil {
+			token := strings.TrimSpace(string(raw))
+			tg := telegram.New(token)
+			user, err := tg.GetMe(apiCtx)
+			if err != nil {
+				return fmt.Errorf("telegram getMe: %w", err)
+			}
+			tgBotUser = user
+			tgPending = tglink.New()
+			cfg.Alerts.TelegramSend = func(chatID int64, p alerts.Publication) (bool, error) {
+				ctx, cancel := context.WithTimeout(apiCtx, telegram.SendTimeout)
+				defer cancel()
+				return tg.Send(ctx, chatID, p.Title, p.Body, p.URL, "Open the pair")
+			}
+			go tg.Poll(apiCtx, logf, botHandler(apiCtx, tg, store, tgPending, logf))
+			logf("watch: telegram bot @%s polling", tgBotUser)
+		} else {
+			logf("watch: telegram disabled (%v)", err)
+		}
+
 		alerter, err = alerts.NewWatcher(cfg.Alerts)
 		if err != nil {
 			return err
@@ -111,6 +141,8 @@ func runWatch(cfg watchConfig) error {
 				// The API reports each watch's status (expired / impossible /
 				// unknown-route) against the data the watcher currently holds.
 				Horizon: alerter.Horizon,
+				// Telegram linking (absent until the bot is configured).
+				TelegramLink: tgPending, BotUsername: tgBotUser,
 			})
 			go func() {
 				logf("watch: subscription API listening on %s", cfg.AlertsListen)

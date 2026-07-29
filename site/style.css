@@ -958,3 +958,8 @@ a.dp-cab-go:hover, a.pp-leg-go:hover { text-decoration: underline; }
 .home-from .suggest { min-width: 230px; }
 .hf-clear { border: 0; background: none; color: var(--ink-3); cursor: pointer; font-size: 16px; padding: 0 2px; }
 .hf-clear:hover { color: var(--ink); }
+
+/* Telegram handoff in the bell: quiet secondary action beside Save. */
+.bell-tg { border: 1px solid var(--line-2); border-radius: 999px; padding: 8px 14px; background: none; color: var(--ink-2); cursor: pointer; font: 700 12.5px var(--font-body); }
+.bell-tg:hover { border-color: var(--ink-3); color: var(--ink); }
+.bell-tg[disabled] { opacity: .6; cursor: wait; }

@@ -24,6 +24,7 @@ import (
 	"time"
 
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/alertstore"
+	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/tglink"
 	"github.com/intUnderflow/rewardflights.lucy.sh/processor/internal/webpush"
 )
 
@@ -38,6 +39,12 @@ type Config struct {
 	TestPerHour int               // POST /test sends per hour per subscription (default 5)
 	Logf        func(string, ...any)
 	Now         func() time.Time // injected in tests; defaults to time.Now
+
+	// Telegram linking (nil/empty disables POST /telegram/link): the site
+	// stashes a configured watch list here and sends the user to
+	// t.me/<BotUsername>?start=<code>; the bot redeems the code.
+	TelegramLink *tglink.Pending
+	BotUsername  string
 }
 
 // maxBody bounds request bodies: 20 watches is ~4KB, so 32KB leaves headroom
@@ -105,6 +112,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /subscribe", s.handleSubscribe)
 	mux.HandleFunc("POST /unsubscribe", s.handleUnsubscribe)
 	mux.HandleFunc("POST /test", s.handleTest)
+	mux.HandleFunc("POST /telegram/link", s.handleTelegramLink)
 	mux.HandleFunc("POST /ack", s.handleAck)
 	mux.HandleFunc("GET /watches", s.handleWatches)
 	mux.HandleFunc("GET /topics", s.handleTopics)
@@ -300,6 +308,9 @@ func (s *Server) handleWatches(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "endpoint is required")
 		return
 	}
+	if !publicEndpoint(w, endpoint) {
+		return
+	}
 	body := map[string]any{"watches": s.withStatus(s.cfg.Store.Watches(endpoint))}
 	if lastPush, lastAck, pushCount, ackCount, ok := s.cfg.Store.DeliveryStatus(endpoint); ok {
 		body["device"] = map[string]any{
@@ -330,6 +341,9 @@ func (s *Server) handleAck(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "endpoint is required")
 		return
 	}
+	if !publicEndpoint(w, req.Endpoint) {
+		return
+	}
 	if _, ok := s.cfg.Store.Lookup(req.Endpoint); !ok {
 		writeJSON(w, http.StatusNotFound, map[string]any{"ok": false, "error": "unknown subscription"})
 		return
@@ -356,8 +370,61 @@ func (s *Server) handleUnsubscribe(w http.ResponseWriter, r *http.Request) {
 		badRequest(w, "endpoint is required")
 		return
 	}
+	if !publicEndpoint(w, req.Endpoint) {
+		return
+	}
 	s.cfg.Store.Remove(req.Endpoint)
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+}
+
+// publicEndpoint rejects Telegram endpoints on every public endpoint-keyed
+// route. A push endpoint is an unguessable URL — knowing it IS the
+// capability — but a telegram:<chatID> is a small guessable integer, so the
+// public API must never read, test, ack, or remove one; those chats are
+// managed from the chat itself (/list, /stop), which proves ownership.
+func publicEndpoint(w http.ResponseWriter, endpoint string) bool {
+	if _, isTG := alertstore.TelegramChatID(endpoint); isTG {
+		badRequest(w, "telegram subscriptions are managed from the Telegram chat")
+		return false
+	}
+	return true
+}
+
+// handleTelegramLink mints a one-time deep-link code for a validated watch
+// list. No chat id is involved yet — the bot binds one when the user taps
+// Start, and only then does anything enter the store.
+func (s *Server) handleTelegramLink(w http.ResponseWriter, r *http.Request) {
+	if s.cfg.TelegramLink == nil || s.cfg.BotUsername == "" {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{"ok": false, "error": "telegram alerts aren't available right now"})
+		return
+	}
+	var req struct {
+		Watches []alertstore.Watch `json:"watches"`
+	}
+	if !decode(w, r, &req) {
+		return
+	}
+	if len(req.Watches) == 0 || len(req.Watches) > alertstore.MaxWatchesPerSub {
+		badRequest(w, "between 1 and 20 watches")
+		return
+	}
+	normalized := make([]alertstore.Watch, 0, len(req.Watches))
+	for _, in := range req.Watches {
+		nw, err := alertstore.Normalize(in)
+		if err != nil {
+			badRequest(w, err.Error())
+			return
+		}
+		normalized = append(normalized, nw)
+	}
+	code, err := s.cfg.TelegramLink.Put(normalized)
+	if err != nil {
+		writeJSON(w, http.StatusTooManyRequests, map[string]any{"ok": false, "error": err.Error()})
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok": true, "url": "https://t.me/" + s.cfg.BotUsername + "?start=" + code,
+	})
 }
 
 // testPayload is the fixed body of a test notification. It is deliberately
@@ -388,6 +455,9 @@ func (s *Server) handleTest(w http.ResponseWriter, r *http.Request) {
 		Endpoint string `json:"endpoint"`
 	}
 	if !decode(w, r, &req) {
+		return
+	}
+	if !publicEndpoint(w, req.Endpoint) {
 		return
 	}
 	sub, known := s.cfg.Store.Lookup(req.Endpoint)

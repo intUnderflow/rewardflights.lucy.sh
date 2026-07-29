@@ -44,6 +44,7 @@ func main() {
 	alertsVapidSubject := flag.String("alerts-vapid-subject", "", "watch mode: VAPID sub claim, e.g. mailto:alerts@rewardflights.lucy.sh")
 	alertsStore := flag.String("alerts-store", defaultAlertsPath("subs.json"), "watch mode: JSON file holding push subscriptions")
 	alertsState := flag.String("alerts-state", defaultAlertsPath("state.json"), "watch mode: path of the alerts state file (cooldown/batch persistence)")
+	telegramKey := flag.String("telegram-key", defaultAlertsPath("telegram.key"), "watch mode: file holding the Telegram bot token; missing file disables Telegram alerts")
 	alertsListen := flag.String("alerts-listen", "", "watch mode: listen address for the subscription API, e.g. 127.0.0.1:8787 (empty disables the API)")
 	alertsMaxSubs := flag.Int("alerts-max-subs", alertstore.DefaultMaxSubs, "watch mode: maximum stored subscriptions")
 	alertsMaxBytes := flag.Int64("alerts-max-bytes", alertstore.DefaultMaxBytes, "watch mode: hard ceiling on the subscription store file, in bytes (disk backstop)")
@@ -89,6 +90,7 @@ func main() {
 			AlertsMaxSubs:     *alertsMaxSubs,
 			AlertsMaxBytes:    *alertsMaxBytes,
 			AlertsListen:      *alertsListen,
+			TelegramKeyPath:   *telegramKey,
 			AlertsRate:        *alertsRate,
 			AlertsBurst:       *alertsBurst,
 			AlertsTestPerHour: *alertsTestPerHour,

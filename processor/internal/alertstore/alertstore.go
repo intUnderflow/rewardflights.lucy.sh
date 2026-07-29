@@ -29,6 +29,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -243,11 +244,13 @@ func toStored(sub *Subscription) storedSub {
 
 // load validates and (for schema 1) migrates one stored subscription.
 func (s *Store) load(sub storedSub, schema int) (*Subscription, error) {
-	if err := ValidEndpoint(sub.Endpoint); err != nil {
-		return nil, err
-	}
-	if sub.P256dh == "" || sub.Auth == "" {
-		return nil, errors.New("p256dh and auth are required")
+	if _, isTG := TelegramChatID(sub.Endpoint); !isTG {
+		if err := ValidEndpoint(sub.Endpoint); err != nil {
+			return nil, err
+		}
+		if sub.P256dh == "" || sub.Auth == "" {
+			return nil, errors.New("p256dh and auth are required")
+		}
 	}
 	out := &Subscription{
 		Endpoint: sub.Endpoint, P256dh: sub.P256dh, Auth: sub.Auth,
@@ -455,6 +458,55 @@ func subSize(sub *Subscription) int64 {
 
 // setSub installs a subscription and keeps the running byte total in step.
 // Caller holds mu.
+// UpsertTelegram binds watches to a Telegram chat, MERGING with any the chat
+// already has (each /start redemption adds; the site's replace-the-list
+// semantics belong to the push flow). Only the bot's /start handler calls
+// this — the chat id came from the chat itself, never from a request body.
+func (s *Store) UpsertTelegram(chatID int64, add []Watch) ([]Watch, error) {
+	if chatID == 0 {
+		return nil, errors.New("missing chat id")
+	}
+	endpoint := TelegramPrefix + strconv.FormatInt(chatID, 10)
+	now := s.now().Unix()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	k := key(endpoint)
+	existing := s.subs[k]
+	var watches []Watch
+	if existing != nil {
+		watches = slices.Clone(existing.Watches)
+	}
+	for _, w := range add {
+		normalized, err := Normalize(w)
+		if err != nil {
+			return nil, err
+		}
+		if slices.ContainsFunc(watches, func(h Watch) bool { return h.ID == normalized.ID }) {
+			continue // the same watch twice is one promise
+		}
+		normalized.CreatedAt = now
+		watches = append(watches, normalized)
+	}
+	if len(watches) > MaxWatchesPerSub {
+		return nil, ErrTooManyWatch
+	}
+	if existing == nil && len(s.subs) >= s.maxSubs {
+		return nil, ErrFull
+	}
+	sub := &Subscription{Endpoint: endpoint, Watches: watches}
+	if existing != nil {
+		sub.LastPushAt, sub.LastAckAt = existing.LastPushAt, existing.LastAckAt
+		sub.PushCount, sub.AckCount = existing.PushCount, existing.AckCount
+	}
+	size := subSize(sub)
+	if s.bytes-s.subBytes[k]+size > s.maxBytes {
+		return nil, ErrStoreTooLarge
+	}
+	s.setSub(k, sub, size)
+	s.touch()
+	return slices.Clone(watches), nil
+}
+
 func (s *Store) setSub(k string, sub *Subscription, size int64) {
 	s.bytes += size - s.subBytes[k]
 	s.subBytes[k] = size
@@ -899,6 +951,22 @@ func (s *Store) Close() error {
 
 // ValidEndpoint reports whether an endpoint is an https URL on an allowlisted
 // push service.
+// TelegramPrefix marks a Telegram delivery subscription. The synthetic
+// endpoint "telegram:<chatID>" rides every existing per-subscription
+// mechanism (subKey hashing, pending batches, caps) unchanged. It is NEVER
+// accepted from the public subscribe API — only the bot's /start handler,
+// which proves chat ownership by construction, may create one.
+const TelegramPrefix = "telegram:"
+
+// TelegramChatID extracts the chat id from a telegram endpoint.
+func TelegramChatID(endpoint string) (int64, bool) {
+	if !strings.HasPrefix(endpoint, TelegramPrefix) {
+		return 0, false
+	}
+	id, err := strconv.ParseInt(endpoint[len(TelegramPrefix):], 10, 64)
+	return id, err == nil && id != 0
+}
+
 func ValidEndpoint(endpoint string) error {
 	u, err := url.Parse(endpoint)
 	if err != nil || u.Scheme != "https" || u.Host == "" {

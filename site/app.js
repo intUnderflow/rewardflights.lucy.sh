@@ -2873,6 +2873,34 @@ function alertBell(routeKey, kind, defaultMask, ctx = {}) {
     }
     pop.append(countLine, actions);
     const note = el(`<p class="bell-note" role="status"></p>`);
+    // Telegram delivery: the same configured watch, handed to the bot via a
+    // one-time deep-link code. No push permission, no per-device setup —
+    // reliable delivery with history, managed from the chat (/list, /stop).
+    const tgBtn = el(`<button type="button" class="bell-tg">Get alerts in Telegram <span aria-hidden="true">→</span></button>`);
+    tgBtn.addEventListener("click", async () => {
+      const w = build();
+      if (!w || watchProblem(w)) { recount(); return; }
+      tgBtn.disabled = true;
+      note.textContent = "";
+      try {
+        const res = await apiFetch("/telegram/link", { method: "POST", body: { watches: [wireWatch(w)] } });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok || !data.url) throw new Error(data.error || `couldn't link (${res.status})`);
+        // A popup block (the open lands after an await) degrades to the
+        // visible link below — the code stays valid for 10 minutes.
+        const opened = window.open(data.url, "_blank", "noopener");
+        note.innerHTML = opened
+          ? "Opening Telegram — tap <b>Start</b> there to arm this alert."
+          : `Tap to finish in Telegram: <a href="${esc(data.url)}" target="_blank" rel="noopener noreferrer">open the bot →</a>`;
+        announce("Continue in Telegram: tap Start to arm this alert.");
+      } catch (e) {
+        note.textContent = /aren't available/.test(e?.message || "")
+          ? "Telegram alerts aren't available right now — push alerts above still work."
+          : "Couldn't reach the alerts service — try again in a moment.";
+      }
+      tgBtn.disabled = false;
+    });
+    actions.append(tgBtn);
     pop.append(note);
 
     function setMode(m) {

@@ -539,3 +539,48 @@ func ParseDay(s string) (int, error) {
 func DayDate(day int) string {
 	return time.Unix(int64(day)*86400, 0).UTC().Format("2006-01-02")
 }
+
+// Summary renders one human line for a watch — the bot's /list and link
+// confirmations. Compact, same vocabulary as the site's own summaries.
+func (w Watch) Summary() string {
+	names := map[string]string{"M": "Economy", "W": "Premium Economy", "C": "Business", "F": "First"}
+	var cabins []string
+	for _, c := range w.Cabins {
+		if n, ok := names[c]; ok {
+			cabins = append(cabins, n)
+		}
+	}
+	arrow := " → "
+	if w.Kind == KindRT {
+		arrow = " ⇄ "
+	}
+	parts := []string{w.Route[:3] + arrow + w.Route[4:], strings.Join(cabins, "/")}
+	if len(cabins) == 4 {
+		parts[1] = "any cabin"
+	}
+	switch {
+	case w.LeadDays > 0:
+		parts = append(parts, fmt.Sprintf("any time, %d days' notice", w.LeadDays))
+	case w.Out != nil:
+		parts = append(parts, "out "+w.Out.From+"–"+w.Out.To)
+	default:
+		parts = append(parts, "any date")
+	}
+	if w.Kind == KindRT && w.Nights != nil {
+		parts = append(parts, fmt.Sprintf("%d–%d nights", w.Nights.Min, w.Nights.Max))
+	}
+	if w.Via != "" {
+		v := "via " + w.Via
+		if w.Conn > 1 {
+			v += fmt.Sprintf(" (≤%dn stop)", w.Conn)
+		}
+		parts = append(parts, v)
+	}
+	if w.MinSeats >= 2 {
+		parts = append(parts, fmt.Sprintf("%d+ seats", w.MinSeats))
+	}
+	if w.Airline != "" {
+		parts = append(parts, w.Airline+" only")
+	}
+	return strings.Join(parts, " · ")
+}
