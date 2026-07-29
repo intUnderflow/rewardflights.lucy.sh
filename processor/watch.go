@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"net/http"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -42,6 +43,7 @@ type watchConfig struct {
 	AlertsMaxBytes    int64  // subscription cap
 	AlertsListen      string // subscription API listen address; empty -> no API
 	TelegramKeyPath   string // Telegram bot token file; missing file disables the bot
+	PagesHookPath     string // Cloudflare Pages deploy hook URL file; missing file disables the daily rebuild
 	AlertsRate        int    // API requests/min per client IP
 	AlertsBurst       int    // API rate-limit burst
 	AlertsTestPerHour int    // POST /test sends per hour per subscription
@@ -151,6 +153,34 @@ func runWatch(cfg watchConfig) error {
 				}
 			}()
 		}
+	}
+
+	// Daily site rebuild: the prerendered route pages bake availability
+	// numbers at Pages build time, so the site must redeploy once a day even
+	// when nobody pushes — the deploy hook URL (a secret: anyone holding it
+	// can trigger builds) lives beside the other alert credentials, and a
+	// missing file simply means the feature is off.
+	if hook, err := os.ReadFile(cfg.PagesHookPath); err == nil {
+		url := strings.TrimSpace(string(hook))
+		go func() {
+			tick := time.NewTicker(24 * time.Hour)
+			defer tick.Stop()
+			for {
+				select {
+				case <-apiCtx.Done():
+					return
+				case <-tick.C:
+					res, err := http.Post(url, "application/json", nil)
+					if err != nil {
+						logf("WARN pages-rebuild: %v", err)
+						continue
+					}
+					res.Body.Close()
+					logf("watch: daily site rebuild triggered (%d)", res.StatusCode)
+				}
+			}
+		}()
+		logf("watch: daily site rebuild armed")
 	}
 
 	// Freshness tags ride on push mode: rendezvous points are only meaningful

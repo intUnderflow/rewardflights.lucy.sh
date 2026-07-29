@@ -45,6 +45,7 @@ func main() {
 	alertsStore := flag.String("alerts-store", defaultAlertsPath("subs.json"), "watch mode: JSON file holding push subscriptions")
 	alertsState := flag.String("alerts-state", defaultAlertsPath("state.json"), "watch mode: path of the alerts state file (cooldown/batch persistence)")
 	telegramKey := flag.String("telegram-key", defaultAlertsPath("telegram.key"), "watch mode: file holding the Telegram bot token; missing file disables Telegram alerts")
+	pagesHook := flag.String("pages-hook", defaultAlertsPath("pages-hook.url"), "watch mode: file holding a Cloudflare Pages deploy hook URL, pinged daily to re-bake the prerendered pages; missing file disables it")
 	alertsListen := flag.String("alerts-listen", "", "watch mode: listen address for the subscription API, e.g. 127.0.0.1:8787 (empty disables the API)")
 	alertsMaxSubs := flag.Int("alerts-max-subs", alertstore.DefaultMaxSubs, "watch mode: maximum stored subscriptions")
 	alertsMaxBytes := flag.Int64("alerts-max-bytes", alertstore.DefaultMaxBytes, "watch mode: hard ceiling on the subscription store file, in bytes (disk backstop)")
@@ -91,6 +92,7 @@ func main() {
 			AlertsMaxBytes:    *alertsMaxBytes,
 			AlertsListen:      *alertsListen,
 			TelegramKeyPath:   *telegramKey,
+			PagesHookPath:     *pagesHook,
 			AlertsRate:        *alertsRate,
 			AlertsBurst:       *alertsBurst,
 			AlertsTestPerHour: *alertsTestPerHour,

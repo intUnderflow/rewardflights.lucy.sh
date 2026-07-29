@@ -56,11 +56,26 @@ cd processor && go build -o <bin path> .
    form via `mktestsite.sh` in the session harness):
 
    ```sh
-   npx esbuild app.js --minify --charset=utf8 --allow-overwrite --outfile=app.js && npx esbuild style.css --minify --charset=utf8 --allow-overwrite --outfile=style.css && npx esbuild sw.js --minify --charset=utf8 --allow-overwrite --outfile=sw.js && npx esbuild assets/world-1.js --minify --charset=utf8 --allow-overwrite --outfile=assets/world-1.js
+   node build.mjs
    ```
 
-   A failed build leaves the previous deploy live — the safe failure mode.
-4. Deploy, then add the custom domain **rewardflights.lucy.sh**.
+   `site/build.mjs` minifies exactly as the old esbuild one-liner did, then
+   prerenders one indexable page per route (`route/<KEY>.html`, served at the
+   SPA's existing extensionless URLs) plus `sitemap.xml`, baking a
+   crawler-readable summary from the live bundle + stats. A data-fetch
+   failure FAILS the build on purpose: Pages keeps the previous deploy, which
+   still carries every route page — deploying without them would de-index
+   the site. A failed build leaves the previous deploy live — the safe
+   failure mode.
+
+5. **Daily rebuild (freshness for the baked pages):** dashboard → the Pages
+   project → Settings → Builds & deployments → **Deploy hooks** → create one
+   (branch `main`), then put its URL on the server:
+   `umask 077; printf '%s' '<hook url>' > ~/rf/alerts/pages-hook.url`
+   The watcher pings it once a day (`-pages-hook` flag; missing file = off),
+   so the prerendered numbers are never more than ~24h stale even when
+   nothing is pushed.
+6. Deploy, then add the custom domain **rewardflights.lucy.sh**.
 
 `site/_headers` (security headers + CSP) and `site/_redirects` (SPA fallback)
 are applied by Pages automatically.

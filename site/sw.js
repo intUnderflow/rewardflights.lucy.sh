@@ -70,7 +70,7 @@ self.addEventListener("fetch", (event) => {
         // Belt against interception (captive portals, enterprise MITM roots):
         // only our own origin's un-redirected HTML may become the offline
         // shell. TLS blocks the classic portal forgery already; this closes
-        // the残 remaining paths cheaply.
+        // the remaining paths cheaply.
         const cacheable = fresh.ok && !fresh.redirected &&
           new URL(fresh.url).origin === self.location.origin &&
           (fresh.headers.get("content-type") || "").includes("text/html");
